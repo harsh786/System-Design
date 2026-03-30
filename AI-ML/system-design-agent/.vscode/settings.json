@@ -1,0 +1,10 @@
+{
+  "github.copilot.advanced": {
+    "customAgents": {
+      "configPath": "${workspaceFolder}/.github/copilot/agents.json"
+    }
+  },
+  "github.copilot.enable": {
+    "*": true
+  }
+}
