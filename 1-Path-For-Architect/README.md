@@ -36,6 +36,17 @@ Use this as a staff/principal/architect preparation system: each file is a separ
 27. [Testing and Quality Engineering Strategy](27-testing-quality-engineering-strategy.md)
 28. [Architecture Portfolio Artifacts](28-architecture-portfolio-artifacts.md)
 29. [Behavioral and Architecture Leadership Interview Bank](29-behavioral-leadership-interview-bank.md)
+30. [Enterprise Architecture and Operating Model](30-enterprise-architecture-operating-model.md)
+31. [Frontend, Mobile, and Client Architecture](31-frontend-mobile-client-architecture.md)
+32. [Enterprise Integration and Legacy Modernization](32-enterprise-integration-legacy-modernization.md)
+33. [Privacy, Data Governance, and Compliance](33-privacy-data-governance-compliance.md)
+34. [Linux, OS, and Infrastructure Internals](34-linux-os-infrastructure-internals.md)
+35. [Business Continuity, Disaster Recovery, and Crisis Management](35-business-continuity-dr-crisis-management.md)
+36. [Sustainability and Responsible Architecture](36-sustainability-responsible-architecture.md)
+37. [Deployment Strategies Deep Dive](37-deployment-strategies-deep-dive.md)
+38. [Scaling Strategies for Millions of Users](38-scaling-strategies-for-millions-of-users.md)
+39. [End-to-End Microservices Scalability](39-microservices-scalability-end-to-end.md)
+40. [AWS Architecture Concepts Roadmap](40-aws-architecture-concepts-roadmap.md)
 
 ## Architect-Level Outcome Matrix
 
@@ -59,6 +70,16 @@ Use this as a staff/principal/architect preparation system: each file is a separ
 | Performance Engineering | Model capacity, latency, saturation, tail behavior, load tests, profiling, and cost per unit of work. |
 | Quality Engineering | Prove correctness, compatibility, resilience, security, performance, and operability through layered testing. |
 | Domain Architecture | Adapt core patterns to fintech, SaaS, marketplace, AdTech, media, healthcare, IoT, and internal platforms. |
+| Enterprise Architecture | Map business capabilities, governance, operating model, technology radar, build-vs-buy, and portfolio modernization. |
+| Client Architecture | Design web/mobile/BFF/GraphQL/offline-sync systems with performance, compatibility, accessibility, and observability. |
+| Legacy Modernization | Integrate SAP/CRM/mainframe/file/batch systems and migrate with strangler, facade, CDC, dual-run, and reconciliation. |
+| Privacy and Governance | Design classification, consent, deletion, residency, lineage, data contracts, auditability, and compliance evidence. |
+| Infrastructure Internals | Debug Linux, file descriptors, TCP, DNS, TLS, cgroups, containers, I/O, and Kubernetes resource failures. |
+| Disaster Recovery | Define RTO/RPO, backup integrity, failover, cyber recovery, crisis roles, and DR drills. |
+| Deployment Strategy | Choose rolling, blue-green, canary, progressive, shadow, dark launch, feature-flag, and DB migration strategies. |
+| Massive Scale | Scale reads, writes, caches, shards, queues, fanout, regions, abuse controls, observability, and cost for millions of users. |
+| End-to-End Microservices Scale | Design frontend-to-backend scalability across DNS, CDN, WAF, load balancers, API gateway, services, pools, databases, caches, events, resilience, and security. |
+| AWS Architecture | Design AWS systems using Route 53, CloudFront, VPC, ALB/NLB, API Gateway, EKS, ECS, Fargate, EC2, RDS, DynamoDB, KMS, IAM, caches, messaging, observability, and governance. |
 
 ## Completion Bar
 
@@ -73,3 +94,8 @@ You are interview-ready when you can do all of this without notes:
 - Design AI/RAG/agent systems with safety, evaluation, retrieval quality, permissioning, cost, and observability.
 - Build a portfolio with capacity plan, threat model, SLO, runbooks, cost model, migration plan, test strategy, and postmortem.
 - Score your own HLD and LLD answers using the architecture review rubrics.
+- Explain enterprise architecture decisions through capability maps, governance, technology radar, operating model, and vendor exit strategy.
+- Design deployment strategies with compatibility, rollback, feature flags, canary metrics, and database expand-contract migrations.
+- Design scaling strategies for millions of users with caching, sharding, queues, multi-region, cell architecture, abuse prevention, and cost controls.
+- Walk through a million-user request path from frontend and DNS to API gateway, services, connection pools, databases, events, caches, observability, and security controls.
+- Design AWS reference architectures and explain service choices, trade-offs, worker node strategy, IAM/federation, KMS, networking, databases, caches, messaging, observability, DR, and cost.

@@ -25,6 +25,13 @@ portfolio/
   15-migration-plan.md
   16-test-strategy.md
   17-postmortem.md
+  18-deployment-strategy.md
+  19-million-user-scaling-plan.md
+  20-business-continuity-dr-plan.md
+  21-privacy-data-governance-plan.md
+  22-enterprise-operating-model.md
+  23-end-to-end-microservices-scalability.md
+  24-aws-reference-architecture.md
 ```
 
 ## 1. Business Requirements
@@ -361,6 +368,117 @@ Write one simulated incident:
 - Action items.
 - Prevention.
 
+## 18. Deployment Strategy
+
+Include:
+
+- Deployment type: rolling, blue-green, canary, progressive, shadow, dark launch, or feature-flag rollout.
+- Compatibility requirements.
+- Database migration strategy.
+- Event/API compatibility rules.
+- Rollout stages.
+- Metrics and gates.
+- Rollback criteria.
+- Rollback steps.
+- Owner and communication plan.
+
+## 19. Million-User Scaling Plan
+
+Include:
+
+- Traffic model.
+- Hot paths.
+- Read scaling strategy.
+- Write scaling strategy.
+- Cache hierarchy.
+- Queue and async processing strategy.
+- Sharding and partitioning plan.
+- Fanout strategy.
+- Multi-region strategy.
+- Abuse prevention.
+- Observability and cost model.
+
+## 20. Business Continuity and DR Plan
+
+Include:
+
+- Service criticality tier.
+- RTO and RPO.
+- Backup strategy.
+- Restore test evidence.
+- Regional failover strategy.
+- Cyber recovery controls.
+- Crisis roles.
+- Communication plan.
+- DR drill results.
+
+## 21. Privacy and Data Governance Plan
+
+Include:
+
+- Data classification.
+- Data owners.
+- Consent and purpose mapping.
+- Retention policy.
+- Deletion workflow.
+- Residency controls.
+- Access review process.
+- Audit evidence.
+- Data contracts.
+- Lineage and quality checks.
+
+## 22. Enterprise Operating Model
+
+Include:
+
+- Business capability map.
+- System ownership map.
+- Architecture principles.
+- Governance model.
+- Technology radar.
+- Build-vs-buy decision record.
+- Vendor risk and exit strategy.
+- Exception register.
+- Modernization roadmap.
+
+## 23. End-to-End Microservices Scalability
+
+Include:
+
+- Request path from browser/mobile to DNS, CDN, WAF, load balancer, gateway, BFF, services, database, cache, and event bus.
+- DNS and global routing strategy.
+- CDN and cache policy.
+- API gateway, CORS, auth, request validation, and rate limiting.
+- Service thread pool and queue strategy.
+- HTTP connection pool and database pool sizing.
+- Database indexing, partitioning, sharding, read replica, and analytics isolation strategy.
+- Cache stampede, hot-key, and invalidation strategy.
+- Outbox/inbox, DLQ, replay, and idempotent consumer strategy.
+- Resilience controls: timeout, retry, circuit breaker, bulkhead, back-pressure, load shedding.
+- Security controls for tenant isolation, abuse prevention, secrets, audit, and mTLS where needed.
+- Observability signals and SLOs.
+- Deployment and rollback strategy.
+
+## 24. AWS Reference Architecture
+
+Include:
+
+- Region and Availability Zone strategy.
+- VPC layout, public/private/data subnets, route tables, NAT, VPC endpoints, and security groups.
+- Edge strategy: Route 53, CloudFront, WAF, Shield, ACM.
+- Load-balancing choice: ALB, NLB, or API Gateway.
+- Compute choice: EC2, ECS, EKS, Fargate, Lambda, or hybrid.
+- EKS/ECS worker or task sizing strategy.
+- Database choice: RDS, Aurora, DynamoDB, OpenSearch, Redshift, or specialized store.
+- Cache choice: ElastiCache Redis/Valkey or Memcached.
+- Messaging choice: SQS, SNS, EventBridge, Kinesis, or MSK.
+- IAM/federation model: IAM roles, STS, Identity Center, Cognito, OIDC/SAML, cross-account access.
+- KMS/secrets/certificate strategy.
+- Observability: CloudWatch, X-Ray, CloudTrail, Config, VPC Flow Logs.
+- DR and backup strategy.
+- Cost model and tagging strategy.
+- Security controls and guardrails.
+
 ## Portfolio Review Checklist
 
 - Can someone understand the system without you speaking?
@@ -372,4 +490,9 @@ Write one simulated incident:
 - Does the cost model connect to architecture choices?
 - Does the migration plan avoid big-bang cutover?
 - Does the threat model include tenant and data boundaries?
-
+- Does the deployment plan include compatibility gates and rollback?
+- Does the scaling plan explain the path to millions of users without premature complexity?
+- Does the DR plan prove recovery with evidence rather than intent?
+- Does the data governance plan cover privacy, retention, deletion, ownership, and auditability?
+- Does the end-to-end scalability plan account for every bottleneck from client to database and async workers?
+- Does the AWS reference architecture justify service choices instead of listing service names?

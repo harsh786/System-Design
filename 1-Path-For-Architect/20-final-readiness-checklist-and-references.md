@@ -32,6 +32,18 @@ You are ready when you can do the following without notes:
 - Apply domain-specific architecture patterns for fintech, SaaS, marketplace, AdTech, media, healthcare, IoT, and internal platforms.
 - Present a portfolio containing requirements, NFRs, C4 diagrams, sequence diagrams, APIs, event contracts, data model, ADRs, threat model, SLO, runbooks, cost model, migration plan, test strategy, and postmortem.
 - Answer behavioral architecture questions with clear context, stakes, constraints, options, decision, execution, result, and reflection.
+- Explain enterprise architecture through capability maps, operating model, governance, architecture review, technology radar, build-vs-buy, vendor risk, and exit strategy.
+- Design client architecture for web/mobile systems with BFF, GraphQL, offline sync, API compatibility, feature rollout, accessibility, and real-user observability.
+- Modernize legacy systems using API facades, anti-corruption layers, CDC, file integration, parallel run, reconciliation, and strangler migration.
+- Design privacy and data governance controls for classification, consent, deletion, residency, lineage, data contracts, access review, and audit evidence.
+- Debug infrastructure-level failures involving Linux processes, file descriptors, TCP, DNS, TLS, page cache, cgroups, containers, and Kubernetes resource limits.
+- Define business continuity and disaster recovery strategies with RTO/RPO, backup integrity, regional failover, cyber recovery, DR drills, and crisis communication.
+- Choose deployment strategies such as rolling, blue-green, canary, progressive delivery, shadow, dark launch, feature flags, and expand-contract database deployments.
+- Scale systems for millions of users with CDN, cache hierarchy, database tuning, sharding, queues, fanout strategy, multi-region, cell architecture, abuse controls, observability, and cost optimization.
+- Explain end-to-end microservices scalability from frontend and DNS to load balancers, WAF, API gateway, CORS, rate limiting, BFF, services, thread pools, connection pools, database pools, indexing, partitioning, sharding, caching, outbox, event processing, resilience patterns, security, observability, and deployment safety.
+- Compare additional database families and engines: MySQL/InnoDB, Oracle, DynamoDB, Cassandra, HBase, distributed SQL, HTAP, search, graph, time-series, vector, embedded, coordination, and OLAP engines.
+- Design lakehouse ecosystems with object storage, file formats, Iceberg/Hudi/Delta, catalogs, governance, CDC, orchestration, stream processing, data quality, lineage, serving engines, and cost controls.
+- Design AWS architectures with Route 53, CloudFront, WAF, VPC, subnets, NAT, VPC endpoints, ALB/NLB, API Gateway, EKS, ECS, Fargate, EC2 worker node types, RDS/Aurora, DynamoDB, ElastiCache, KMS, IAM, federation, SQS/SNS/EventBridge/Kinesis, CloudWatch, CloudTrail, Config, DR, and cost governance.
 
 ---
 
@@ -66,6 +78,24 @@ Use official/reference documentation whenever possible:
 - FinOps Framework: https://www.finops.org/framework/
 - NIST AI Risk Management Framework: https://www.nist.gov/itl/ai-risk-management-framework
 - OWASP Top 10 for LLM Applications: https://owasp.org/www-project-top-10-for-large-language-model-applications/
+- CNCF Cloud Native Landscape: https://landscape.cncf.io/
+- Web.dev performance guidance: https://web.dev/learn/performance/
+- OWASP Application Security Verification Standard: https://owasp.org/www-project-application-security-verification-standard/
+- AWS Route 53 API Reference: https://docs.aws.amazon.com/Route53/latest/APIReference/Welcome.html
+- Apache Airflow documentation: https://airflow.apache.org/docs/
+- Apache Beam documentation: https://beam.apache.org/documentation/
+- Debezium documentation: https://debezium.io/documentation/
+- Trino documentation: https://trino.io/docs/current/
+- Apache Druid documentation: https://druid.apache.org/docs/latest/
+- DuckDB documentation: https://duckdb.org/docs/
+- DataHub documentation: https://datahubproject.io/docs/
+- OpenMetadata documentation: https://docs.open-metadata.org/
+- Great Expectations documentation: https://docs.greatexpectations.io/
+- AWS EKS User Guide: https://docs.aws.amazon.com/eks/latest/userguide/what-is-eks.html
+- AWS ECS Developer Guide: https://docs.aws.amazon.com/AmazonECS/latest/developerguide/Welcome.html
+- Elastic Load Balancing User Guide: https://docs.aws.amazon.com/elasticloadbalancing/latest/userguide/what-is-load-balancing.html
+- AWS IAM User Guide: https://docs.aws.amazon.com/IAM/latest/UserGuide/introduction.html
+- AWS KMS Developer Guide: https://docs.aws.amazon.com/kms/latest/developerguide/overview.html
 
 ---
 

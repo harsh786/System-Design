@@ -438,6 +438,183 @@ Monitor:
 - Backup success/failure.
 - Slow queries.
 
----
+## 7.17 Advanced Database Internals and Missing Interview Areas
 
+### Distributed SQL Internals
+
+Learn distributed SQL when interviews involve globally distributed relational systems.
+
+- Consensus replication: Raft/Paxos-style replication for ranges/tablets.
+- Range/tablet splitting and rebalancing.
+- Distributed transactions.
+- Timestamp ordering.
+- Clock uncertainty and TrueTime-style concepts.
+- Serializable isolation across shards.
+- Geo-partitioning and follower reads.
+- Transaction latency across regions.
+- Hot range detection.
+- Schema changes across distributed clusters.
+
+Examples to compare:
+
+- Google Spanner.
+- CockroachDB.
+- YugabyteDB.
+- TiDB.
+
+Interview rule:
+
+```text
+Distributed SQL gives relational semantics at scale, but cross-region consistency has latency and operational cost.
+```
+
+### HTAP Systems
+
+HTAP means hybrid transactional and analytical processing.
+
+- Row-store plus column-store combinations.
+- Real-time replication from OLTP to analytics.
+- Columnar secondary storage.
+- Fresh analytics over operational data.
+- Workload isolation.
+- Consistency between OLTP and OLAP views.
+
+Examples:
+
+- SingleStore.
+- TiDB.
+- AlloyDB-style operational analytics concepts.
+- SQL Server operational analytics with columnstore.
+
+### Embedded and Edge Databases
+
+Know when local storage matters:
+
+- SQLite for embedded/mobile/local-first applications.
+- DuckDB for local analytical processing.
+- RocksDB/LevelDB for embedded key-value storage.
+- LiteFS/rqlite-style distributed SQLite concepts.
+
+Interview focus:
+
+- Local-first sync.
+- Conflict resolution.
+- File locking.
+- WAL mode.
+- Backup and export.
+- Edge analytics.
+
+### Vector Search Internals
+
+Vector search is now a standard database interview topic for RAG and recommendation systems.
+
+- Embeddings and dimensionality.
+- Approximate nearest neighbor search.
+- HNSW.
+- IVF.
+- Product quantization.
+- Recall vs latency.
+- Metadata filtering.
+- Hybrid lexical + vector search.
+- Reranking.
+- Embedding model migration.
+- Reindexing and backfill.
+
+Examples:
+
+- pgvector.
+- Milvus.
+- Weaviate.
+- Qdrant.
+- Pinecone.
+- Elasticsearch/OpenSearch vector search.
+- Redis vector search.
+
+### Search Engine Internals
+
+Search systems are not primary transactional databases.
+
+- Inverted index.
+- Analyzer/tokenizer.
+- Stemming and synonyms.
+- BM25 scoring.
+- Doc values.
+- Refresh interval.
+- Segment merge.
+- Shard and replica sizing.
+- Index lifecycle management.
+- Relevance tuning.
+- Vector/hybrid search.
+
+Examples:
+
+- Elasticsearch.
+- OpenSearch.
+- Apache Solr.
+- Vespa.
+
+### Graph Database Internals
+
+- Nodes and relationships.
+- Property graph vs RDF/triple store.
+- Index-backed lookup.
+- Traversal cost.
+- Supernode problem.
+- Path expansion.
+- Cypher/Gremlin/SPARQL concepts.
+- Graph partitioning limits.
+
+Examples:
+
+- Neo4j.
+- JanusGraph.
+- Amazon Neptune.
+- TigerGraph.
+
+### Time-Series and Metrics Databases
+
+- High-cardinality labels.
+- Retention and downsampling.
+- Compression.
+- Chunking.
+- Continuous aggregates.
+- Rollups.
+- Remote write.
+- Query fanout.
+- Cardinality explosion.
+
+Examples:
+
+- TimescaleDB.
+- InfluxDB.
+- Prometheus.
+- VictoriaMetrics.
+- M3DB.
+- QuestDB.
+
+### Coordination and Metadata Stores
+
+Architects should distinguish user data stores from coordination stores.
+
+- etcd.
+- ZooKeeper.
+- Consul.
+
+Use for:
+
+- Leader election.
+- Distributed locks with caution.
+- Cluster metadata.
+- Service discovery.
+- Configuration.
+
+Risks:
+
+- Treating coordination stores as general databases.
+- Large values.
+- High write volume.
+- Poor quorum sizing.
+- Weak operational backup/restore plan.
+
+---
 

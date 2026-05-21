@@ -46,6 +46,10 @@ _Split from `../world_class_pro_architect_master_roadmap.md`. The original sourc
 - Tagging strategy.
 - Cloud security posture.
 
+## AWS Architect Roadmap Pointer
+
+Use [40-aws-architecture-concepts-roadmap.md](40-aws-architecture-concepts-roadmap.md) for the dedicated AWS architecture track covering Route 53, CloudFront, VPC, ALB/NLB, API Gateway, EKS, ECS, Fargate, EC2 worker node strategy, RDS/Aurora, DynamoDB, ElastiCache, KMS, IAM, federation, messaging, observability, deployment, DR, and AWS cost governance.
+
 ## Supply-Chain Security
 
 - SBOM.
@@ -353,5 +357,4 @@ RSASHA256(base64UrlEncode(header) + "." + base64UrlEncode(payload), privateKey)
 - Compliance: audit trails, data retention, deletion, residency, access reviews.
 
 ---
-
 

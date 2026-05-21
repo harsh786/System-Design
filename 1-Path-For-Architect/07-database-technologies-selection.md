@@ -317,6 +317,265 @@ _Split from `../world_class_pro_architect_master_roadmap.md`. The original sourc
 | Graph traversal | Neo4j/graph DB | Your queries are simple key lookups. |
 | Vector similarity | Vector DB / pgvector / Redis vector | You need strict OLTP constraints only. |
 
+## 8.12 Additional Database Technologies to Know
+
+### MySQL / InnoDB
+
+Best for:
+
+- High-volume relational OLTP.
+- Web applications.
+- Ecosystems where MySQL compatibility matters.
+
+Learn deeply:
+
+- Clustered primary key.
+- Secondary index lookup through primary key.
+- Buffer pool.
+- Redo and undo logs.
+- MVCC.
+- Gap locks and next-key locks.
+- Replication.
+- Online DDL.
+- Read replicas.
+- ProxySQL/Vitess-style scaling concepts.
+
+Interview focus:
+
+- MySQL vs PostgreSQL.
+- InnoDB index structure.
+- Replication lag.
+- Online schema migration.
+- How Vitess-style sharding works conceptually.
+
+### Oracle Database
+
+Best for:
+
+- Enterprise OLTP.
+- Legacy mission-critical systems.
+- Strong HA, tooling, and vendor support.
+
+Learn deeply:
+
+- Optimizer.
+- B-tree and bitmap indexes.
+- Partitioning.
+- RAC concepts.
+- Data Guard.
+- PL/SQL trade-offs.
+- Flashback.
+- Backup/recovery.
+
+Interview focus:
+
+- Enterprise HA.
+- Migration risk.
+- Stored procedure-heavy systems.
+- Vendor lock-in and modernization.
+
+### Distributed SQL
+
+Examples:
+
+- Google Spanner.
+- CockroachDB.
+- YugabyteDB.
+- TiDB.
+
+Best for:
+
+- Relational data with horizontal scale.
+- Stronger consistency than typical NoSQL.
+- Geo-distributed workloads where SQL is required.
+
+Learn deeply:
+
+- Consensus replication.
+- Range/tablet sharding.
+- Distributed transactions.
+- Serializable isolation.
+- Geo-partitioning.
+- Follower reads.
+- Transaction latency.
+- Clock uncertainty.
+
+Avoid when:
+
+- Single-region relational database is enough.
+- Cross-region write latency is unacceptable.
+- Team cannot operate distributed storage.
+
+### DynamoDB
+
+Best for:
+
+- Managed key-value/document access at massive scale.
+- Predictable access patterns.
+- Serverless or AWS-native architectures.
+
+Learn deeply:
+
+- Partition key and sort key.
+- Single-table design.
+- GSIs and LSIs.
+- Conditional writes.
+- Transactions.
+- Streams.
+- TTL.
+- Global tables.
+- Adaptive capacity.
+- Hot partitions.
+
+Interview focus:
+
+- Access-pattern-first modeling.
+- Hot key mitigation.
+- Conditional write for concurrency.
+- Global table consistency trade-offs.
+
+### Cassandra / Apache HBase
+
+Best for:
+
+- Very high write throughput.
+- Large sparse tables.
+- Predictable query patterns.
+
+Learn deeply:
+
+- Partition key and clustering key.
+- Memtables, SSTables, WAL/commit log.
+- Compaction.
+- Tombstones.
+- Bloom filters.
+- Consistency levels.
+- RegionServer/HDFS concepts for HBase.
+
+Interview focus:
+
+- Cassandra/Scylla vs HBase.
+- Query-first modeling.
+- Repair and compaction.
+- Hot partitions.
+
+### Couchbase
+
+Best for:
+
+- Document workloads with caching-style low latency.
+- Mobile/offline sync use cases.
+- JSON documents with SQL-like querying.
+
+Learn deeply:
+
+- Buckets/scopes/collections.
+- N1QL.
+- Indexes.
+- XDCR.
+- Sync Gateway concepts.
+- Memory-first architecture.
+
+### Solr and Vespa
+
+Best for:
+
+- Search-heavy systems.
+- Relevance tuning.
+- Large-scale query serving.
+
+Learn deeply:
+
+- Inverted index.
+- Ranking functions.
+- Shards and replicas.
+- Segment merges.
+- Text analyzers.
+- Vector/hybrid retrieval.
+
+### DuckDB
+
+Best for:
+
+- Embedded analytics.
+- Local data exploration.
+- Querying Parquet/CSV/lake files without a full cluster.
+
+Learn deeply:
+
+- Vectorized execution.
+- Columnar processing.
+- Parquet pushdown.
+- Local analytical workloads.
+
+### StarRocks and Apache Doris
+
+Best for:
+
+- MPP real-time analytics.
+- Low-latency SQL over large analytical datasets.
+- User-facing BI and dashboards.
+
+Learn deeply:
+
+- Columnar storage.
+- MPP execution.
+- Materialized views.
+- Primary-key/upsert models.
+- Query optimization.
+
+### Apache Druid
+
+Best for:
+
+- Real-time OLAP.
+- Time-partitioned event analytics.
+- Fast slice-and-dice dashboards.
+
+Learn deeply:
+
+- Segments.
+- Historical, broker, coordinator, overlord, middle manager/indexer roles.
+- Rollups.
+- Bitmap indexes.
+- Kafka ingestion.
+
+### FoundationDB
+
+Best for:
+
+- Building higher-level databases on a strongly consistent ordered key-value substrate.
+
+Learn deeply:
+
+- Ordered key-value model.
+- Strict serializable transactions.
+- Layers.
+- Tuple encoding.
+- Conflict ranges.
+
+### Lakehouse Query and Warehouse Engines
+
+Also compare:
+
+- Snowflake.
+- BigQuery.
+- Redshift.
+- Databricks SQL.
+- Trino.
+- Athena.
+- DuckDB.
+
+Architect focus:
+
+- Managed vs self-managed.
+- Storage-compute separation.
+- Workload isolation.
+- Query cost.
+- Data sharing.
+- Governance.
+- Open table format support.
+
 ---
 
 
@@ -338,6 +597,9 @@ Architect interviews often ask "which database and why?" Prepare by workload, no
 | Warehouse | Snowflake, BigQuery, Redshift | BI and large-scale SQL analytics | partitioning, clustering, distribution, workload management |
 | Lakehouse | Iceberg, Hudi, Delta on S3/GCS/ADLS | Open table analytics on object storage | snapshots, metadata, compaction, schema evolution, ACID table operations |
 | Vector | pgvector, Milvus, Pinecone, Weaviate | Similarity search and RAG | embeddings, ANN indexes, recall/latency, metadata filters |
+| Embedded/local analytics | SQLite, DuckDB | local-first apps, edge analytics, developer analytics | WAL, file locking, vectorized execution, Parquet pushdown |
+| Coordination stores | etcd, ZooKeeper, Consul | cluster metadata, leader election, service discovery | quorum, watches, sessions, operational backup |
+| HTAP | SingleStore, TiDB, SQL Server columnstore | operational analytics over fresh data | workload isolation, row/column layout, freshness, transactional impact |
 
 ### Selection Rules
 
@@ -358,5 +620,8 @@ Architect interviews often ask "which database and why?" Prepare by workload, no
 - Snowflake: virtual warehouses, micro-partitions, clustering, time travel, zero-copy clone, separation of storage and compute.
 - BigQuery: slots, partitioned tables, clustered tables, storage pricing, query cost, streaming ingestion.
 - Vector databases: HNSW/IVF concepts, recall vs latency, metadata filtering, re-ranking, embedding refresh strategy.
-
+- DuckDB: embedded OLAP, vectorized execution, local Parquet querying, analytics in notebooks and edge jobs.
+- StarRocks/Doris/Druid: MPP analytics, materialized views, segment/tablet design, real-time ingestion, low-latency dashboards.
+- FoundationDB: ordered key-value model, serializable transactions, layers, conflict ranges.
+- etcd/ZooKeeper/Consul: metadata and coordination, not general-purpose user-data stores.
 

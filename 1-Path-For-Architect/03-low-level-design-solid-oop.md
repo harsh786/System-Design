@@ -109,46 +109,165 @@ A strong answer does not start with classes. It starts with behavior, invariants
 
 ## Design Patterns
 
-### Creational
+This section is the complete LLD pattern catalog to know for architect interviews. Do not memorize names only. For each pattern, know the intent, when to use it, when not to use it, and one production example.
 
-- Factory Method.
-- Abstract Factory.
-- Builder.
-- Prototype.
-- Singleton with caution.
+### GoF Creational Patterns
 
-### Structural
+| Pattern | Intent | Use When | Avoid When | Example |
+| --- | --- | --- | --- | --- |
+| Factory Method | Let subclasses or implementations decide which object to create. | Creation varies by type, environment, or plugin. | Simple constructor is enough. | `PaymentProviderFactory.create(method)`. |
+| Abstract Factory | Create families of related objects without coupling to concrete classes. | Multiple compatible product families exist. | Only one product type changes. | UI widgets for web/mobile/native themes. |
+| Builder | Construct complex objects step by step while preserving invariants. | Object has many optional fields or validation rules. | Object has few required fields. | `OrderRequest.builder().items(...).coupon(...).build()`. |
+| Prototype | Clone preconfigured objects. | Object creation is expensive or dynamic. | Copy semantics are unclear. | Copying workflow templates or rule configurations. |
+| Singleton | Ensure one instance exists. | Shared stateless service or process-wide registry is truly needed. | Used as hidden global mutable state. | Application config registry, with caution. |
 
-- Adapter.
-- Facade.
-- Decorator.
-- Proxy.
-- Composite.
-- Bridge.
+### GoF Structural Patterns
 
-### Behavioral
+| Pattern | Intent | Use When | Avoid When | Example |
+| --- | --- | --- | --- | --- |
+| Adapter | Convert one interface into another expected by clients. | Integrating vendor APIs or legacy contracts. | You control both interfaces and can simplify directly. | Stripe/Adyen adapters behind `PaymentGateway`. |
+| Bridge | Separate abstraction from implementation so both vary independently. | Multiple dimensions of variation exist. | One dimension changes rarely. | Notification abstraction bridged to email/SMS/push implementations. |
+| Composite | Treat individual objects and groups uniformly. | Tree structures with common operations. | Parent and leaf behavior are very different. | File system folders/files, menu trees. |
+| Decorator | Add behavior without changing the wrapped object's contract. | Cross-cutting additions like logging, caching, retry, auth. | Behavior order becomes hard to reason about. | `RetryingPaymentClient` wrapping `PaymentClient`. |
+| Facade | Provide a simplified interface over a complex subsystem. | Clients need one stable entry point. | It hides too much and becomes a god service. | `CheckoutFacade` orchestrates cart, pricing, inventory, payment. |
+| Flyweight | Share intrinsic state to reduce memory. | Many small similar objects exist. | State is mostly unique. | Text editor character styles, game particles. |
+| Proxy | Control access to another object. | Lazy loading, remote access, caching, security, rate limiting. | Direct access is simpler and safe. | Repository proxy with cache and authorization. |
 
-- Strategy.
-- Observer.
-- Command.
-- State.
-- Chain of Responsibility.
-- Template Method.
-- Mediator.
-- Visitor.
+### GoF Behavioral Patterns
 
-### Enterprise Patterns
+| Pattern | Intent | Use When | Avoid When | Example |
+| --- | --- | --- | --- | --- |
+| Chain of Responsibility | Pass request through handlers until one handles it. | Ordered filters or validators. | Flow must be explicit and simple. | API gateway filters, validation chain. |
+| Command | Encapsulate a request as an object. | Queueing, retry, undo, audit, scheduling. | Direct method call is enough. | `ReserveInventoryCommand`, `RefundPaymentCommand`. |
+| Interpreter | Represent and evaluate a grammar. | Small domain language exists. | Full parser/compiler is needed. | Rule engine expressions. |
+| Iterator | Traverse a collection without exposing internals. | Collection representation should remain hidden. | Simple list access is enough. | Paginated result iterator. |
+| Mediator | Centralize complex object interactions. | Many components talk to each other. | Mediator becomes a god object. | UI dialog mediator, workflow coordinator. |
+| Memento | Capture and restore object state. | Undo/redo or checkpoints are needed. | State is huge or sensitive. | Text editor undo snapshot. |
+| Observer | Notify subscribers about changes. | One-to-many reactions are needed. | Delivery ordering/reliability is critical and needs durable events. | In-process domain event listeners. |
+| State | Change behavior when internal state changes. | State transitions drive behavior. | Only one or two simple conditionals exist. | Order: Created, Paid, Shipped, Cancelled. |
+| Strategy | Swap algorithms behind a stable interface. | Business policy varies. | Only one algorithm exists. | Pricing, routing, discount, retry policy. |
+| Template Method | Define algorithm skeleton and override steps. | Algorithm structure is stable; steps vary. | Composition is clearer. | Batch import pipeline stages. |
+| Visitor | Add operations to object structures without changing classes. | Stable object model, many operations. | Object model changes frequently. | AST processing, report generation. |
 
-- Repository.
-- Unit of Work.
-- Service Layer.
-- Specification.
-- Data Mapper.
-- Domain Model.
-- Transaction Script.
-- CQRS.
-- Outbox.
-- Saga.
+### GRASP Patterns
+
+GRASP helps you assign responsibilities during LLD.
+
+| Pattern | Intent | Example |
+| --- | --- | --- |
+| Information Expert | Assign responsibility to the class with the needed data. | `Order` calculates subtotal from order lines. |
+| Creator | Assign creation to class that contains or closely uses created object. | `Order` creates `OrderLine`. |
+| Controller | First object after UI/API boundary coordinates a use case. | `CheckoutController` calls application service. |
+| Low Coupling | Minimize dependency between modules. | Domain does not import HTTP or database classes. |
+| High Cohesion | Keep related behavior together. | `InventoryReservationService` only handles reservation workflow. |
+| Polymorphism | Use interfaces/subtypes for behavior variation. | `PaymentMethod` implementations. |
+| Pure Fabrication | Create a service class when domain object should not own responsibility. | `EmailSender`, `InvoicePdfGenerator`. |
+| Indirection | Insert an intermediate abstraction to reduce coupling. | `PaymentGateway` hides provider SDKs. |
+| Protected Variations | Shield clients from likely change points. | Stable `NotificationSender` interface. |
+
+### DDD Tactical Patterns
+
+| Pattern | Intent | Example |
+| --- | --- | --- |
+| Entity | Object with identity and lifecycle. | `Order`, `Customer`, `Account`. |
+| Value Object | Immutable object defined by value. | `Money`, `Address`, `DateRange`. |
+| Aggregate | Consistency boundary around entities/value objects. | `Order` aggregate owns order lines and state. |
+| Aggregate Root | Only entry point for modifying aggregate internals. | `Order.confirmPayment()`. |
+| Domain Service | Domain behavior that does not belong naturally to one entity. | `FraudPolicy`, `PricingService`. |
+| Repository | Collection-like abstraction for aggregate persistence. | `OrderRepository.findById()`. |
+| Factory | Encapsulate complex valid aggregate creation. | `BookingFactory.createHold(...)`. |
+| Domain Event | Record meaningful business fact. | `OrderConfirmed`, `PaymentFailed`. |
+| Specification | Reusable business predicate. | `CustomerEligibleForRefund`. |
+| Policy | Encapsulated decision rule. | `CancellationPolicy`. |
+
+### Enterprise Application Patterns
+
+| Pattern | Intent | Example |
+| --- | --- | --- |
+| Transaction Script | Simple procedural use case logic. | Admin maintenance action. |
+| Domain Model | Rich object model with behavior and invariants. | Order/payment/inventory workflow. |
+| Table Module | One class handles logic for a database table. | Legacy enterprise CRUD module. |
+| Service Layer | Application boundary for use cases and transactions. | `CheckoutApplicationService`. |
+| Repository | Persistence abstraction for aggregates. | `CustomerRepository`. |
+| Unit of Work | Track changes and commit once. | ORM session transaction. |
+| Data Mapper | Map domain objects to database records. | ORM mapper. |
+| Active Record | Object contains persistence methods. | Simple CRUD model. |
+| Identity Map | Avoid duplicate object instances per transaction. | ORM first-level cache. |
+| Lazy Load | Load data only when needed. | Lazy order details. |
+| DTO | Transfer data across process/layer boundary. | `OrderResponse`. |
+| Mapper/Assembler | Convert domain to DTO or persistence shape. | `OrderDtoMapper`. |
+
+### Integration and Messaging Patterns
+
+| Pattern | Intent | Example |
+| --- | --- | --- |
+| Outbox | Atomically persist state change and event to publish later. | Order DB writes `OrderCreated` outbox row. |
+| Inbox | Deduplicate and track consumed messages. | Consumer stores processed event IDs. |
+| Saga | Coordinate distributed workflow with compensation. | Order -> payment -> inventory -> shipment. |
+| Process Manager | Stateful orchestrator for long workflow. | Refund workflow manager. |
+| CQRS | Separate command and query models. | Transactional orders plus denormalized order history view. |
+| Event Sourcing | Persist events as source of truth. | Ledger or audit-heavy domain. |
+| Event-Carried State Transfer | Event includes enough state for consumers. | `ProductPriceChanged` includes new price. |
+| Request-Reply | Async request that expects correlated response. | Async fraud check result. |
+| Competing Consumers | Multiple workers process messages from same queue. | Email delivery workers. |
+| Dead Letter Queue | Store messages that cannot be processed. | Failed notification event. |
+
+### Resilience Patterns Used in LLD
+
+| Pattern | Intent | Example |
+| --- | --- | --- |
+| Timeout | Bound waiting time. | HTTP client timeout below caller timeout. |
+| Retry with Backoff | Retry transient failure safely. | Retry 503 with exponential backoff and jitter. |
+| Circuit Breaker | Stop calling unhealthy dependency temporarily. | Payment provider circuit breaker. |
+| Bulkhead | Isolate resource pools by dependency or traffic class. | Separate thread pools for payment and search. |
+| Rate Limiter | Protect system from excess traffic. | Token bucket per tenant. |
+| Load Shedding | Reject low-priority work under overload. | Drop analytics enrichment first. |
+| Fallback | Return degraded result. | Cached profile when profile service is down. |
+| Idempotency Key | Make retries safe. | Payment request ID. |
+| Back-Pressure | Slow producers when consumers cannot keep up. | Bounded queue with rejection policy. |
+
+### Concurrency Patterns
+
+| Pattern | Intent | Example |
+| --- | --- | --- |
+| Producer-Consumer | Decouple work creation and processing. | Request thread enqueues background job. |
+| Worker Pool | Bound concurrent execution. | Thread pool for image processing. |
+| Thread Pool | Reuse threads and control concurrency. | API executor with bounded queue. |
+| Future/Promise | Represent async result. | Parallel downstream calls. |
+| Reactor | Non-blocking event loop for I/O. | Netty-style server. |
+| Actor | Isolate mutable state behind message processing. | Per-user session actor. |
+| Read-Write Lock | Allow concurrent reads and exclusive writes. | Read-heavy config registry. |
+| Semaphore | Limit access to scarce resource. | Max concurrent calls to provider. |
+| Immutable Object | Avoid synchronization by design. | `Money`, config snapshots. |
+| Copy-on-Write | Safe reads with occasional writes. | Listener registry. |
+| Leader-Follower | Coordinate worker leadership. | Scheduler leader election client. |
+
+### API and Boundary Patterns
+
+| Pattern | Intent | Example |
+| --- | --- | --- |
+| Controller | Transport boundary. | HTTP controller validates request and delegates. |
+| Application Service | Use-case orchestration. | `PlaceOrderService`. |
+| Ports and Adapters | Domain depends on ports; infrastructure implements adapters. | `PaymentPort`, `StripePaymentAdapter`. |
+| Hexagonal Architecture | Keep domain isolated from frameworks and I/O. | Core package has no Spring/HTTP imports. |
+| Anti-Corruption Layer | Translate external/legacy model into domain model. | ERP order status adapter. |
+| Facade | Simplify subsystem access. | `CheckoutFacade`. |
+| Filter/Pipeline | Compose request processing stages. | auth, validation, rate limit, handler. |
+| Interceptor | Add cross-cutting behavior around calls. | tracing, metrics, auth. |
+
+### Testing Patterns
+
+| Pattern | Intent | Example |
+| --- | --- | --- |
+| Test Double | Replace dependency in tests. | fake payment provider. |
+| Stub | Return predefined data. | inventory available. |
+| Mock | Verify interaction. | email sender called once. |
+| Fake | Lightweight working implementation. | in-memory repository. |
+| Object Mother | Centralized test fixture creation. | valid customer factory. |
+| Test Data Builder | Fluent valid test objects. | `OrderBuilder`. |
+| Golden Master | Detect behavior changes in legacy code. | approval file for formatter. |
+| Contract Test | Verify interface compatibility. | payment adapter contract. |
+| Property-Based Test | Generate many inputs for invariants. | ledger always balances. |
 
 ## LLD Answer Template
 
@@ -304,4 +423,3 @@ A strong answer does not start with classes. It starts with behavior, invariants
 | 50 | Design a Meeting Scheduler | Availability, room booking, conflict resolution |
 
 ---
-

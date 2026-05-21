@@ -122,7 +122,10 @@ _Split from `../world_class_pro_architect_master_roadmap.md`. The original sourc
 - 1 domain-specific architecture drill.
 - 1 portfolio artifact update.
 - 1 behavioral leadership story.
+- 1 deployment strategy drill with rollback and metrics.
+- 1 million-user scaling drill with bottlenecks and cost model.
+- 1 enterprise/legacy/privacy/DR scenario review.
+- 1 end-to-end microservices scaling walkthrough from frontend to database/events.
+- 1 AWS architecture drill: VPC, edge, compute choice, data services, IAM/KMS, observability, DR, and cost.
 
 ---
-
-

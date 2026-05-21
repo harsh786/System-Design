@@ -80,6 +80,16 @@ These additions push the roadmap from strong architect preparation into top-tier
 | Testing Strategy | Prove correctness, compatibility, resilience, security, performance, data quality, and operational recovery. |
 | Portfolio Artifacts | Produce requirements, NFRs, C4 diagrams, APIs, events, ADRs, threat model, SLO, runbooks, cost model, migration plan, test strategy, and postmortem. |
 | Behavioral Leadership | Answer influence, conflict, migration, incident, cost, security, and mentoring questions with evidence and reflection. |
+| Enterprise Architecture | Connect systems to business capabilities, operating model, architecture governance, technology radar, and vendor strategy. |
+| Client Architecture | Design web, mobile, BFF, GraphQL, offline sync, client observability, accessibility, and release compatibility. |
+| Legacy Modernization | Modernize monoliths, ERP/CRM/mainframe integrations, file interfaces, CDC, facades, anti-corruption layers, and strangler migrations. |
+| Privacy and Data Governance | Design data classification, consent, retention, deletion, residency, lineage, contracts, quality, and compliance evidence. |
+| Infrastructure Internals | Debug Linux, TCP, DNS, TLS, file descriptors, containers, cgroups, page cache, and Kubernetes node/runtime failure modes. |
+| Business Continuity and DR | Define RTO/RPO, backup restore, active-passive, active-active, cyber recovery, crisis roles, and executive communication. |
+| Deployment Strategies | Choose rolling, blue-green, canary, progressive delivery, shadow, dark launch, feature flags, and expand-contract migrations. |
+| Million-User Scaling | Scale reads, writes, caches, shards, queues, fanout, services, regions, abuse controls, observability, and cost. |
+| End-to-End Microservices Scaling | Explain the full request path from frontend and DNS to load balancers, API gateway, BFF, services, pools, databases, caching, events, resilience, security, and observability. |
+| AWS Architecture | Design AWS systems across edge, VPC, load balancing, EKS/ECS/Fargate/EC2, RDS/Aurora/DynamoDB, ElastiCache, KMS/IAM/federation, messaging, observability, DR, and cost governance. |
 
 ---
 
@@ -322,4 +332,3 @@ Real-time analytics platform with Kafka, Spark/Flink, object storage, Iceberg/De
 - Perform failover, backup, and recovery drills.
 
 ---
-
