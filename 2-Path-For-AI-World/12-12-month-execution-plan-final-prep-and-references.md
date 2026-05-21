@@ -37,6 +37,7 @@ Output:
 Focus:
 
 - document ingestion
+- RAG pattern taxonomy
 - chunking
 - embeddings
 - vector DBs
@@ -51,6 +52,7 @@ Build:
 - production RAG app over real documents
 - vector DB benchmark
 - embedding model benchmark
+- RAG pattern comparison: naive, hybrid, reranked, parent-child, Graph RAG, Agentic RAG
 - golden retrieval dataset
 
 Output:
@@ -69,12 +71,14 @@ Focus:
 - confidence scoring
 - abstention
 - human approval
+- agent training and improvement loop
 
 Build:
 
 - agentic RAG assistant using vector search + SQL + API tools
 - bounded LangGraph workflow
 - source-grounded answer verifier
+- failure-clustering workflow for prompt/tool/graph/retriever improvements
 
 Output:
 
@@ -92,12 +96,15 @@ Focus:
 - LangSmith/Phoenix-style tracing
 - regression evals
 - prompt/retrieval/model tuning
+- cost per successful task
+- agent accuracy and efficiency scorecard
 
 Build:
 
 - automated eval CI pipeline
 - production-style trace dashboard
 - nightly regression job
+- tuning lab comparing prompts, retrievers, tools, graphs, model routing, and fine-tuning/distillation
 
 Output:
 
@@ -144,6 +151,11 @@ Focus:
 - incident response
 - canary deployment
 - load testing
+- million-user capacity model
+- cell-based tenant isolation
+- AI privacy and supply-chain review
+- UX trust and approval design
+- architecture review board process
 
 Build:
 
@@ -151,6 +163,7 @@ Build:
 - multi-tenant RAG/agent platform
 - cost and token optimization dashboard
 - disaster recovery plan
+- AI architecture review packet with privacy, vendor risk, UX trust, runtime identity, and maturity model
 
 Output:
 

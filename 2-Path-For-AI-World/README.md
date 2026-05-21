@@ -23,6 +23,7 @@ Read the files in numeric order. Each stage has a different job:
 | Interview Mastery | `11-senior-ai-architect-interview-bank.md` | Practice the 100 senior-level answer blueprints. |
 | 12-Month Plan | `12-12-month-execution-plan-final-prep-and-references.md` | Follow the execution plan, interview strategy, references, and closing principle. |
 | Added Deep Dive | `13-enterprise-scale-deep-dives-caching-sharding-partitioning.md` | Fill gaps around caching, vector DB sharding, partitioning, multi-tenancy, ingestion scaling, and scale testing. |
+| Master Gaps | `14-world-class-ai-architect-missing-master-topics.md` | Add product, privacy, supply-chain, UX trust, agent identity, architecture governance, build-vs-buy, and platform maturity topics. |
 
 ## Mastery Gates
 
@@ -53,6 +54,7 @@ Read the files in numeric order. Each stage has a different job:
 | Top 100 Interview Questions | `11-senior-ai-architect-interview-bank.md` |
 | 12-Month Plan, Interview Strategy, References, Closing Principle | `12-12-month-execution-plan-final-prep-and-references.md` |
 | Additional missing scale concepts | `13-enterprise-scale-deep-dives-caching-sharding-partitioning.md` |
+| Additional world-class architect topics | `14-world-class-ai-architect-missing-master-topics.md` |
 
 ## Original Roadmap Header
 

@@ -37,12 +37,14 @@
 - [ ] clean ingestion
 - [ ] table-aware parsing
 - [ ] OCR where needed
+- [ ] RAG pattern selected and justified
 - [ ] chunking benchmarked
 - [ ] metadata schema defined
 - [ ] ACL filters implemented
 - [ ] embedding model benchmarked
 - [ ] hybrid retrieval tested
 - [ ] reranker tested
+- [ ] retrieval failure modes documented
 - [ ] citations verified
 - [ ] stale docs removed
 - [ ] deletion propagation works
@@ -61,6 +63,8 @@
 - [ ] state persistence
 - [ ] memory policy
 - [ ] approval checkpoints
+- [ ] training/improvement loop defined
+- [ ] cost per successful task measured
 - [ ] trajectory evals
 - [ ] full traces
 
@@ -170,6 +174,33 @@ Include:
 - cost model
 - SLO dashboard
 - runbooks
+
+## Project 8: Agent Training and Optimization Lab
+
+Include:
+
+- production trace dataset
+- failure clustering
+- prompt/tool/graph variants
+- retriever variants
+- model routing experiment
+- fine-tuning or distillation experiment
+- golden eval comparison
+- cost per successful task dashboard
+- canary and rollback plan
+
+## Project 9: World-Class AI Architecture Review Board
+
+Include:
+
+- AI use-case intake
+- risk tiering
+- architecture review checklist
+- privacy and data governance review
+- vendor/supply-chain risk review
+- UX trust review
+- production readiness gate
+- ADR library
 
 ---
 

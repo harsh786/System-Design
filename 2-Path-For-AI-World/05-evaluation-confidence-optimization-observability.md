@@ -81,6 +81,35 @@ Milestone:
 
 > You do not ship because the demo looks good. You ship because the system passes measurable quality, safety, latency, and cost gates.
 
+## Agent Accuracy and Efficiency Scorecard
+
+Architects need to optimize the full task, not isolated model output.
+
+| Dimension | Metrics |
+|---|---|
+| task quality | task success, answer correctness, groundedness, completeness |
+| retrieval quality | recall@k, context precision, citation correctness, freshness |
+| tool quality | tool selection accuracy, argument accuracy, side-effect success, idempotency |
+| trajectory quality | minimal steps, no loops, correct ordering, recovery from tool failure |
+| safety | unsafe action rate, prompt-injection resistance, PII leakage rate |
+| efficiency | cost per successful task, tokens per successful task, latency per successful task |
+| reliability | timeout rate, fallback rate, retry success, degraded-mode success |
+| UX trust | escalation accuracy, abstention accuracy, user correction rate |
+
+Quality-cost frontier:
+
+```text
+for each workflow:
+  measure task_success, safety, p95_latency, cost_per_success
+  compare prompt/model/retriever/tool/graph variants
+  reject variants that improve cost but reduce safety or critical accuracy
+  canary only statistically meaningful improvements
+```
+
+Senior phrase:
+
+> I optimize agents on cost per correct, safe, completed task, not cost per model call.
+
 ---
 
 ## Phase 9: Confidence Scoring
@@ -157,6 +186,32 @@ Use fine-tuning when:
 - extraction behavior must be stable
 - smaller model must imitate larger model
 - repeated task behavior matters
+
+Model and agent training options:
+
+| Technique | Best For | Watch Out |
+|---|---|---|
+| prompt/program optimization | fast improvement without model ownership | overfitting to small eval sets |
+| retrieval tuning | factuality and private/changing knowledge | stale or low-quality source data |
+| SFT | consistent format, style, extraction, domain behavior | expensive data labeling and regression risk |
+| LoRA/adapters | efficient customization of open models | serving many adapters adds ops complexity |
+| DPO/preference tuning | ranking preferred responses | preference data quality controls outcome |
+| distillation | cheaper/faster student model | student loses edge-case reasoning |
+| synthetic data generation | rare cases, hard negatives, adversarial prompts | must be human-validated for golden evals |
+| human feedback mining | real production failures | privacy, sampling bias, labeling quality |
+
+Tuning order for production systems:
+
+1. Clarify product behavior and risk boundaries.
+2. Fix data quality, metadata, and retrieval.
+3. Improve prompts, schemas, and context assembly.
+4. Improve tools, graph transitions, memory, and stop conditions.
+5. Add routing, caching, compression, and batching.
+6. Fine-tune or distill only after evals show system-level tuning is insufficient.
+
+Tuning rule:
+
+> Change one major lever at a time and compare against a frozen baseline using the same golden set, safety set, latency test, and cost model.
 
 ---
 

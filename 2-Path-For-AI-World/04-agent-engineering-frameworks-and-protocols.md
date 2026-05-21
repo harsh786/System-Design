@@ -51,6 +51,41 @@ Pro rule:
 
 > Use deterministic workflows where possible. Add autonomy only where flexibility is worth the risk.
 
+## Training and Improving Agents
+
+Do not confuse training a model with improving an agent. An agent is a system made of prompts, tools, memory, graph transitions, policies, models, retrieval, evals, and runtime controls.
+
+| Improvement Lever | What Changes | Use When |
+|---|---|---|
+| prompt tuning | instructions, examples, response schema | behavior is inconsistent but model can already do the task |
+| tool tuning | tool names, descriptions, schemas, examples | agent picks wrong tools or wrong arguments |
+| graph tuning | routing, transitions, stop conditions, retries | workflow loops, skips approval, or follows weak paths |
+| memory tuning | write policy, retrieval policy, expiration | agent forgets useful state or remembers unsafe data |
+| retriever tuning | chunking, top_k, reranker, filters | agent lacks the right evidence |
+| model routing | choose model by intent/risk/difficulty | cost is high or simple tasks use oversized models |
+| fine-tuning | model weights or adapters | repeated behavior/style/schema is hard to force with prompting |
+| distillation | small model learns from stronger model outputs | cost/latency must drop at high volume |
+| human feedback loop | SME review becomes training/eval data | production failures reveal missing examples |
+| policy tuning | risk thresholds, approval rules, tool permissions | agent is too permissive or too conservative |
+
+Agent improvement loop:
+
+```text
+production trace
+  -> failure clustering
+  -> label root cause
+  -> choose one change lever
+  -> update prompt/tool/graph/retriever/model/policy
+  -> run golden evals
+  -> run trajectory and safety evals
+  -> canary release
+  -> monitor task success, cost, latency, and safety
+```
+
+Senior rule:
+
+> Train the agent system before training the model. Most failures are caused by weak tools, weak retrieval, weak state design, weak evals, or weak policies, not by missing model fine-tuning.
+
 ---
 
 ## Phase 5: Agent Frameworks

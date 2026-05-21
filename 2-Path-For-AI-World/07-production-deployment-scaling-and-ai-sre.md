@@ -67,6 +67,40 @@ x tool calls
 x eval sampling rate
 ```
 
+Expanded capacity model:
+
+```text
+peak_requests_per_second
+x agent_steps_per_request
+x model_calls_per_step
+x average_input_tokens
+x average_output_tokens
++ retrieval_qps
++ reranker_qps
++ tool_qps
++ embedding_jobs_per_second
++ trace_write_qps
++ eval_sample_qps
+= model, retrieval, tool, storage, observability, and review capacity
+```
+
+Million-user architecture patterns:
+
+| Pattern | Why It Matters |
+|---|---|
+| request classes | separate chat, retrieval, tool action, eval, and long-running jobs |
+| cell-based tenancy | isolate large tenants and reduce blast radius |
+| queues and workers | absorb spikes and run long tasks asynchronously |
+| backpressure | protect model providers, vector DBs, and tools |
+| model routing | send simple tasks to cheap/fast models and hard tasks to stronger models |
+| streaming responses | reduce perceived latency for interactive flows |
+| cache hierarchy | prompt, semantic, retrieval, reranker, embedding, and tool-result caches |
+| hot/cold indexes | keep frequently used knowledge fast and archival knowledge cheaper |
+| read replicas | scale vector, metadata, and trace reads independently |
+| budget enforcement | stop runaway tenants, prompts, agents, or eval sampling |
+| degraded modes | answer with limited tools/models when dependencies fail |
+| regional failover | survive provider, region, or data-plane incidents |
+
 Scaling checklist:
 
 - rate limit by user and tenant
@@ -91,6 +125,26 @@ Scaling checklist:
 - tenant isolation
 - canary and rollback
 - load test full path
+
+Scale testing must include:
+
+- auth and tenant policy
+- API gateway and AI gateway
+- model provider rate limits
+- vector retrieval and metadata filters
+- hybrid merge and reranking
+- tool latency and failure behavior
+- streaming path
+- queue depth and worker saturation
+- trace/log write volume
+- eval sampling overhead
+- cost budget enforcement
+- degraded mode and fallback behavior
+- cross-tenant isolation under load
+
+Architect rule:
+
+> Scaling an agent is not only scaling model calls. You must scale state, retrieval, tools, queues, evals, observability, memory, approvals, caches, budgets, and incident controls.
 
 ---
 

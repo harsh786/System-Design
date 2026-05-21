@@ -22,6 +22,37 @@ User question
   -> evaluate groundedness
 ```
 
+## RAG Pattern Taxonomy
+
+Different RAG patterns solve different failure modes. A senior architect should name the pattern, explain why it is needed, and define how it will be evaluated.
+
+| RAG Pattern | Use When | Main Risk |
+|---|---|---|
+| naive RAG | baseline Q&A over simple documents | weak recall, weak citations |
+| semantic RAG | semantic similarity is enough | misses exact terms, IDs, dates |
+| keyword/BM25 RAG | exact terms matter | misses paraphrases |
+| hybrid RAG | exact terms and semantic meaning both matter | score merging and tuning complexity |
+| reranked RAG | high precision and citation quality matter | extra latency and cost |
+| parent-child RAG | small chunks retrieve well but larger context is needed | parent context can add irrelevant text |
+| hierarchical RAG | books, standards, manuals, policies | hierarchy metadata must be reliable |
+| multi-query RAG | user query is ambiguous or underspecified | more retrieval calls and dedup complexity |
+| query-decomposition RAG | question needs multiple subquestions | subquestion planning can drift |
+| HyDE-style RAG | queries are short or abstract | generated hypothetical answer may bias retrieval |
+| self-query RAG | metadata filters can be inferred from question | generated filters can be wrong |
+| corrective RAG | retrieval result may be insufficient | needs reliable sufficiency detection |
+| adaptive RAG | choose retrieval strategy per query | router must be evaluated |
+| agentic RAG | multi-step planning, verification, or tool choice is needed | cost, latency, and control complexity |
+| Graph RAG | relationships and multi-hop connected facts matter | graph quality and entity resolution cost |
+| SQL + vector RAG | numeric facts and semantic docs both matter | consistency between SQL and text evidence |
+| temporal RAG | answers depend on time/version/freshness | stale or conflicting source versions |
+| multimodal RAG | documents include images, charts, screenshots, audio, or video | harder parsing, citation, and eval |
+| federated RAG | knowledge lives across many systems | source auth, latency, and result merging |
+| memory-augmented RAG | user/project history matters | privacy, staleness, and memory poisoning |
+
+Architect rule:
+
+> Start with the simplest measurable RAG design. Add hybrid search, reranking, decomposition, graph retrieval, agents, or multimodal retrieval only when evals show the simpler design cannot meet recall, groundedness, citation, latency, or cost targets.
+
 Master ingestion:
 
 - PDF parsing
@@ -145,5 +176,23 @@ Learn semantic architecture:
 Milestone:
 
 > You understand that enterprise AI quality depends on governed knowledge, not just model power.
+
+## Knowledge Quality and Retrieval Failure Modes
+
+Senior architects diagnose RAG failures by layer:
+
+| Failure | Likely Layer | Fix |
+|---|---|---|
+| correct document never retrieved | ingestion, chunking, embeddings, index, filters | improve parsing, chunking, metadata, embedding model, or hybrid retrieval |
+| correct document retrieved but answer wrong | context assembly, prompt, model, verification | improve context budget, claim verification, citations, or model choice |
+| stale answer | freshness, versioning, cache, sync pipeline | add freshness metadata, deletion propagation, cache invalidation, and reindex SLAs |
+| user sees unauthorized content | auth, ACL sync, metadata filters, cache keying | enforce permission-filtered retrieval and negative access tests |
+| citations point to weak evidence | chunking, reranking, citation builder | use claim-level citations, reranking, page/section offsets, citation evals |
+| answer is incomplete | retrieval depth, query decomposition, source coverage | add multi-query, decomposition, source authority ranking, or Graph RAG |
+| numeric answer is wrong | tool/data integration | use SQL/calculation tools and numeric accuracy evals |
+
+Retrieval design principle:
+
+> RAG quality is not one metric. Measure retrieval recall, context precision, groundedness, citation correctness, latency, freshness, permission safety, and cost together.
 
 ---
