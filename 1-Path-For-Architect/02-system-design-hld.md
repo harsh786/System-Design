@@ -2,6 +2,11 @@
 
 _Split from `../world_class_pro_architect_master_roadmap.md`. The original source file is intentionally untouched._
 
+Use the expanded practice banks here:
+
+- [Top 100 System Design Problem Bank](41-system-design-top-100-problem-bank.md)
+- [Top 300 System Design Concepts Interview Question Bank](44-system-design-concepts-top-300-interview-question-bank.md)
+
 ---
 
 # 3. System Design Roadmap
@@ -127,6 +132,8 @@ _Split from `../world_class_pro_architect_master_roadmap.md`. The original sourc
 
 Use this list for HLD practice. For every problem, produce requirements, scale estimates, APIs, data model, architecture, failure modes, observability, security, deployment, cost, and trade-offs.
 
+For the expanded architect-level practice bank, use `41-system-design-top-100-problem-bank.md`.
+
 | # | Problem | Category | Deep-Dive Focus |
 | --- | --- | --- | --- |
 | 1 | URL shortener | Core web scale | key generation, redirects, caching, analytics |
@@ -181,5 +188,3 @@ Use this list for HLD practice. For every problem, produce requirements, scale e
 | 50 | Data lakehouse platform | Data | S3, Iceberg/Hudi, Spark/Flink, governance |
 
 ---
-
-

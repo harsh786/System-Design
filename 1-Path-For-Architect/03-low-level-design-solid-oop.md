@@ -288,6 +288,8 @@ GRASP helps you assign responsibilities during LLD.
 
 ## Practice Problems
 
+For the expanded architect-level LLD practice bank, use `42-low-level-design-top-100-problem-bank.md`.
+
 - Parking lot.
 - Elevator.
 - Library management.

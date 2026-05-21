@@ -2,6 +2,8 @@
 
 _Split from `../world_class_pro_architect_master_roadmap.md`. The original source file is intentionally untouched._
 
+Use the expanded interview drill bank here: [Top 300 Big Data, Streaming, Lakehouse, and Analytics Interview Question Bank](46-big-data-streaming-lakehouse-top-300-interview-question-bank.md).
+
 ---
 
 
@@ -369,4 +371,3 @@ Design a clickstream lakehouse:
 6. Run batch transforms with Spark/dbt.
 7. Query through Trino/Athena and serve real-time dashboards through Pinot/ClickHouse.
 8. Add lineage, data quality tests, RBAC, encryption, lifecycle, cost monitoring, and replay plan.
-

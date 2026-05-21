@@ -2,6 +2,8 @@
 
 _Split from `../world_class_pro_architect_master_roadmap.md`. The original source file is intentionally untouched._
 
+Use the expanded interview drill bank here: [Top 200 Java, JVM, Concurrency, and Spring Interview Question Bank](43-java-jvm-spring-top-200-interview-question-bank.md).
+
 ---
 
 # 6. Languages and Frameworks Roadmap
@@ -173,5 +175,4 @@ Architect-level Java knowledge is not only syntax. You must explain how Java beh
 8. Implement producer-consumer with graceful shutdown.
 9. Debug a simulated GC pause and explain remediation.
 10. Build a Spring Boot API and trace one request through servlet thread, connection pool, DB transaction, and telemetry.
-
 

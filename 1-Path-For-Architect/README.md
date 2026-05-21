@@ -47,6 +47,13 @@ Use this as a staff/principal/architect preparation system: each file is a separ
 38. [Scaling Strategies for Millions of Users](38-scaling-strategies-for-millions-of-users.md)
 39. [End-to-End Microservices Scalability](39-microservices-scalability-end-to-end.md)
 40. [AWS Architecture Concepts Roadmap](40-aws-architecture-concepts-roadmap.md)
+41. [Top 100 System Design Problem Bank](41-system-design-top-100-problem-bank.md)
+42. [Top 100 Low-Level Design Problem Bank](42-low-level-design-top-100-problem-bank.md)
+43. [Top 200 Java, JVM, Concurrency, and Spring Interview Question Bank](43-java-jvm-spring-top-200-interview-question-bank.md)
+44. [Top 300 System Design Concepts Interview Question Bank](44-system-design-concepts-top-300-interview-question-bank.md)
+45. [Top 360 Database and Database Design Interview Question Bank](45-database-database-design-top-300-interview-question-bank.md)
+46. [Top 300 Big Data, Streaming, Lakehouse, and Analytics Interview Question Bank](46-big-data-streaming-lakehouse-top-300-interview-question-bank.md)
+47. [DSA Interview Questions By LeetCode Category](47-dsa-leetcode-category-top-50-interview-bank.md)
 
 ## Architect-Level Outcome Matrix
 
