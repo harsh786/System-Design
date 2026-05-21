@@ -22,7 +22,7 @@ Read the files in numeric order. Each stage has a different job:
 | Execution Assets | `10-production-checklists-capstones-and-templates.md` | Use readiness checklists, capstone projects, and architecture templates. |
 | Interview Mastery | `11-senior-ai-architect-interview-bank.md` | Practice the 100 senior-level answer blueprints. |
 | 12-Month Plan | `12-12-month-execution-plan-final-prep-and-references.md` | Follow the execution plan, interview strategy, references, and closing principle. |
-| Added Deep Dive | `13-enterprise-scale-deep-dives-caching-sharding-partitioning.md` | Fill gaps around caching, vector DB sharding, partitioning, multi-tenancy, ingestion scaling, and scale testing. |
+| Added Deep Dive | `13-enterprise-scale-deep-dives-caching-sharding-partitioning.md` | Fill gaps around billion-request AI caching, vector DB sharding, partitioning, multi-tenancy, ingestion scaling, and scale testing. |
 | Master Gaps | `14-world-class-ai-architect-missing-master-topics.md` | Add product, privacy, supply-chain, UX trust, agent identity, architecture governance, build-vs-buy, and platform maturity topics. |
 
 ## Mastery Gates

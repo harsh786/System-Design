@@ -43,7 +43,7 @@ You are ready when you can do the following without notes:
 - Explain end-to-end microservices scalability from frontend and DNS to load balancers, WAF, API gateway, CORS, rate limiting, BFF, services, thread pools, connection pools, database pools, indexing, partitioning, sharding, caching, outbox, event processing, resilience patterns, security, observability, and deployment safety.
 - Compare additional database families and engines: MySQL/InnoDB, Oracle, DynamoDB, Cassandra, HBase, distributed SQL, HTAP, search, graph, time-series, vector, embedded, coordination, and OLAP engines.
 - Design lakehouse ecosystems with object storage, file formats, Iceberg/Hudi/Delta, catalogs, governance, CDC, orchestration, stream processing, data quality, lineage, serving engines, and cost controls.
-- Design AWS architectures with Route 53, CloudFront, WAF, VPC, subnets, NAT, VPC endpoints, ALB/NLB, API Gateway, EKS, ECS, Fargate, EC2 worker node types, RDS/Aurora, DynamoDB, ElastiCache, KMS, IAM, federation, SQS/SNS/EventBridge/Kinesis, CloudWatch, CloudTrail, Config, DR, and cost governance.
+- Design AWS architectures with Route 53, CloudFront, WAF, VPC, subnets, NAT, VPC endpoints, ALB/NLB, API Gateway, EKS, ECS, Fargate, EC2 worker node types, service mesh/service discovery, VPC Lattice, ECS Service Connect, RDS/Aurora, DynamoDB, ElastiCache, KMS, IAM, federation, SQS/SNS/EventBridge/Kinesis, CloudWatch, CloudTrail, Config, DR, and cost governance.
 
 ---
 

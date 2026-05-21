@@ -41,7 +41,7 @@ Production design includes:
 
 ---
 
-## Phase 17: Scaling to Millions of Users
+## Phase 17: Scaling to Millions and Billions of Requests
 
 Every request may involve:
 
@@ -101,6 +101,8 @@ Million-user architecture patterns:
 | degraded modes | answer with limited tools/models when dependencies fail |
 | regional failover | survive provider, region, or data-plane incidents |
 
+For billion-request AI platforms, treat prompt caching as one optimization layer, not the scale architecture. Use the full strategy in `13-enterprise-scale-deep-dives-caching-sharding-partitioning.md`: prompt/prefix caching, semantic response caching, retrieval cache, embedding cache, reranker cache, tool-result cache, regional cache hierarchy, tenant-aware cache keys, cache invalidation, cache stampede protection, hot-key protection, stale-answer policy, cache safety for auth/permissions, and a billion-request capacity model.
+
 Scaling checklist:
 
 - rate limit by user and tenant
@@ -125,6 +127,23 @@ Scaling checklist:
 - tenant isolation
 - canary and rollback
 - load test full path
+
+Billion-request checklist:
+
+- regional cells
+- model routing
+- provider fallback
+- request batching
+- async queues
+- vector DB sharding
+- hot-index replication
+- semantic cache
+- retrieval cache
+- rate limits
+- backpressure
+- budget controls
+- degraded modes
+- cache safety tests for auth and permissions
 
 Scale testing must include:
 

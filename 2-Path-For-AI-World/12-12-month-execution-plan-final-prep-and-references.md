@@ -152,6 +152,7 @@ Focus:
 - canary deployment
 - load testing
 - million-user capacity model
+- billion-request AI caching strategy
 - cell-based tenant isolation
 - AI privacy and supply-chain review
 - UX trust and approval design
@@ -163,6 +164,7 @@ Build:
 - multi-tenant RAG/agent platform
 - cost and token optimization dashboard
 - disaster recovery plan
+- prompt, semantic, retrieval, embedding, reranker, and tool-result cache design
 - AI architecture review packet with privacy, vendor risk, UX trust, runtime identity, and maturity model
 
 Output:

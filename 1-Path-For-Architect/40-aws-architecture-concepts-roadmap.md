@@ -19,7 +19,7 @@ Requirements -> Regions/AZs -> Network boundary -> Edge/DNS -> Compute model -> 
 | Global edge | Route 53, CloudFront, Global Accelerator, WAF, Shield, ACM. |
 | Network | VPC, subnets, route tables, IGW, NAT Gateway, Security Groups, NACLs, VPC endpoints, PrivateLink, Transit Gateway, Direct Connect, VPN. |
 | Compute | EC2, Auto Scaling Groups, Lambda, Batch. |
-| Containers | EKS, ECS, Fargate, ECR, App Mesh, Cloud Map. |
+| Containers | EKS, ECS, Fargate, ECR, ECS Service Connect, Cloud Map, VPC Lattice, Kubernetes service mesh options. |
 | API entry | API Gateway, ALB, NLB, AppSync, CloudFront Functions, Lambda@Edge. |
 | Data | RDS, Aurora, DynamoDB, ElastiCache, OpenSearch, Redshift, S3, EFS, EBS, FSx. |
 | Messaging | SQS, SNS, EventBridge, Kinesis, MSK, Step Functions. |
@@ -278,6 +278,223 @@ Decision rule:
 ```text
 Choose ECS/Fargate for AWS-native simplicity, EKS for Kubernetes ecosystem and platform flexibility, EC2/ASG for maximum host control.
 ```
+
+## Service Mesh, Service Discovery, and Application Networking
+
+This area was intentionally under-specified in the first version of this AWS roadmap. For architect interviews, service-to-service networking deserves its own section because it affects reliability, security, observability, traffic management, and operational complexity.
+
+### What a Service Mesh Solves
+
+A service mesh or application networking layer can provide:
+
+- Service discovery.
+- Client-side or proxy-based load balancing.
+- mTLS between services.
+- Traffic shifting.
+- Retries.
+- Timeouts.
+- Circuit breaking.
+- Outlier detection.
+- Request-level metrics.
+- Distributed tracing integration.
+- Access policy between services.
+- Consistent service-to-service communication across many teams.
+
+Architect rule:
+
+```text
+Do not add a service mesh just because microservices exist. Add it when service-to-service traffic policy, identity, observability, or cross-team consistency justifies the operational cost.
+```
+
+### AWS Options for Service-to-Service Communication
+
+| Option | Best For | Notes |
+| --- | --- | --- |
+| Kubernetes Service + CoreDNS | Basic EKS internal service discovery. | Good default inside one cluster. |
+| ECS Service Discovery / Cloud Map | ECS service discovery and DNS-based lookup. | Useful for ECS services and custom service registries. |
+| ECS Service Connect | ECS-native service discovery, connectivity, and traffic telemetry. | Good default for ECS service-to-service communication. |
+| VPC Lattice | Cross-VPC, cross-account application networking. | Connect, secure, and monitor services across VPCs/accounts without exposing everything publicly. |
+| PrivateLink | Private producer-consumer service exposure. | Strong for private SaaS/internal service exposure across accounts/VPCs. |
+| Internal ALB/NLB | Internal service routing and load balancing. | Simple and familiar, but can become costly/noisy at large service counts. |
+| Kubernetes-native mesh | Istio, Linkerd, Consul, Kuma, Envoy Gateway/Gateway API. | Stronger mesh features, but higher operational ownership. |
+| AWS App Mesh | Legacy AWS-managed Envoy mesh. | AWS has announced end of support on September 30, 2026, so treat as migration/legacy knowledge rather than a new default. |
+
+### AWS App Mesh: Know It, But Do Not Default to It
+
+As of May 22, 2026, AWS documentation states that AWS App Mesh support ends on September 30, 2026. For interviews, know App Mesh concepts because existing systems may still use it, but for new architecture explain safer current alternatives.
+
+App Mesh concepts:
+
+- Service mesh.
+- Virtual service.
+- Virtual node.
+- Virtual router.
+- Route.
+- Envoy sidecar.
+- Cloud Map or DNS service discovery.
+- TLS/mTLS.
+- Retries, timeouts, and traffic splitting.
+- Metrics, logs, and traces through Envoy integrations.
+
+Migration-aware answer:
+
+```text
+If the system already uses App Mesh, I would plan migration before the September 30, 2026 support deadline. For ECS workloads I would evaluate ECS Service Connect. For cross-account or cross-VPC service networking I would evaluate VPC Lattice. For EKS workloads needing advanced mesh features, I would evaluate Istio, Linkerd, Consul, or Gateway API/Envoy-based options depending on team maturity.
+```
+
+### VPC Lattice
+
+Use when:
+
+- Services span multiple VPCs.
+- Services span multiple AWS accounts.
+- You need application-layer routing without exposing services publicly.
+- You want consistent auth, routing, and monitoring across heterogeneous compute: EC2, ECS, EKS, Lambda.
+- You want a service-network abstraction rather than per-service peering and load balancer wiring.
+
+Key concepts:
+
+- Service network.
+- Service.
+- Target group.
+- Listener.
+- Rule.
+- Auth policy.
+- VPC association.
+- Service network VPC endpoint.
+
+Architect focus:
+
+- Cross-account access control.
+- IAM-based auth policies.
+- Observability.
+- Private connectivity.
+- Cost and data processing charges.
+- Regional scope and failure model.
+
+### ECS Service Connect
+
+Use when:
+
+- You are on ECS.
+- You want simple service discovery and service-to-service connectivity.
+- You want friendly service names.
+- You want traffic telemetry in ECS/CloudWatch.
+- You want less operational burden than running a full mesh.
+
+Concepts:
+
+- Service Connect namespace.
+- Client aliases.
+- Service discovery name.
+- Sidecar/proxy behavior managed by ECS.
+- Traffic telemetry.
+- Connection draining during deployments.
+
+Trade-off:
+
+- Strong ECS-native fit, but not a general cross-platform service mesh.
+
+### EKS Service Mesh Options
+
+For EKS, compare:
+
+| Option | Use When | Trade-Off |
+| --- | --- | --- |
+| Kubernetes Service/CoreDNS | Basic internal service discovery. | No advanced traffic policy or mTLS by default. |
+| AWS Load Balancer Controller | Ingress/ALB/NLB integration. | North-south and selected internal routing, not full mesh by itself. |
+| Gateway API / Envoy Gateway | Standard Kubernetes API gateway/traffic management direction. | Still requires platform maturity. |
+| Istio | Advanced traffic management, mTLS, policy, telemetry. | High operational complexity. |
+| Linkerd | Simpler Kubernetes mesh with mTLS and observability. | Fewer advanced traffic features than Istio. |
+| Consul | Multi-platform service discovery and mesh. | Requires HashiCorp/Consul operations expertise. |
+
+### Service Discovery Choices
+
+| Need | Prefer |
+| --- | --- |
+| EKS service in one cluster | Kubernetes Service and CoreDNS. |
+| ECS service discovery | ECS Service Connect or Cloud Map. |
+| Cross-account service networking | VPC Lattice or PrivateLink. |
+| Private producer-consumer API | PrivateLink. |
+| HTTP ingress | ALB, API Gateway, or Gateway API/Ingress. |
+| Multi-service mesh policy | Istio/Linkerd/Consul or equivalent. |
+
+### Traffic Management Capabilities
+
+Know these for interviews:
+
+- Weighted routing.
+- Canary by service version.
+- Blue-green traffic shift.
+- Header-based routing.
+- Path-based routing.
+- Retry policy.
+- Timeout policy.
+- Circuit breaker.
+- Outlier detection.
+- Connection draining.
+- Fault injection.
+- Request mirroring/shadow traffic.
+
+AWS mapping:
+
+- Route 53: DNS traffic routing and failover.
+- CloudFront: edge routing and cache behavior.
+- ALB: host/path/header routing and target-group weighted forwarding.
+- API Gateway: managed API front door, throttling, auth, stages.
+- ECS Service Connect: ECS service connectivity and telemetry.
+- VPC Lattice: service networks across VPCs/accounts.
+- Kubernetes mesh: deeper east-west service traffic control.
+
+### mTLS and Service Identity
+
+Design questions:
+
+- Who issues certificates?
+- How are certificates rotated?
+- Is service identity bound to workload identity?
+- Is mTLS required everywhere or only sensitive service paths?
+- How do you debug certificate expiry or trust-chain failures?
+- How does this integrate with IAM, Kubernetes service accounts, or SPIFFE/SPIRE-style identity?
+
+Architect warning:
+
+- mTLS without certificate lifecycle automation becomes an outage source.
+- mTLS does not replace authorization. It authenticates service identity; policy must still decide what the service can do.
+
+### Observability in Service Mesh and App Networking
+
+Track:
+
+- Request rate by source and destination service.
+- p95/p99 latency by service pair.
+- Error rate by route.
+- Retry count.
+- Timeout count.
+- Circuit breaker/open state.
+- mTLS handshake/cert errors.
+- Saturated downstream services.
+- Top talkers and unexpected service calls.
+- Cross-AZ/cross-region traffic cost.
+
+### When Service Mesh Is Overkill
+
+Avoid a mesh when:
+
+- You have a small number of services.
+- Team cannot operate proxy/control-plane upgrades.
+- Basic ALB/API Gateway/Cloud Map is enough.
+- You do not need mTLS, advanced traffic policy, or deep east-west observability.
+- The mesh would hide bad service boundaries instead of fixing them.
+
+Simpler alternatives:
+
+- API Gateway for external APIs.
+- ALB for HTTP service ingress.
+- Cloud Map for service discovery.
+- ECS Service Connect for ECS-only service communication.
+- VPC Lattice for cross-VPC/account service networking.
+- Application-level resilience libraries when few services exist.
 
 ## API and Application Entry
 
@@ -634,8 +851,6 @@ Know:
 - Lake Formation: lake permissions/governance.
 - Kinesis Data Firehose: streaming delivery.
 - QuickSight: BI dashboards.
-- SageMaker: ML platform.
-- Bedrock: managed foundation models and GenAI app building.
 
 Architect focus:
 
@@ -869,9 +1084,11 @@ Use for:
 - AWS Well-Architected Framework: https://docs.aws.amazon.com/wellarchitected/latest/framework/welcome.html
 - Amazon EKS User Guide: https://docs.aws.amazon.com/eks/latest/userguide/what-is-eks.html
 - Amazon ECS Developer Guide: https://docs.aws.amazon.com/AmazonECS/latest/developerguide/Welcome.html
+- Amazon ECS Service Connect: https://docs.aws.amazon.com/AmazonECS/latest/developerguide/service-connect.html
+- Amazon VPC Lattice User Guide: https://docs.aws.amazon.com/vpc-lattice/latest/ug/what-is-vpc-lattice.html
+- AWS App Mesh User Guide: https://docs.aws.amazon.com/app-mesh/latest/userguide/what-is-app-mesh.html
 - Elastic Load Balancing User Guide: https://docs.aws.amazon.com/elasticloadbalancing/latest/userguide/what-is-load-balancing.html
 - Amazon RDS User Guide: https://docs.aws.amazon.com/AmazonRDS/latest/UserGuide/Welcome.html
 - AWS IAM User Guide: https://docs.aws.amazon.com/IAM/latest/UserGuide/introduction.html
 - AWS KMS Developer Guide: https://docs.aws.amazon.com/kms/latest/developerguide/overview.html
 - Amazon ElastiCache User Guide: https://docs.aws.amazon.com/AmazonElastiCache/latest/dg/WhatIs.html
-
