@@ -1,0 +1,1017 @@
+<!DOCTYPE html>
+        <html>
+        <head>
+            <meta charset="UTF-8">
+            <title>Slack Architecture Deep Dive</title>
+            <style>
+/* From extension vscode.github */
+/*---------------------------------------------------------------------------------------------
+ *  Copyright (c) Microsoft Corporation. All rights reserved.
+ *  Licensed under the MIT License. See License.txt in the project root for license information.
+ *--------------------------------------------------------------------------------------------*/
+
+.vscode-dark img[src$=\#gh-light-mode-only],
+.vscode-light img[src$=\#gh-dark-mode-only],
+.vscode-high-contrast:not(.vscode-high-contrast-light) img[src$=\#gh-light-mode-only],
+.vscode-high-contrast-light img[src$=\#gh-dark-mode-only] {
+	display: none;
+}
+
+</style>
+            
+        <link rel="stylesheet" href="https://cdn.jsdelivr.net/gh/Microsoft/vscode/extensions/markdown-language-features/media/markdown.css">
+<link rel="stylesheet" href="https://cdn.jsdelivr.net/gh/Microsoft/vscode/extensions/markdown-language-features/media/highlight.css">
+<style>
+            body {
+                font-family: -apple-system, BlinkMacSystemFont, 'Segoe WPC', 'Segoe UI', system-ui, 'Ubuntu', 'Droid Sans', sans-serif;
+                font-size: 14px;
+                line-height: 1.6;
+            }
+        </style>
+        <style>
+.task-list-item {
+    list-style-type: none;
+}
+
+.task-list-item-checkbox {
+    margin-left: -20px;
+    vertical-align: middle;
+    pointer-events: none;
+}
+</style>
+<style>
+:root {
+  --color-note: #0969da;
+  --color-tip: #1a7f37;
+  --color-warning: #9a6700;
+  --color-severe: #bc4c00;
+  --color-caution: #d1242f;
+  --color-important: #8250df;
+}
+
+</style>
+<style>
+@media (prefers-color-scheme: dark) {
+  :root {
+    --color-note: #2f81f7;
+    --color-tip: #3fb950;
+    --color-warning: #d29922;
+    --color-severe: #db6d28;
+    --color-caution: #f85149;
+    --color-important: #a371f7;
+  }
+}
+
+</style>
+<style>
+.markdown-alert {
+  padding: 0.5rem 1rem;
+  margin-bottom: 16px;
+  color: inherit;
+  border-left: .25em solid #888;
+}
+
+.markdown-alert>:first-child {
+  margin-top: 0
+}
+
+.markdown-alert>:last-child {
+  margin-bottom: 0
+}
+
+.markdown-alert .markdown-alert-title {
+  display: flex;
+  font-weight: 500;
+  align-items: center;
+  line-height: 1
+}
+
+.markdown-alert .markdown-alert-title .octicon {
+  margin-right: 0.5rem;
+  display: inline-block;
+  overflow: visible !important;
+  vertical-align: text-bottom;
+  fill: currentColor;
+}
+
+.markdown-alert.markdown-alert-note {
+  border-left-color: var(--color-note);
+}
+
+.markdown-alert.markdown-alert-note .markdown-alert-title {
+  color: var(--color-note);
+}
+
+.markdown-alert.markdown-alert-important {
+  border-left-color: var(--color-important);
+}
+
+.markdown-alert.markdown-alert-important .markdown-alert-title {
+  color: var(--color-important);
+}
+
+.markdown-alert.markdown-alert-warning {
+  border-left-color: var(--color-warning);
+}
+
+.markdown-alert.markdown-alert-warning .markdown-alert-title {
+  color: var(--color-warning);
+}
+
+.markdown-alert.markdown-alert-tip {
+  border-left-color: var(--color-tip);
+}
+
+.markdown-alert.markdown-alert-tip .markdown-alert-title {
+  color: var(--color-tip);
+}
+
+.markdown-alert.markdown-alert-caution {
+  border-left-color: var(--color-caution);
+}
+
+.markdown-alert.markdown-alert-caution .markdown-alert-title {
+  color: var(--color-caution);
+}
+
+</style>
+        
+        </head>
+        <body class="vscode-body vscode-light">
+            <span id="markdown-mermaid" aria-hidden="true" data-config="{&quot;darkModeTheme&quot;:&quot;dark&quot;,&quot;lightModeTheme&quot;:&quot;default&quot;,&quot;maxTextSize&quot;:50000,&quot;clickDrag&quot;:&quot;alt&quot;,&quot;showControls&quot;:&quot;onHoverOrFocus&quot;,&quot;resizable&quot;:true,&quot;maxHeight&quot;:&quot;&quot;}"></span>
+				<h1 id="slack-architecture-deep-dive">Slack Architecture Deep Dive</h1>
+<h2 id="table-of-contents">Table of Contents</h2>
+<ol>
+<li><a href="#1-high-level-architecture">High-Level Architecture</a></li>
+<li><a href="#2-gateway-server">Gateway Server</a></li>
+<li><a href="#3-channel-server">Channel Server</a></li>
+<li><a href="#4-admin-server">Admin Server</a></li>
+<li><a href="#5-presence-server">Presence Server</a></li>
+<li><a href="#6-how-all-servers-work-together">How All Servers Work Together</a></li>
+<li><a href="#7-end-to-end-message-flow-examples">End-to-End Message Flow Examples</a></li>
+<li><a href="#8-data-storage-layer">Data Storage Layer</a></li>
+<li><a href="#9-failure-scenarios--resilience">Failure Scenarios &amp; Resilience</a></li>
+</ol>
+<hr>
+<h2 id="1-high-level-architecture">1. High-Level Architecture</h2>
+<pre><code>┌─────────────────────────────────────────────────────────────────────────────┐
+│                              CLIENTS                                         │
+│   Desktop App    │    Mobile App    │    Web Browser    │    Bot/API         │
+└───────┬──────────┴────────┬─────────┴───────┬───────────┴────────┬──────────┘
+        │                   │                 │                    │
+        ▼                   ▼                 ▼                    ▼
+┌─────────────────────────────────────────────────────────────────────────────┐
+│                         EDGE LAYER (Envoy / Flannel)                         │
+│  • TLS termination   • Rate limiting   • Load balancing   • Auth validation  │
+└───────┬──────────────────┬──────────────────┬──────────────────┬────────────┘
+        │                  │                  │                  │
+        ▼                  ▼                  ▼                  ▼
+┌──────────────┐  ┌──────────────┐  ┌──────────────┐  ┌──────────────────┐
+│   GATEWAY    │  │   CHANNEL    │  │    ADMIN     │  │    PRESENCE      │
+│   SERVER     │  │   SERVER     │  │    SERVER    │  │    SERVER        │
+│              │  │              │  │              │  │                  │
+│ • WebSocket  │  │ • Message    │  │ • Workspace  │  │ • Online/Offline │
+│   management │  │   routing    │  │   mgmt       │  │ • Away/DND      │
+│ • Session    │  │ • Channel    │  │ • Permissions│  │ • Heartbeat     │
+│   tracking   │  │   CRUD       │  │ • Billing    │  │ • Status text   │
+│ • Event      │  │ • Fan-out    │  │ • User mgmt  │  │ • Typing        │
+│   dispatch   │  │ • History    │  │ • Compliance │  │   indicators    │
+└──────┬───────┘  └──────┬───────┘  └──────┬───────┘  └────────┬─────────┘
+       │                 │                  │                   │
+       ▼                 ▼                  ▼                   ▼
+┌─────────────────────────────────────────────────────────────────────────────┐
+│                         MESSAGE BUS (Redis Pub/Sub + Kafka)                   │
+└───────┬──────────────────┬──────────────────┬──────────────────┬────────────┘
+        │                  │                  │                  │
+        ▼                  ▼                  ▼                  ▼
+┌─────────────────────────────────────────────────────────────────────────────┐
+│                         DATA LAYER                                            │
+│  MySQL/Vitess (sharded)  │  Redis (cache/sessions)  │  S3 (files/media)     │
+│  Solr/Elasticsearch      │  Memcached               │  Kafka (event log)    │
+└─────────────────────────────────────────────────────────────────────────────┘
+</code></pre>
+<h3 id="core-design-principles">Core Design Principles</h3>
+<table>
+<thead>
+<tr>
+<th>Principle</th>
+<th>How Slack Applies It</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Stateless services</td>
+<td>Gateway servers hold connections but no business state</td>
+</tr>
+<tr>
+<td>Workspace sharding</td>
+<td>Data partitioned by workspace (team) ID</td>
+</tr>
+<tr>
+<td>Event-driven</td>
+<td>All state changes propagate as events through message bus</td>
+</tr>
+<tr>
+<td>Graceful degradation</td>
+<td>WebSocket → long-polling → REST fallback</td>
+</tr>
+<tr>
+<td>Eventually consistent</td>
+<td>Presence/typing are best-effort, messages are consistent</td>
+</tr>
+</tbody>
+</table>
+<hr>
+<h2 id="2-gateway-server">2. Gateway Server</h2>
+<p>The Gateway Server is the <strong>real-time connection backbone</strong> — it maintains persistent WebSocket connections with every online client.</p>
+<h3 id="responsibilities">Responsibilities</h3>
+<pre><code>┌─────────────────────────────────────────────────────────┐
+│                    GATEWAY SERVER                         │
+├─────────────────────────────────────────────────────────┤
+│                                                          │
+│  1. WebSocket Lifecycle Management                       │
+│     • Accept new connections (upgrade HTTP → WS)         │
+│     • Maintain keep-alive (ping/pong every 30s)          │
+│     • Handle graceful disconnection                      │
+│     • Reconnection with message_id resume                │
+│                                                          │
+│  2. Session Registry                                     │
+│     • Map: user_id → [connection_1, connection_2, ...]   │
+│     • A user can have 3-5 simultaneous connections       │
+│       (desktop + mobile + web + multiple workspaces)     │
+│     • Store session metadata (device, workspace, etc.)   │
+│                                                          │
+│  3. Event Dispatch (Push to Client)                      │
+│     • Subscribe to Redis channels for user's workspaces  │
+│     • Filter events per connection (relevance check)     │
+│     • Serialize and push events down WebSocket           │
+│                                                          │
+│  4. Message Ingestion (Receive from Client)              │
+│     • Parse incoming WebSocket frames                    │
+│     • Validate message structure                         │
+│     • Route to appropriate backend service               │
+│     • Return acknowledgement to client                   │
+│                                                          │
+└─────────────────────────────────────────────────────────┘
+</code></pre>
+<h3 id="connection-state-machine">Connection State Machine</h3>
+<pre><code>                    ┌──────────┐
+                    │CONNECTING│
+                    └────┬─────┘
+                         │ WS handshake + auth token
+                         ▼
+                    ┌──────────┐
+              ┌─────│CONNECTED │◄────────────────┐
+              │     └────┬─────┘                  │
+              │          │                        │
+   ping timeout          │ ping/pong OK           │ reconnect with
+              │          ▼                        │ last message_id
+              │     ┌──────────┐                  │
+              │     │  ACTIVE  │──────────────────┘
+              │     └────┬─────┘        ▲
+              │          │              │
+              │    network error     resume
+              │          │              │
+              ▼          ▼              │
+         ┌──────────────────────┐      │
+         │    DISCONNECTED      │──────┘
+         └──────────┬───────────┘
+                    │ max retries exceeded
+                    ▼
+              ┌──────────┐
+              │  CLOSED  │
+              └──────────┘
+</code></pre>
+<h3 id="how-gateway-handles-scale">How Gateway Handles Scale</h3>
+<pre><code>┌─────────────────────────────────────────────────────────────────┐
+│  Slack runs ~600+ Gateway Server instances                       │
+│                                                                  │
+│  Each instance handles ~100,000-300,000 concurrent connections   │
+│                                                                  │
+│  Connection assignment: Consistent hashing on user_id            │
+│  (allows same user's connections to land on same gateway         │
+│   for efficient local fan-out)                                   │
+│                                                                  │
+│  Memory per connection: ~50-100 KB                               │
+│  (socket buffers + session metadata + subscription state)        │
+└─────────────────────────────────────────────────────────────────┘
+</code></pre>
+<h3 id="gateway--redis-pubsub">Gateway ↔ Redis Pub/Sub</h3>
+<pre><code>Gateway subscribes to channels based on the user's workspace memberships:
+
+  Gateway-A subscribes to:
+    • workspace:T001 (all events for workspace T001)
+    • channel:C001 (specific high-traffic channel)
+    • dm:U001_U002 (direct message thread)
+
+When a message arrives on Redis channel &quot;workspace:T001&quot;:
+  1. Gateway checks which local connections belong to T001
+  2. For each connection, checks if user is member of the target channel
+  3. Filters out events the user shouldn't see (permissions)
+  4. Serializes event as JSON
+  5. Pushes down the WebSocket
+</code></pre>
+<hr>
+<h2 id="3-channel-server">3. Channel Server</h2>
+<p>The Channel Server is the <strong>message routing and storage brain</strong> — it handles message persistence, channel membership, and fan-out logic.</p>
+<h3 id="responsibilities-1">Responsibilities</h3>
+<pre><code>┌─────────────────────────────────────────────────────────┐
+│                   CHANNEL SERVER                          │
+├─────────────────────────────────────────────────────────┤
+│                                                          │
+│  1. Message Processing                                   │
+│     • Receive message from Gateway                       │
+│     • Validate (user is member of channel, not muted)    │
+│     • Persist to MySQL/Vitess                            │
+│     • Assign message timestamp (ts) as unique ID         │
+│     • Trigger fan-out to all channel members             │
+│                                                          │
+│  2. Channel Management                                   │
+│     • Create/archive/delete channels                     │
+│     • Manage channel membership (join/leave/invite)      │
+│     • Channel settings (topic, purpose, pinned items)    │
+│     • Channel types: public, private, DM, group DM      │
+│                                                          │
+│  3. Fan-Out Logic                                        │
+│     • Determine recipient list for a message             │
+│     • Publish event to Redis Pub/Sub                     │
+│     • Handle @channel, @here, @everyone mentions         │
+│     • Thread reply notifications                         │
+│                                                          │
+│  4. Message History                                      │
+│     • Serve paginated channel history                    │
+│     • Search within channel                              │
+│     • Edit/delete message operations                     │
+│     • File/attachment metadata                           │
+│                                                          │
+└─────────────────────────────────────────────────────────┘
+</code></pre>
+<h3 id="message-processing-pipeline">Message Processing Pipeline</h3>
+<pre><code>Client sends message:
+  { &quot;type&quot;: &quot;message&quot;, &quot;channel&quot;: &quot;C001&quot;, &quot;text&quot;: &quot;Hello team!&quot; }
+
+         │
+         ▼
+┌─────────────────────────────────────────────────────────────────┐
+│ STEP 1: VALIDATION                                               │
+│  • Is user authenticated? (JWT/session check)                    │
+│  • Is user member of channel C001?                               │
+│  • Is channel archived? (reject if yes)                          │
+│  • Rate limit check (max messages per minute)                    │
+│  • Content validation (length, formatting)                       │
+└─────────────────┬───────────────────────────────────────────────┘
+                  │
+                  ▼
+┌─────────────────────────────────────────────────────────────────┐
+│ STEP 2: ENRICHMENT                                               │
+│  • Parse mentions (@user, @channel, @here)                       │
+│  • Unfurl links (fetch preview metadata)                         │
+│  • Process slash commands (/remind, /poll)                       │
+│  • Assign message timestamp: ts = &quot;1716547200.000100&quot;            │
+│  • Assign workspace-scoped sequence number                       │
+└─────────────────┬───────────────────────────────────────────────┘
+                  │
+                  ▼
+┌─────────────────────────────────────────────────────────────────┐
+│ STEP 3: PERSISTENCE                                              │
+│  • Write to MySQL (Vitess shard for workspace T001)              │
+│    INSERT INTO messages (workspace_id, channel_id, user_id,      │
+│                          ts, text, ...) VALUES (...)              │
+│  • Update channel's latest_ts                                    │
+│  • Update unread counters for all members                        │
+└─────────────────┬───────────────────────────────────────────────┘
+                  │
+                  ▼
+┌─────────────────────────────────────────────────────────────────┐
+│ STEP 4: FAN-OUT                                                  │
+│  • Get channel membership list (cached in Redis)                 │
+│  • Publish to Redis Pub/Sub: channel &quot;workspace:T001&quot;            │
+│    {                                                             │
+│      &quot;type&quot;: &quot;message&quot;,                                          │
+│      &quot;channel&quot;: &quot;C001&quot;,                                          │
+│      &quot;user&quot;: &quot;U001&quot;,                                             │
+│      &quot;text&quot;: &quot;Hello team!&quot;,                                      │
+│      &quot;ts&quot;: &quot;1716547200.000100&quot;,                                  │
+│      &quot;recipients&quot;: [&quot;U002&quot;, &quot;U003&quot;, &quot;U004&quot;, ...]                 │
+│    }                                                             │
+│  • Gateway servers pick up this event and push to clients        │
+└─────────────────────────────────────────────────────────────────┘
+</code></pre>
+<h3 id="channel-membership-data-model">Channel Membership Data Model</h3>
+<pre><code>┌──────────────────────────────────────────────────┐
+│ Table: channel_members                            │
+├──────────────────────────────────────────────────┤
+│ workspace_id  │ channel_id  │ user_id  │ role    │
+│ T001          │ C001        │ U001     │ admin   │
+│ T001          │ C001        │ U002     │ member  │
+│ T001          │ C001        │ U003     │ member  │
+├──────────────────────────────────────────────────┤
+│ + last_read_ts (for unread badge calculation)     │
+│ + muted (boolean)                                 │
+│ + notification_pref (all/mentions/none)           │
+└──────────────────────────────────────────────────┘
+
+Fan-out decision tree:
+  if message contains @channel or @here:
+    notify ALL members (even muted, except DND)
+  elif message contains @U003:
+    notify U003 with highlight, others normally
+  else:
+    notify based on each member's notification_pref
+</code></pre>
+<hr>
+<h2 id="4-admin-server">4. Admin Server</h2>
+<p>The Admin Server handles <strong>workspace management, user administration, permissions, billing, and compliance</strong> — all the non-real-time administrative operations.</p>
+<h3 id="responsibilities-2">Responsibilities</h3>
+<pre><code>┌─────────────────────────────────────────────────────────┐
+│                    ADMIN SERVER                           │
+├─────────────────────────────────────────────────────────┤
+│                                                          │
+│  1. Workspace (Team) Management                          │
+│     • Create/configure workspaces                        │
+│     • Workspace settings (name, icon, domain)            │
+│     • Enterprise Grid: manage linked workspaces          │
+│     • Default channels for new members                   │
+│                                                          │
+│  2. User Management                                      │
+│     • Invite/deactivate users                            │
+│     • Role assignment (owner, admin, member, guest)      │
+│     • Profile fields configuration                       │
+│     • SCIM provisioning (enterprise SSO)                 │
+│     • User groups management                             │
+│                                                          │
+│  3. Permissions &amp; Policies                               │
+│     • Who can create channels (public/private)           │
+│     • Who can install apps/bots                          │
+│     • Message editing/deletion permissions               │
+│     • File upload restrictions                           │
+│     • Guest access controls                              │
+│     • Channel posting permissions                        │
+│                                                          │
+│  4. Billing &amp; Plans                                      │
+│     • Subscription management (Free/Pro/Business+/Grid)  │
+│     • Seat count tracking                                │
+│     • Feature gates based on plan                        │
+│     • Usage analytics                                    │
+│                                                          │
+│  5. Compliance &amp; Data Governance                         │
+│     • Message retention policies                         │
+│     • Data export (Discovery API)                        │
+│     • DLP (Data Loss Prevention) rules                   │
+│     • eDiscovery holds                                   │
+│     • Audit logs                                         │
+│                                                          │
+└─────────────────────────────────────────────────────────┘
+</code></pre>
+<h3 id="admin-server-in-the-request-flow">Admin Server in the Request Flow</h3>
+<pre><code>Unlike Gateway (WebSocket) and Channel (high-throughput messaging),
+Admin Server primarily handles REST API calls:
+
+  POST /api/admin.teams.settings.set
+  POST /api/admin.users.invite
+  POST /api/admin.conversations.setTeams
+  GET  /api/admin.analytics.getFile
+
+These are lower-frequency, higher-latency operations that
+don't go through the WebSocket path.
+</code></pre>
+<h3 id="permission-check-example">Permission Check Example</h3>
+<pre><code>User U001 tries to post in #announcements (restricted channel):
+
+  1. Client sends message via WebSocket → Gateway → Channel Server
+  2. Channel Server calls Admin Server:
+     GET /internal/permissions/check
+       { user: &quot;U001&quot;, channel: &quot;C_ANNOUNCE&quot;, action: &quot;post_message&quot; }
+  3. Admin Server checks:
+     • Channel posting permission policy for #announcements
+     • User's role (owner? admin? member?)
+     • Channel-specific overrides
+  4. Returns: { &quot;allowed&quot;: false, &quot;reason&quot;: &quot;channel_posting_restricted&quot; }
+  5. Channel Server returns error to client via Gateway:
+     { &quot;ok&quot;: false, &quot;error&quot;: &quot;restricted_action&quot;, &quot;channel&quot;: &quot;C_ANNOUNCE&quot; }
+</code></pre>
+<h3 id="admin-events-that-affect-other-servers">Admin Events That Affect Other Servers</h3>
+<pre><code>Admin action: Deactivate user U005
+  │
+  ├──► Channel Server:
+  │      • Remove U005 from all channels
+  │      • Reassign owned channels to workspace admin
+  │
+  ├──► Gateway Server:
+  │      • Force-disconnect all of U005's WebSocket sessions
+  │      • Reject any new connection attempts
+  │
+  ├──► Presence Server:
+  │      • Clear U005's presence status
+  │      • Notify U005's contacts of status change
+  │
+  └──► Data Layer:
+         • Mark user as deactivated (soft delete)
+         • Revoke all OAuth tokens
+         • Cancel scheduled messages from U005
+</code></pre>
+<hr>
+<h2 id="5-presence-server">5. Presence Server</h2>
+<p>The Presence Server tracks <strong>who is online, away, DND, or offline</strong> and broadcasts status changes to interested parties.</p>
+<h3 id="responsibilities-3">Responsibilities</h3>
+<pre><code>┌─────────────────────────────────────────────────────────┐
+│                   PRESENCE SERVER                         │
+├─────────────────────────────────────────────────────────┤
+│                                                          │
+│  1. Status Tracking                                      │
+│     • Online (active within last 5 minutes)              │
+│     • Away (no activity for 5+ minutes)                  │
+│     • DND (Do Not Disturb — manual or scheduled)         │
+│     • Offline (no active connections)                    │
+│                                                          │
+│  2. Heartbeat Processing                                 │
+│     • Receive heartbeats from Gateway (every 30s)        │
+│     • Detect activity (keystrokes, mouse, focus)         │
+│     • Transition: Active → Away after 5 min idle         │
+│     • Transition: Away → Active on any activity          │
+│                                                          │
+│  3. Custom Status                                        │
+│     • Status text (&quot;In a meeting&quot;, &quot;Lunch break&quot;)        │
+│     • Status emoji                                       │
+│     • Status expiration (auto-clear after X time)        │
+│                                                          │
+│  4. Typing Indicators                                    │
+│     • Track who is typing in which channel               │
+│     • Ephemeral — not persisted (TTL: 5 seconds)         │
+│     • Fan-out only to members currently viewing channel  │
+│                                                          │
+│  5. Presence Subscriptions                               │
+│     • Clients subscribe to presence of visible users     │
+│     • DM sidebar: show online status of recent contacts  │
+│     • Channel member list: show who is online            │
+│     • Limit subscriptions to prevent N² fan-out          │
+│                                                          │
+└─────────────────────────────────────────────────────────┘
+</code></pre>
+<h3 id="presence-state-machine">Presence State Machine</h3>
+<pre><code>                         ┌─────────────────────────┐
+                         │                         │
+       user activity     │    ┌──────────────┐     │    scheduled DND
+      ┌──────────────────┼───►│    ACTIVE    │─────┼──────────────────┐
+      │                  │    └──────┬───────┘     │                  │
+      │                  │           │             │                  │
+      │                  │    5 min idle           │                  │
+      │                  │           │             │                  │
+      │                  │           ▼             │                  ▼
+      │                  │    ┌──────────────┐     │         ┌──────────────┐
+      │                  └────│     AWAY     │     │         │     DND      │
+      │                       └──────┬───────┘     │         └──────┬───────┘
+      │                              │             │                │
+      │                   all connections closed    │      DND timer expires
+      │                              │             │                │
+      │                              ▼             │                ▼
+      │                       ┌──────────────┐     │         Back to previous
+      └───────────────────────│   OFFLINE    │◄────┘         state (Active/Away)
+                              └──────────────┘
+</code></pre>
+<h3 id="how-presence-scales-the-hard-problem">How Presence Scales (The Hard Problem)</h3>
+<pre><code>PROBLEM: With 10 million users online, naive presence broadcasting is N²
+
+  If user U001 goes offline:
+    • U001 has 500 contacts across 50 channels
+    • Naive: notify all 500 contacts = 500 messages
+    • 10M users × 500 contacts = 5 BILLION status messages/sec (impossible)
+
+SLACK'S SOLUTION: Subscription-Based Presence
+
+  1. Clients only SUBSCRIBE to presence of users they can SEE:
+     • Users in the DM sidebar (last 20 conversations)
+     • Users in the currently-open channel member list
+     • Typically ~50-200 subscriptions per client
+
+  2. Presence Server maintains reverse index:
+     presence_subscribers[U001] = {U002, U003, U007, ...}
+     (who cares when U001's status changes)
+
+  3. When U001 goes offline:
+     • Look up presence_subscribers[U001] → only 30 users
+     • Publish 30 targeted events (not 500)
+     • O(subscribers) not O(workspace_size)
+
+  4. Subscription lifecycle:
+     • Client opens DM with U005 → subscribe to U005's presence
+     • Client closes DM with U005 → unsubscribe after 60s
+     • Channel switch → update subscriptions
+</code></pre>
+<h3 id="presence-data-structure-redis">Presence Data Structure (Redis)</h3>
+<pre><code># Current presence state
+HSET presence:U001 status &quot;active&quot; last_activity 1716547200 device &quot;desktop&quot;
+
+# Custom status
+HSET custom_status:U001 text &quot;In a meeting&quot; emoji &quot;:calendar:&quot; expires 1716550800
+
+# Typing indicators (ephemeral, auto-expires)
+SETEX typing:C001:U001 5 &quot;1&quot;    # Expires in 5 seconds
+
+# Presence subscriptions (reverse index)
+SADD presence_watchers:U001 U002 U003 U007 U015
+
+# DND schedule
+HSET dnd:U001 next_start &quot;09:00&quot; next_end &quot;10:00&quot; timezone &quot;America/New_York&quot;
+</code></pre>
+<hr>
+<h2 id="6-how-all-servers-work-together">6. How All Servers Work Together</h2>
+<h3 id="architecture-interaction-matrix">Architecture Interaction Matrix</h3>
+<pre><code>┌─────────────┬────────────────┬────────────────┬────────────────┬────────────────┐
+│  FROM \ TO  │    GATEWAY     │    CHANNEL     │     ADMIN      │   PRESENCE     │
+├─────────────┼────────────────┼────────────────┼────────────────┼────────────────┤
+│   GATEWAY   │ ─              │ Route messages │ ─              │ Heartbeats,    │
+│             │                │ to channel svc │                │ activity signal│
+├─────────────┼────────────────┼────────────────┼────────────────┼────────────────┤
+│   CHANNEL   │ Fan-out events │ ─              │ Permission     │ ─              │
+│             │ via Redis→GW   │                │ checks         │                │
+├─────────────┼────────────────┼────────────────┼────────────────┼────────────────┤
+│    ADMIN    │ Force-close    │ Update channel │ ─              │ Clear/update   │
+│             │ connections    │ membership     │                │ user presence  │
+├─────────────┼────────────────┼────────────────┼────────────────┼────────────────┤
+│  PRESENCE   │ Push status    │ ─              │ DND schedule   │ ─              │
+│             │ events via GW  │                │ from settings  │                │
+└─────────────┴────────────────┴────────────────┴────────────────┴────────────────┘
+</code></pre>
+<h3 id="communication-patterns">Communication Patterns</h3>
+<pre><code>┌───────────────────────────────────────────────────────────────────────────┐
+│ SYNCHRONOUS (gRPC / Internal REST):                                        │
+│   • Gateway → Channel Server (send message)                                │
+│   • Channel Server → Admin Server (permission check)                       │
+│   • Gateway → Presence Server (heartbeat)                                  │
+│                                                                            │
+│ ASYNCHRONOUS (Redis Pub/Sub):                                              │
+│   • Channel Server → Gateway (message fan-out)                             │
+│   • Presence Server → Gateway (status change broadcast)                    │
+│   • Admin Server → All services (user deactivated event)                   │
+│                                                                            │
+│ ASYNCHRONOUS (Kafka):                                                      │
+│   • All servers → Kafka (audit events, analytics)                          │
+│   • Channel Server → Search indexer (index new messages)                   │
+│   • Admin Server → Billing (usage events)                                  │
+└───────────────────────────────────────────────────────────────────────────┘
+</code></pre>
+<hr>
+<h2 id="7-end-to-end-message-flow-examples">7. End-to-End Message Flow Examples</h2>
+<h3 id="example-1-alice-sends-hello-to-general">Example 1: Alice sends &quot;Hello!&quot; to #general</h3>
+<pre><code>Timeline:
+────────────────────────────────────────────────────────────────────────────
+
+[T+0ms] Alice's desktop client
+  │ Sends via WebSocket:
+  │ {&quot;type&quot;:&quot;message&quot;,&quot;channel&quot;:&quot;C001&quot;,&quot;text&quot;:&quot;Hello!&quot;,&quot;id&quot;:42}
+  ▼
+
+[T+2ms] Gateway Server (GW-17)
+  │ • Receives WebSocket frame from Alice's connection
+  │ • Parses JSON, validates structure
+  │ • Looks up Alice's session: workspace=T001, user=U001
+  │ • Routes to Channel Server via gRPC
+  ▼
+
+[T+5ms] Channel Server (CS-8)
+  │ • Validates Alice (U001) is member of #general (C001) ✓
+  │ • Checks posting permissions (via cached policy, not Admin call) ✓
+  │ • Assigns ts: &quot;1716547200.000100&quot;
+  │ • Writes to MySQL/Vitess shard for workspace T001
+  │ • Responds to Gateway: { &quot;ok&quot;: true, &quot;ts&quot;: &quot;1716547200.000100&quot; }
+  ▼
+
+[T+12ms] Gateway Server (GW-17)
+  │ • Sends ACK back to Alice's WebSocket:
+  │   {&quot;ok&quot;:true,&quot;reply_to&quot;:42,&quot;ts&quot;:&quot;1716547200.000100&quot;}
+  │   (Alice now knows her message was received)
+  ▼
+
+[T+15ms] Channel Server (CS-8) — Fan-out phase
+  │ • Fetches #general member list from Redis cache:
+  │   [U001(Alice), U002(Bob), U003(Carol), U004(Dave), ...]
+  │ • Publishes to Redis Pub/Sub channel &quot;workspace:T001&quot;:
+  │   {
+  │     &quot;type&quot;: &quot;message&quot;,
+  │     &quot;subtype&quot;: &quot;channel_message&quot;,
+  │     &quot;channel&quot;: &quot;C001&quot;,
+  │     &quot;user&quot;: &quot;U001&quot;,
+  │     &quot;text&quot;: &quot;Hello!&quot;,
+  │     &quot;ts&quot;: &quot;1716547200.000100&quot;,
+  │     &quot;team&quot;: &quot;T001&quot;
+  │   }
+  ▼
+
+[T+18ms] All Gateway Servers subscribed to &quot;workspace:T001&quot;
+  │ • GW-17 (has Alice, Bob): Push to Bob (skip Alice — she's the sender)
+  │ • GW-03 (has Carol): Push to Carol's WebSocket
+  │ • GW-42 (has Dave): Push to Dave's WebSocket
+  │ • GW-17 also pushes to Alice's MOBILE connection (she's on 2 devices)
+  ▼
+
+[T+20-35ms] Bob, Carol, Dave receive message in their clients
+  • Desktop shows message in #general
+  • Mobile shows push notification (if channel not muted)
+  • Unread badge increments
+
+Total end-to-end latency: ~35ms (p50), ~80ms (p95), ~200ms (p99)
+</code></pre>
+<h3 id="example-2-bob-goes-from-active--away-presence-flow">Example 2: Bob goes from Active → Away (Presence Flow)</h3>
+<pre><code>Timeline:
+────────────────────────────────────────────────────────────────────────────
+
+[T+0s] Bob has been idle for 5 minutes (no keystrokes/mouse)
+  │
+  ▼
+
+[T+0s] Bob's Client
+  │ Sends heartbeat with activity flag:
+  │ {&quot;type&quot;:&quot;ping&quot;,&quot;activity&quot;:false}
+  │ (activity:false means no user interaction since last ping)
+  ▼
+
+[T+1ms] Gateway Server (GW-17)
+  │ • Responds with pong to keep connection alive
+  │ • Forwards activity signal to Presence Server:
+  │   gRPC: ReportActivity(user=U002, active=false, timestamp=now)
+  ▼
+
+[T+3ms] Presence Server
+  │ • Checks current state: U002 was &quot;active&quot;
+  │ • Last real activity was 5m03s ago → exceeds threshold
+  │ • Transitions: U002 status = &quot;away&quot;
+  │ • Updates Redis: HSET presence:U002 status &quot;away&quot;
+  │ • Looks up who subscribes to U002's presence:
+  │   SMEMBERS presence_watchers:U002 → {U001, U003, U007}
+  │ • Publishes presence change to Redis Pub/Sub:
+  │   channel: &quot;presence_change&quot;
+  │   {
+  │     &quot;type&quot;: &quot;presence_change&quot;,
+  │     &quot;user&quot;: &quot;U002&quot;,
+  │     &quot;presence&quot;: &quot;away&quot;,
+  │     &quot;recipients&quot;: [&quot;U001&quot;, &quot;U003&quot;, &quot;U007&quot;]
+  │   }
+  ▼
+
+[T+6ms] Gateway Servers receive presence event
+  │ • GW-17: Alice (U001) has U002 in DM sidebar → push event
+  │ • GW-03: Carol (U003) has U002 in DM sidebar → push event
+  │ • GW-42: Dave (U004) does NOT subscribe to U002 → skip
+  ▼
+
+[T+8ms] Alice and Carol's clients
+  • Bob's avatar gains the &quot;away&quot; indicator (hollow circle)
+  • No push notification (presence changes are silent)
+</code></pre>
+<h3 id="example-3-admin-deactivates-user-cross-server-coordination">Example 3: Admin Deactivates User (Cross-Server Coordination)</h3>
+<pre><code>Timeline:
+────────────────────────────────────────────────────────────────────────────
+
+[T+0ms] Workspace admin calls REST API:
+  POST /api/admin.users.setInactive
+  { &quot;user&quot;: &quot;U005&quot;, &quot;team_id&quot;: &quot;T001&quot; }
+  │
+  ▼
+
+[T+5ms] Admin Server
+  │ • Validates caller has admin role ✓
+  │ • Marks U005 as deactivated in database
+  │ • Revokes all OAuth tokens for U005
+  │ • Publishes &quot;user_deactivated&quot; event to Kafka + Redis:
+  │   { &quot;type&quot;:&quot;user_change&quot;, &quot;user&quot;:&quot;U005&quot;, &quot;active&quot;:false, &quot;team&quot;:&quot;T001&quot; }
+  ▼
+
+[T+10ms] Channel Server (consumes event)
+  │ • Removes U005 from all channel membership lists
+  │ • For channels owned by U005: transfer ownership to admin
+  │ • Cancels any scheduled messages from U005
+  │ • Removes U005 from all user groups
+  ▼
+
+[T+10ms] Presence Server (consumes event, in parallel)
+  │ • Sets U005 status = &quot;offline&quot; (permanent)
+  │ • Notifies presence subscribers of U005:
+  │   { &quot;type&quot;:&quot;presence_change&quot;, &quot;user&quot;:&quot;U005&quot;, &quot;presence&quot;:&quot;offline&quot; }
+  │ • Removes all presence subscriptions for U005
+  ▼
+
+[T+12ms] Gateway Server (consumes event, in parallel)
+  │ • Finds all active WebSocket connections for U005
+  │ • Sends disconnect frame with reason:
+  │   { &quot;type&quot;:&quot;goodbye&quot;, &quot;reason&quot;:&quot;account_deactivated&quot; }
+  │ • Closes WebSocket connections
+  │ • Adds U005 to connection blacklist (reject future attempts)
+  ▼
+
+[T+15ms] Other Gateway Servers push updates:
+  • Members of channels that had U005 see:
+    { &quot;type&quot;:&quot;member_left_channel&quot;, &quot;user&quot;:&quot;U005&quot;, &quot;channel&quot;:&quot;C001&quot; }
+  • U005's DM contacts see presence go offline
+
+[T+20ms] U005's client receives disconnect, shows &quot;account deactivated&quot; screen
+</code></pre>
+<h3 id="example-4-typing-indicator-flow">Example 4: Typing Indicator Flow</h3>
+<pre><code>Timeline:
+────────────────────────────────────────────────────────────────────────────
+
+[T+0ms] Alice starts typing in #general
+  │ Client detects keypress in message input
+  │ Sends (throttled to once per 3 seconds):
+  │ {&quot;type&quot;:&quot;typing&quot;,&quot;channel&quot;:&quot;C001&quot;}
+  ▼
+
+[T+2ms] Gateway Server (GW-17)
+  │ • Forwards to Presence Server (lightweight, no persistence)
+  ▼
+
+[T+4ms] Presence Server
+  │ • Sets ephemeral key: SETEX typing:C001:U001 5 &quot;1&quot;
+  │ • Publishes to Redis Pub/Sub:
+  │   { &quot;type&quot;:&quot;user_typing&quot;, &quot;channel&quot;:&quot;C001&quot;, &quot;user&quot;:&quot;U001&quot; }
+  │ • NOTE: No database write — this is purely in-memory/ephemeral
+  ▼
+
+[T+6ms] Gateway Servers
+  │ • Only push to users currently VIEWING #general
+  │   (not all members — optimization to reduce noise)
+  │ • Bob has #general open → sees &quot;Alice is typing...&quot;
+  │ • Carol has #random open → does NOT receive typing event
+  ▼
+
+[T+5000ms] If Alice stops typing:
+  • The SETEX key expires automatically
+  • Client-side timeout clears &quot;Alice is typing...&quot; after 5s
+  • No explicit &quot;stopped typing&quot; event needed (fire-and-forget)
+</code></pre>
+<h3 id="example-5-creating-a-new-channel-admin--channel--gateway">Example 5: Creating a New Channel (Admin + Channel + Gateway)</h3>
+<pre><code>Timeline:
+────────────────────────────────────────────────────────────────────────────
+
+[T+0ms] Alice creates #project-alpha via UI
+  │ REST API call (NOT WebSocket — this is a write operation):
+  │ POST /api/conversations.create
+  │ { &quot;name&quot;: &quot;project-alpha&quot;, &quot;is_private&quot;: false, &quot;team_id&quot;: &quot;T001&quot; }
+  ▼
+
+[T+5ms] Channel Server
+  │ • Checks with Admin Server: Can U001 create public channels?
+  │   → Admin checks workspace policy → YES ✓
+  │ • Creates channel record in MySQL:
+  │   INSERT INTO channels (id, workspace_id, name, creator, created)
+  │   VALUES ('C999', 'T001', 'project-alpha', 'U001', NOW())
+  │ • Adds Alice as first member and channel admin
+  │ • Returns: { &quot;ok&quot;: true, &quot;channel&quot;: { &quot;id&quot;: &quot;C999&quot;, ... } }
+  ▼
+
+[T+15ms] Channel Server publishes event:
+  │ Redis Pub/Sub → &quot;workspace:T001&quot;:
+  │ { &quot;type&quot;: &quot;channel_created&quot;, &quot;channel&quot;: { &quot;id&quot;:&quot;C999&quot;, &quot;name&quot;:&quot;project-alpha&quot; } }
+  ▼
+
+[T+18ms] Gateway Servers
+  │ • Push &quot;channel_created&quot; event to ALL connected workspace members
+  │ • (Everyone sees the new channel appear in their sidebar)
+  ▼
+
+[T+20ms] Alice's client receives:
+  • Channel appears in sidebar
+  • Auto-navigates to the new channel
+  • Channel Server adds default channels bookmarks
+</code></pre>
+<hr>
+<h2 id="8-data-storage-layer">8. Data Storage Layer</h2>
+<h3 id="storage-distribution">Storage Distribution</h3>
+<pre><code>┌────────────────────────────────────────────────────────────────────────┐
+│                        DATA STORAGE ARCHITECTURE                        │
+├────────────────────────────────────────────────────────────────────────┤
+│                                                                         │
+│  MySQL / Vitess (Primary Store)                                         │
+│  ├── Sharded by workspace_id                                            │
+│  ├── Messages table (largest: billions of rows)                         │
+│  ├── Channels, Users, Teams tables                                      │
+│  ├── Channel membership                                                 │
+│  └── Permissions &amp; policies                                             │
+│                                                                         │
+│  Redis (Hot Data)                                                        │
+│  ├── Session store (user → gateway mapping)                             │
+│  ├── Presence state (status, last_activity)                             │
+│  ├── Channel membership cache                                           │
+│  ├── Rate limiting counters                                             │
+│  ├── Typing indicators (ephemeral, TTL=5s)                              │
+│  └── Pub/Sub message bus (real-time fan-out)                            │
+│                                                                         │
+│  Kafka (Event Log)                                                       │
+│  ├── All messages (durable, ordered)                                    │
+│  ├── Audit events (who did what, when)                                  │
+│  ├── Analytics events (usage tracking)                                  │
+│  └── Cross-service coordination events                                  │
+│                                                                         │
+│  S3 / Object Storage                                                     │
+│  ├── File uploads (images, documents, code snippets)                    │
+│  ├── Avatar images                                                       │
+│  └── Data exports (compliance)                                           │
+│                                                                         │
+│  Elasticsearch / Solr                                                    │
+│  ├── Message full-text search                                            │
+│  ├── File content search                                                 │
+│  └── User/channel search                                                 │
+│                                                                         │
+└────────────────────────────────────────────────────────────────────────┘
+</code></pre>
+<h3 id="sharding-strategy-vitess">Sharding Strategy (Vitess)</h3>
+<pre><code>Shard key: workspace_id (team_id)
+
+Why workspace_id?
+  • All queries within a workspace are local (no cross-shard joins)
+  • Channel members are always in the same workspace
+  • Message queries are always workspace-scoped
+  • Enterprise Grid: each linked workspace is its own shard
+
+Shard distribution example:
+  Shard 1: workspaces T001-T10000
+  Shard 2: workspaces T10001-T20000
+  ...
+  Shard N: workspaces T(N-1)*10000+1 to T(N)*10000
+
+Hot workspace handling:
+  • Very large workspaces (&gt;50K users) get dedicated shards
+  • Slack, Uber, IBM → each on their own shard cluster
+</code></pre>
+<hr>
+<h2 id="9-failure-scenarios--resilience">9. Failure Scenarios &amp; Resilience</h2>
+<h3 id="what-happens-when-each-server-fails">What Happens When Each Server Fails</h3>
+<pre><code>┌────────────────────┬──────────────────────────────────────────────────────┐
+│ Component Failure   │ Impact &amp; Recovery                                    │
+├────────────────────┼──────────────────────────────────────────────────────┤
+│ Gateway Server     │ • Clients reconnect to another GW (load balancer)    │
+│ crashes            │ • Messages resume from last message_id               │
+│                    │ • Brief ~2-5s interruption for affected clients       │
+│                    │ • No data loss (state is in Channel Server)           │
+├────────────────────┼──────────────────────────────────────────────────────┤
+│ Channel Server     │ • Message sending temporarily fails (HTTP 503)       │
+│ overloaded         │ • Gateway queues messages or returns error            │
+│                    │ • Client shows &quot;Trouble connecting&quot; yellow bar        │
+│                    │ • Read path (history) may timeout                     │
+├────────────────────┼──────────────────────────────────────────────────────┤
+│ Admin Server       │ • Cannot change settings/permissions                  │
+│ down               │ • Existing permissions still work (cached)            │
+│                    │ • New user invites fail                               │
+│                    │ • Messaging continues unaffected                      │
+├────────────────────┼──────────────────────────────────────────────────────┤
+│ Presence Server    │ • Status indicators freeze/go stale                   │
+│ down               │ • Typing indicators stop working                      │
+│                    │ • Messages still deliver normally                     │
+│                    │ • Least critical — graceful degradation               │
+├────────────────────┼──────────────────────────────────────────────────────┤
+│ Redis down         │ • Real-time delivery halted (no Pub/Sub)              │
+│                    │ • Messages still persist to MySQL                     │
+│                    │ • Clients get messages on next reconnect/refresh      │
+│                    │ • Redis Sentinel/Cluster provides auto-failover       │
+├────────────────────┼──────────────────────────────────────────────────────┤
+│ MySQL shard down   │ • Affected workspaces cannot send/load messages       │
+│                    │ • Other workspaces unaffected (isolation)             │
+│                    │ • Failover to read replica within seconds             │
+└────────────────────┴──────────────────────────────────────────────────────┘
+</code></pre>
+<h3 id="graceful-degradation-hierarchy">Graceful Degradation Hierarchy</h3>
+<pre><code>FULL FUNCTIONALITY
+    │
+    │ WebSocket disconnects
+    ▼
+LONG-POLLING FALLBACK
+    │ • Client polls every 3-5 seconds
+    │ • Higher latency but still real-time-ish
+    │
+    │ Long-polling fails
+    ▼
+REST API FALLBACK
+    │ • Client periodically fetches channel history
+    │ • Manual refresh required
+    │ • Send messages via POST (still works)
+    │
+    │ All connectivity lost
+    ▼
+OFFLINE MODE
+    • Show cached messages from local storage
+    • Queue outgoing messages
+    • Sync when connection restored
+</code></pre>
+<hr>
+<h2 id="quick-reference-request-routing">Quick Reference: Request Routing</h2>
+<pre><code>Client Action              → Primary Server → Supporting Servers
+─────────────────────────────────────────────────────────────────
+Send message               → Channel        → Admin (permissions), Gateway (fan-out)
+Edit/delete message        → Channel        → Gateway (fan-out edit event)
+Create channel             → Channel        → Admin (permission check)
+Join/leave channel         → Channel        → Gateway (membership event), Presence
+Upload file                → Channel (meta) → S3 (binary), Gateway (notification)
+Start typing               → Presence       → Gateway (typing indicator)
+Go idle/active             → Presence       → Gateway (status event)
+Set custom status          → Presence       → Gateway (status event)
+Change workspace settings  → Admin          → Channel (policy update)
+Invite user                → Admin          → Channel (add to default channels)
+Deactivate user            → Admin          → All (force logout, remove membership)
+Search messages            → Search (Solr)  → Channel (permission filter)
+Install app/bot            → Admin          → Channel (bot joins channels)
+</code></pre>
+
+            
+            
+        </body>
+        </html>
