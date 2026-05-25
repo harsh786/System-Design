@@ -316,6 +316,25 @@ State what happens during a network partition.
 
 Use strong consistency for money, scarce inventory, authorization, entitlement, ledger, and state transitions that cannot diverge. Use eventual consistency for feeds, counters, search, analytics, notifications, recommendations, dashboards, and derived projections.
 
+#### Platform Building Blocks And Microservice Patterns
+
+For every HLD, explicitly decide which building blocks belong on the hot path, async path, stream path, batch path, and analytical path.
+
+| Concern | Common Choices | When To Use |
+|---|---|---|
+| Caching | CDN, Redis, Memcached, local cache | hot reads, sessions, counters, derived views, stampede protection |
+| Async/eventing | Kafka, Pulsar, Kinesis, SQS/RabbitMQ, outbox/inbox, DLQ | side effects, fanout, indexing, notifications, replayable domain events |
+| Stream processing | Flink, Kafka Streams, Spark Structured Streaming | rolling counters, fraud/risk, ranking features, ETA, realtime materialized views |
+| Batch/workflow | Airflow, Dagster, Argo, Temporal, Step Functions, Spark | backfills, reconciliation, reports, lifecycle jobs, ML feature generation |
+| CDC/projections | Debezium, Kafka Connect, CDC, outbox relay | search indexes, CQRS read models, lakehouse tables, cache invalidation |
+| Contracts | Schema Registry, Avro, Protobuf, JSON Schema, AsyncAPI | event versioning and compatibility |
+| Lakehouse/object store | S3/GCS/Azure Blob, Iceberg, Hudi, Delta | raw events, payloads, audit history, replayable data |
+| Analytics | Pinot, ClickHouse, Druid, Redshift, BigQuery, Snowflake, Athena/Trino | dashboards, investigations, ad hoc SQL, operational analytics |
+| Service runtime | Spring Boot, Quarkus, Micronaut, Go/gRPC, Node.js, Kubernetes, service mesh | independently deployable services, mTLS, routing, rollout, observability |
+| Microservice patterns | CQRS, saga, process manager, event storming, idempotency, compensating actions | service ownership, multi-service workflows, explicit domain boundaries |
+
+Do not add technology as decoration. Every component needs an owner, SLO, retention policy, replay story, and failure mode.
+
 ### Step 6: High-Level Architecture
 
 The architecture should make ownership clear.
@@ -860,6 +879,20 @@ flowchart LR
 - Indexing: <primary lookup, secondary indexes, search indexes>.
 - CAP: <CP for core correctness, AP/eventual for derived views>.
 - Eventual consistency: <which projections can lag and how users see pending/stale state>.
+
+### Platform Building Blocks And Microservice Patterns
+
+| Concern | Choices | Usage In This System |
+|---|---|---|
+| Caching | <CDN/Redis/Memcached/local cache> | <hot path and invalidation> |
+| Async/eventing | <Kafka/Pulsar/Kinesis/SQS/outbox/DLQ> | <side effects and replay> |
+| Stream processing | <Flink/Kafka Streams/Spark Streaming> | <windows/features/realtime projections> |
+| Batch/workflow | <Airflow/Dagster/Argo/Temporal/Spark> | <backfills/reconciliation/reports> |
+| CDC/schema | <Debezium/Kafka Connect/Schema Registry/Protobuf/Avro> | <projections and event governance> |
+| Lakehouse/object store | <S3/GCS/Iceberg/Hudi/Delta> | <raw history, payloads, replay> |
+| Analytics | <Pinot/ClickHouse/Druid/Redshift/Athena> | <dashboards and ad hoc queries> |
+| Service runtime | <Spring Boot/Quarkus/Micronaut/Go/gRPC/Node.js/Kubernetes> | <service runtime and deployment model> |
+| Microservice patterns | <CQRS/saga/outbox/inbox/event storming> | <ownership, consistency, compensation> |
 
 ## 8. Critical Flows
 
