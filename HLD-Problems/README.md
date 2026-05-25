@@ -2,7 +2,11 @@
 
 Expanded from `../1-Path-For-Architect/41-system-design-top-100-problem-bank.md` with additional high-value interview problems.
 
-Each numbered file covers requirements, non-functional requirements, traffic and size estimation, API design, async contracts, HLD, LLD, database modeling, security, deployment, observability, cost, trade-offs, and interview follow-ups.
+Each numbered file covers requirements, non-functional requirements, traffic and size estimation, API design, async contracts, HLD, LLD, database technology choice, schema modeling, replication, sharding, partitioning, indexing, CAP/consistency, security, deployment, observability, cost, trade-offs, and interview follow-ups.
+
+## Interview Execution Template
+
+Use [HLD Interview Template](HLD_INTERVIEW_TEMPLATE.md) as the repeatable live-interview framework for solving any system design problem. It covers scope clarification, requirements, estimation, APIs, data modeling, architecture, service responsibilities, critical flows, deep dives, scaling, security, reliability, observability, cost, and trade-offs.
 
 ## Index
 

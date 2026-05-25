@@ -253,15 +253,6 @@ Ops/Integrations: Connection health + delivery retries + moderation/abuse + noti
 
 ## 7. Database Modeling And DB Design
 
-### Storage Choices
-
-- Relational OLTP for canonical aggregates, constraints, idempotency keys, and audit metadata.
-- Distributed KV/wide-column store for high-write time series, hot counters, sessions, or location/score data where needed.
-- Search/geo/vector index for discovery and filtering where the source of truth is elsewhere.
-- Cache for hot projections, availability summaries, quotes, rate-limit state, and read-heavy timelines.
-- Object storage for evidence, payloads, statements, attachments, model artifacts, and long-retention raw files.
-- Warehouse/lakehouse for analytics, reconciliation, ML training, compliance reporting, and historical replay.
-
 ### Canonical Tables
 
 | Table | Primary Key / Important Columns | Purpose And Notes |
@@ -276,12 +267,59 @@ Ops/Integrations: Connection health + delivery retries + moderation/abuse + noti
 | domain_events | event_id, aggregate_id, aggregate_version, event_type, payload_ref | Outbox, replay, and audit event log. |
 | audit_log | audit_id, actor_id, action, aggregate_id, before_hash, after_hash, reason | Immutable user/admin/service audit trail. |
 
-### Indexing, Partitioning, And Retention
+### Database Technology Choice
 
-- Partition canonical tables by tenant/region plus stable high-cardinality aggregate ID; use time buckets for append-heavy history.
-- Build separate indexes for product reads and operator/support lookups so debugging does not overload hot user paths.
-- Use TTL only for derived/replayable data; compliance, ledger, dispute, and audit records use explicit retention policy.
-- Store large payloads, proofs, statements, files, and raw telemetry in object storage referenced from canonical rows.
+| Workload / Data | Recommended Database / Store | Why This Choice Fits |
+| --- | --- | --- |
+| Source of truth / primary store | Spanner/CockroachDB/PostgreSQL for calendar events, ACLs, labels, mailbox metadata, and sync tokens; Bigtable/Cassandra/ScyllaDB for high-volume mail/message bodies and mailbox indexes | collaboration permissions and sync cursors need transactions, while mailbox/message history is high-volume and partitionable |
+| Hot serving / cache | Redis for free/busy cache, unread counters, sync cursors, session state, and hot thread metadata | keeps hot reads, sessions, counters, quotas, and derived views away from the OLTP source of truth |
+| Event stream / outbox | Kafka/Pulsar/Kinesis with compacted topics for keys and retained topics for replay | decouples projections, notifications, analytics, search indexing, and recovery from the write path |
+| Search / analytics | OpenSearch/Lucene-style index for mail/calendar search; ClickHouse for deliverability and engagement analytics | serves text/filter/OLAP queries without overloading transactional tables |
+| Large immutable payloads | object storage for attachments, raw MIME, exports, and long-retention archives | large or immutable data is cheaper, durable, and easier to lifecycle outside OLTP rows |
+
+Interview stance: name the source-of-truth database first, then explicitly separate caches, indexes, event logs, and analytics stores. The cache, search index, and warehouse are derived systems; they must be rebuildable from canonical state and immutable events.
+
+### Replication Strategy
+
+- Primary store: multi-AZ synchronous or quorum replication for the primary store; asynchronous cross-region replicas for DR and read locality.
+- Event log: replicate each partition across at least 3 brokers/nodes, require quorum acknowledgements for critical events, and monitor under-replicated partitions.
+- Cache/read models: replicate for availability, but treat them as disposable; rebuild from source-of-truth rows plus events after corruption or cache loss.
+- Object storage: use multi-AZ durability by default; enable cross-region replication only for disaster recovery, compliance, or locality requirements.
+- Analytics/search stores: replicate shards for query availability, but recover by replaying events or rebuilding from snapshots when correctness is in doubt.
+
+### Sharding And Partitioning Strategy
+
+- Primary partition key: `user_id/mailbox_id/calendar_id + time bucket; thread_id/event_id for object lookup`. Choose the key that matches the hottest write/read path, not just the entity name.
+- Primary lookup path: `message_id/event_id/thread_id` should be single-partition whenever possible.
+- Time-partition append-heavy data such as events, audit logs, metrics, and delivery attempts so retention, archival, replay, and backfills do not scan the full corpus.
+- Hot partition mitigation: split large mailboxes/calendars by time bucket, precompute free/busy windows, and isolate bulk imports/index rebuilds.
+- Keep tenant/cell/region boundaries explicit so one large customer, city, celebrity, event, or provider cannot overload the whole system.
+
+### Indexing Strategy
+
+- Required secondary indexes: `user_id + start_time, user_id + received_at, thread_id + message_time, label_id + updated_at, sync_token`.
+- Keep OLTP indexes minimal on high-write tables; move broad filtering, text search, ranking, and analytics to dedicated search/OLAP stores.
+- Use composite indexes that match real query order: equality columns first, then range/sort columns such as `created_at`, `updated_at`, or `score`.
+- For mutable state machines, index `(state, updated_at)` or `(state, next_attempt_at)` for workers and repair jobs.
+- For audit and event tables, prefer append-only writes with time-bucketed partitions and compact indexes over many mutable secondary indexes.
+
+### CAP Theorem And Consistency Choices
+
+| Data / Operation | CAP Bias During Partition | Consistency Model | Interview Notes |
+| --- | --- | --- | --- |
+| Canonical command path | CP for permissions, event mutation, and mailbox source-of-truth state | strong consistency for ACLs, event updates, invites, mailbox labels that gate visibility, and sync token advancement | Prefer rejecting or queuing unsafe writes over accepting divergent state. |
+| Derived read models | AP/eventual for search/free-busy caches with read-your-writes where possible | Eventual consistency for search index, spam features, notifications, free/busy cache refresh, and analytics | Expose `pending`, `processing`, `stale_at`, or version metadata when users may observe lag. |
+| Cache | AP with bounded TTL, unless used for a lock/fencing decision | Eventually consistent and invalidated by events or short TTL | Cache is never the only source of truth for correctness-critical state. |
+| Search / analytics | AP/eventual | Asynchronous ingestion with replay/backfill | Results can lag; define freshness SLO and rebuild path. |
+| Audit / ledger / immutable events | CP for append acceptance; replicated for durability | Append-only, immutable, replayable | Used for reconciliation, forensics, and projection rebuilds. |
+
+### Data Lifecycle, Backups, And Rebuilds
+
+- PITR backups, periodic restore drills, immutable event retention, and projection rebuilds from source-of-truth plus event log.
+- Use transactional outbox or change-data-capture so database commits and emitted events cannot silently diverge.
+- Define retention per data class: hot OLTP rows, warm history, cold object-store archives, legal holds, and deletion/anonymization workflows.
+- Run checksum/control-total reconciliation between source-of-truth tables, event streams, search indexes, warehouses, and external providers.
+- Document restore order: primary metadata first, immutable events second, object payloads third, then rebuild caches/search/read models.
 
 ### Data Integrity Rules
 

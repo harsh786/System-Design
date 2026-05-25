@@ -337,20 +337,59 @@ Tenant/User
 | `reconciliation_batches` | `id, provider, period_start, period_end, state, mismatch_count, completed_at` |
 | `idempotency_keys` | `key_hash, scope, request_hash, response_ref, expires_at, created_at` |
 
-### Storage Choices
+### Database Technology Choice
 
-- **Primary metadata:** relational DB when transactions, constraints, and auditability matter; wide-column or document DB when access is aggregate-oriented and ultra-high scale.
-- **Cache:** Redis/Memcached/local in-process cache for hot reads, quotas, sessions, and derived views.
-- **Event log:** Kafka/Pulsar/Kinesis-style append log for fanout, indexing, analytics, and replay.
-- **Object storage:** large payloads, media, exports, logs, backups, and immutable artifacts.
-- **Search/OLAP:** Elasticsearch/OpenSearch/Solr/ClickHouse/Druid/Pinot depending on query type.
+| Workload / Data | Recommended Database / Store | Why This Choice Fits |
+| --- | --- | --- |
+| Source of truth / primary store | PostgreSQL/CockroachDB/Spanner/Oracle-class ACID database for ledger journals, orders, balances, mandates, settlements, and audit; append-only event log for downstream projections | money, securities, limits, and regulatory records require strong consistency, immutable audit, constraints, and reproducible reconciliation |
+| Hot serving / cache | Redis only for non-authoritative limits, sessions, quotes, feature lookups, and dedupe guards; never as the money source of truth | keeps hot reads, sessions, counters, quotas, and derived views away from the OLTP source of truth |
+| Event stream / outbox | Kafka/Pulsar/Kinesis with compacted topics for keys and retained topics for replay | decouples projections, notifications, analytics, search indexing, and recovery from the write path |
+| Search / analytics | OpenSearch for support/case search; ClickHouse/Snowflake/BigQuery for risk, reconciliation, regulatory, and finance analytics | serves text/filter/OLAP queries without overloading transactional tables |
+| Large immutable payloads | object storage for statements, reports, KYC evidence, contracts, provider files, and immutable exports | large or immutable data is cheaper, durable, and easier to lifecycle outside OLTP rows |
 
-### Indexes And Partitioning
+Interview stance: name the source-of-truth database first, then explicitly separate caches, indexes, event logs, and analytics stores. The cache, search index, and warehouse are derived systems; they must be rebuildable from canonical state and immutable events.
 
-- Partition primary records by `tenant_id`, `user_id`, `resource_id`, `conversation_id`, `object_id`, or another stable high-cardinality key that matches the hottest access pattern.
-- Keep secondary indexes for lookup by status, owner, created time, expiration time, and external idempotency/provider IDs.
-- Use time-bucketed partitions for event, log, metric, and audit tables.
-- Use optimistic locking with `version` for normal updates; use short leases or serializable transactions only around scarce resources or correctness-critical transitions.
+### Replication Strategy
+
+- Primary store: multi-AZ synchronous or quorum replication for the primary store; asynchronous cross-region replicas for DR and read locality.
+- Event log: replicate each partition across at least 3 brokers/nodes, require quorum acknowledgements for critical events, and monitor under-replicated partitions.
+- Cache/read models: replicate for availability, but treat them as disposable; rebuild from source-of-truth rows plus events after corruption or cache loss.
+- Object storage: use multi-AZ durability by default; enable cross-region replication only for disaster recovery, compliance, or locality requirements.
+- Analytics/search stores: replicate shards for query availability, but recover by replaying events or rebuilding from snapshots when correctness is in doubt.
+
+### Sharding And Partitioning Strategy
+
+- Primary partition key: `account_id/customer_id/instrument_id/ledger_account_id plus time bucket; provider_reference for reconciliation tables`. Choose the key that matches the hottest write/read path, not just the entity name.
+- Primary lookup path: `transaction_id/order_id/account_id/ledger_entry_id` should be single-partition whenever possible.
+- Time-partition append-heavy data such as events, audit logs, metrics, and delivery attempts so retention, archival, replay, and backfills do not scan the full corpus.
+- Hot partition mitigation: isolate hot accounts/instruments, use account-level serialization where needed, and move analytics/reports off the OLTP primary.
+- Keep tenant/cell/region boundaries explicit so one large customer, city, celebrity, event, or provider cannot overload the whole system.
+
+### Indexing Strategy
+
+- Required secondary indexes: `account_id + created_at, external_reference, settlement_date, state + updated_at, idempotency_key, provider_id + provider_ref`.
+- Keep OLTP indexes minimal on high-write tables; move broad filtering, text search, ranking, and analytics to dedicated search/OLAP stores.
+- Use composite indexes that match real query order: equality columns first, then range/sort columns such as `created_at`, `updated_at`, or `score`.
+- For mutable state machines, index `(state, updated_at)` or `(state, next_attempt_at)` for workers and repair jobs.
+- For audit and event tables, prefer append-only writes with time-bucketed partitions and compact indexes over many mutable secondary indexes.
+
+### CAP Theorem And Consistency Choices
+
+| Data / Operation | CAP Bias During Partition | Consistency Model | Interview Notes |
+| --- | --- | --- | --- |
+| Canonical command path | CP for money/security correctness because double-spend or inconsistent balances are unacceptable | serializable or repeatable-read transactions for ledger postings, order state, balance-affecting transitions, and compliance gates | Prefer rejecting or queuing unsafe writes over accepting divergent state. |
+| Derived read models | AP/eventual only for projections and read models clearly marked pending/stale | Eventual consistency for portfolio views, statements, search, notifications, risk dashboards, ML features, and analytics after canonical commit | Expose `pending`, `processing`, `stale_at`, or version metadata when users may observe lag. |
+| Cache | AP with bounded TTL, unless used for a lock/fencing decision | Eventually consistent and invalidated by events or short TTL | Cache is never the only source of truth for correctness-critical state. |
+| Search / analytics | AP/eventual | Asynchronous ingestion with replay/backfill | Results can lag; define freshness SLO and rebuild path. |
+| Audit / ledger / immutable events | CP for append acceptance; replicated for durability | Append-only, immutable, replayable | Used for reconciliation, forensics, and projection rebuilds. |
+
+### Data Lifecycle, Backups, And Rebuilds
+
+- PITR backups, periodic restore drills, immutable event retention, and projection rebuilds from source-of-truth plus event log.
+- Use transactional outbox or change-data-capture so database commits and emitted events cannot silently diverge.
+- Define retention per data class: hot OLTP rows, warm history, cold object-store archives, legal holds, and deletion/anonymization workflows.
+- Run checksum/control-total reconciliation between source-of-truth tables, event streams, search indexes, warehouses, and external providers.
+- Document restore order: primary metadata first, immutable events second, object payloads third, then rebuild caches/search/read models.
 
 ## 8. Critical Flows
 

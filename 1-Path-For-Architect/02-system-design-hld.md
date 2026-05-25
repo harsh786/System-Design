@@ -105,6 +105,8 @@ Use the expanded practice banks here:
 
 ## System Design Template
 
+For the detailed live-interview template, use [`../HLD-Problems/HLD_INTERVIEW_TEMPLATE.md`](../HLD-Problems/HLD_INTERVIEW_TEMPLATE.md).
+
 ```text
 1. Clarify scope
 2. List functional requirements
