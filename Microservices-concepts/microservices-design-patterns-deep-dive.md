@@ -555,7 +555,175 @@ next_retry_at
 
 Without durable compensation progress, a crash can leave the system in an unknown state.
 
-### Step 5: Prefer Reservations Over Direct Mutation
+### Step 5: Retry Failed Compensation Safely
+
+If one step fails during compensation, do not restart the original business workflow. The original saga has already failed and entered cancellation or recovery mode. Treat compensation as its own durable workflow.
+
+Example:
+
+```text
+Original checkout workflow:
+  1. Create order              SUCCEEDED
+  2. Reserve inventory         SUCCEEDED
+  3. Authorize payment         FAILED
+
+Compensation workflow:
+  1. Release inventory         SUCCEEDED
+  2. Cancel order              FAILED
+```
+
+The best action is not:
+
+```text
+Restart checkout from step 1.
+```
+
+The best action is:
+
+```text
+Retry the failed compensation step:
+  CancelOrder(order_id=O-100, idempotency_key=S-100.cancel_order)
+```
+
+The saga should store compensation state durably:
+
+```text
+saga_id = S-100
+business_key = O-100
+state = COMPENSATING
+
+compensation_steps:
+  release_inventory = SUCCEEDED
+  cancel_order = FAILED_RETRYABLE
+
+next_retry_at = 2026-05-24T12:05:00Z
+retry_count = 3
+last_error = Order Service timeout
+```
+
+The retry loop should be:
+
+```text
+1. Mark saga as COMPENSATING.
+2. Build compensation plan in reverse order of completed steps.
+3. Store each compensation step status durably.
+4. Execute the next PENDING or FAILED_RETRYABLE compensation step.
+5. If it succeeds, mark that step SUCCEEDED and move to the next step.
+6. If it fails with retryable error, set next_retry_at using backoff and jitter.
+7. If max retries are exceeded, move saga to MANUAL_REVIEW_REQUIRED.
+8. If error is non-retryable, move saga to MANUAL_REVIEW_REQUIRED immediately.
+9. Run reconciliation jobs to detect mismatches and repair or escalate.
+```
+
+Retrying the whole compensation workflow can be acceptable only if every compensation step is idempotent. In practice, the compensation orchestrator may re-scan from the beginning after a crash, but completed steps must behave as safe no-ops:
+
+```text
+ReleaseReservation(R-500)
+  -> already released
+  -> return success
+
+CancelOrder(O-100)
+  -> already cancelled
+  -> return success
+
+VoidPaymentAuthorization(PA-900)
+  -> already voided
+  -> return success
+```
+
+This is why compensation should use stable operation IDs:
+
+```text
+Good:
+  ReleaseReservation(reservation_id=R-500)
+  VoidAuthorization(payment_authorization_id=PA-900)
+  CancelShipment(shipment_id=SHIP-700)
+
+Bad:
+  Add 2 units back to stock
+  Subtract payment amount from captured total
+  Cancel latest shipment for this order
+```
+
+For external systems, do not blindly retry after a timeout. First check the external system's actual status using the original provider reference or idempotency key.
+
+Example:
+
+```text
+VoidPaymentAuthorization(PA-900)
+  -> timeout
+
+Before retry:
+  Query payment provider by payment_authorization_id or idempotency key.
+
+If provider says authorization already voided:
+  mark compensation step SUCCEEDED.
+
+If provider says authorization still active:
+  retry void authorization.
+
+If provider says payment was already captured:
+  switch compensation action to RefundPayment.
+
+If provider status is unknown for too long:
+  move to MANUAL_REVIEW_REQUIRED and alert operations.
+```
+
+Compensation state machine:
+
+```text
+COMPENSATING
+  -> COMPENSATION_STEP_SUCCEEDED
+  -> COMPENSATION_STEP_FAILED_RETRYABLE
+  -> COMPENSATION_STEP_FAILED_NON_RETRYABLE
+  -> COMPENSATION_COMPLETED
+  -> COMPENSATION_FAILED_REQUIRES_MANUAL_REVIEW
+```
+
+Production retry policy:
+
+```text
+Retry transient failures:
+  - network timeout
+  - 503 from internal service
+  - temporary database lock
+  - broker publish failure
+
+Do not blindly retry business failures:
+  - payment already captured when trying to void
+  - shipment already picked up when trying to cancel label
+  - order already delivered
+  - validation failure caused by bad or missing data
+```
+
+For non-retryable failures, compensation should switch to a valid business recovery path:
+
+```text
+Cannot void payment because payment already captured
+  -> issue refund
+
+Cannot cancel shipment because package already dispatched
+  -> start return workflow
+
+Cannot unsend notification
+  -> send correction notification
+
+Cannot release inventory because reservation is missing
+  -> run reconciliation and manual stock adjustment if needed
+```
+
+Production rule:
+
+```text
+Do not retry the original saga after compensation starts.
+Retry failed compensation steps.
+Make all compensation steps idempotent.
+Store compensation progress.
+Use provider status checks before retrying external side effects.
+Escalate to manual review when automatic recovery is unsafe.
+```
+
+### Step 6: Prefer Reservations Over Direct Mutation
 
 A reservation is easier to compensate than a completed business action.
 
@@ -595,7 +763,7 @@ Harder:
   Cancel label later, if carrier allows.
 ```
 
-### Step 6: Use Timeouts and Expiration
+### Step 7: Use Timeouts and Expiration
 
 Sagas cannot wait forever.
 
@@ -619,7 +787,7 @@ Notify customer if needed.
 
 Timeouts must be business-aware. A hotel booking hold may last 10 minutes. A loan application may last 30 days.
 
-### Step 7: Accept That Some Compensation Is Forward Correction
+### Step 8: Accept That Some Compensation Is Forward Correction
 
 Not all actions can be undone.
 
@@ -642,7 +810,7 @@ CANCELLATION_REQUESTED
 MANUAL_REVIEW_REQUIRED
 ```
 
-### Step 8: Design Manual Recovery
+### Step 9: Design Manual Recovery
 
 Some failures cannot be resolved automatically.
 
@@ -663,7 +831,7 @@ Production saga systems need:
 - Ability to force a terminal state with reason
 - Customer support visibility
 
-### Step 9: Use a Compensation Matrix
+### Step 10: Use a Compensation Matrix
 
 Before implementing a saga, create a table like this:
 
@@ -864,6 +1032,210 @@ producer_service
 schema_version
 occurred_at
 idempotency_key
+```
+
+### Concrete Outbox Table Values Example
+
+Suppose `Order Service` receives this request:
+
+```text
+Create order for customer C-10
+order_id = O-100
+total = 1499.00 INR
+request_id = REQ-777
+trace_id = T-123
+```
+
+Without outbox, the dangerous flow is:
+
+```text
+1. Save order in orders table.
+2. Publish OrderCreated event.
+```
+
+If the service crashes between step 1 and step 2, the order exists but no event is published. Inventory, payment, notification, and analytics services may never learn about the order.
+
+With outbox, the service writes both the business row and the event row in the same local database transaction:
+
+```sql
+BEGIN;
+
+INSERT INTO orders (
+  order_id,
+  customer_id,
+  status,
+  total_amount,
+  currency,
+  created_at
+) VALUES (
+  'O-100',
+  'C-10',
+  'PENDING',
+  1499.00,
+  'INR',
+  '2026-05-24T10:00:00Z'
+);
+
+INSERT INTO outbox_events (
+  id,
+  aggregate_type,
+  aggregate_id,
+  event_type,
+  event_version,
+  payload,
+  headers,
+  status,
+  created_at,
+  published_at,
+  retry_count,
+  next_retry_at,
+  last_error
+) VALUES (
+  'EVT-9001',
+  'Order',
+  'O-100',
+  'OrderCreated',
+  1,
+  '{"order_id":"O-100","customer_id":"C-10","total_amount":1499.00,"currency":"INR","status":"PENDING"}',
+  '{"correlation_id":"REQ-777","trace_id":"T-123","producer_service":"order-service","idempotency_key":"REQ-777"}',
+  'PENDING',
+  '2026-05-24T10:00:00Z',
+  NULL,
+  0,
+  NULL,
+  NULL
+);
+
+COMMIT;
+```
+
+Business table after commit:
+
+| Table | Column | Value | Meaning |
+|-------|--------|-------|---------|
+| `orders` | `order_id` | `O-100` | Unique order ID |
+| `orders` | `customer_id` | `C-10` | Customer who placed the order |
+| `orders` | `status` | `PENDING` | Order has been created but not fully completed |
+| `orders` | `total_amount` | `1499.00` | Order amount |
+| `orders` | `currency` | `INR` | Currency |
+| `orders` | `created_at` | `2026-05-24T10:00:00Z` | Creation time |
+
+Outbox table after commit:
+
+| Table | Column | Value | Meaning |
+|-------|--------|-------|---------|
+| `outbox_events` | `id` | `EVT-9001` | Unique event/message ID |
+| `outbox_events` | `aggregate_type` | `Order` | Domain object type |
+| `outbox_events` | `aggregate_id` | `O-100` | ID of the business object that changed |
+| `outbox_events` | `event_type` | `OrderCreated` | Name of the domain event |
+| `outbox_events` | `event_version` | `1` | Event schema version |
+| `outbox_events` | `payload` | Order details JSON | Data consumers need |
+| `outbox_events` | `headers` | Correlation and trace metadata JSON | Metadata for tracing, causation, idempotency |
+| `outbox_events` | `status` | `PENDING` | Event is saved but not yet published |
+| `outbox_events` | `created_at` | `2026-05-24T10:00:00Z` | Time event was created |
+| `outbox_events` | `published_at` | `NULL` | Not published yet |
+| `outbox_events` | `retry_count` | `0` | Relay has not retried yet |
+| `outbox_events` | `next_retry_at` | `NULL` | No retry scheduled yet |
+| `outbox_events` | `last_error` | `NULL` | No publish error yet |
+
+The outbox relay then reads pending events:
+
+```sql
+SELECT *
+FROM outbox_events
+WHERE status = 'PENDING'
+ORDER BY created_at
+LIMIT 100;
+```
+
+Then it publishes this message to the broker:
+
+```json
+{
+  "event_id": "EVT-9001",
+  "event_type": "OrderCreated",
+  "event_version": 1,
+  "aggregate_type": "Order",
+  "aggregate_id": "O-100",
+  "payload": {
+    "order_id": "O-100",
+    "customer_id": "C-10",
+    "total_amount": 1499.00,
+    "currency": "INR",
+    "status": "PENDING"
+  },
+  "headers": {
+    "correlation_id": "REQ-777",
+    "trace_id": "T-123",
+    "producer_service": "order-service",
+    "idempotency_key": "REQ-777"
+  },
+  "occurred_at": "2026-05-24T10:00:00Z"
+}
+```
+
+If publish succeeds, the relay updates the outbox row:
+
+| Column | Before | After |
+|--------|--------|-------|
+| `status` | `PENDING` | `PUBLISHED` |
+| `published_at` | `NULL` | `2026-05-24T10:00:05Z` |
+| `retry_count` | `0` | `0` |
+| `next_retry_at` | `NULL` | `NULL` |
+| `last_error` | `NULL` | `NULL` |
+
+If publish fails because the broker is unavailable, the relay keeps the event for retry:
+
+| Column | Before | After |
+|--------|--------|-------|
+| `status` | `PENDING` | `FAILED_RETRYABLE` or `PENDING` |
+| `published_at` | `NULL` | `NULL` |
+| `retry_count` | `0` | `1` |
+| `next_retry_at` | `NULL` | `2026-05-24T10:01:00Z` |
+| `last_error` | `NULL` | `Kafka timeout` |
+
+The exact status values depend on implementation. A simple system may keep retryable rows as `PENDING` and use `next_retry_at`. A more explicit system may use:
+
+```text
+PENDING
+PUBLISHING
+PUBLISHED
+FAILED_RETRYABLE
+FAILED_PERMANENT
+```
+
+Important rule:
+
+```text
+The outbox row is not the business state.
+The business table is the service state.
+The outbox table is the reliable event publishing buffer.
+```
+
+On the consumer side, the consumer should also protect itself against duplicate delivery. For example, `Inventory Service` can store processed message IDs:
+
+| Table | Column | Value | Meaning |
+|-------|--------|-------|---------|
+| `processed_messages` | `consumer_name` | `InventoryService` | Consumer identity |
+| `processed_messages` | `message_id` | `EVT-9001` | Event already processed |
+| `processed_messages` | `processed_at` | `2026-05-24T10:00:08Z` | Processing time |
+
+If `EVT-9001` arrives again, `Inventory Service` checks this table and skips duplicate business processing.
+
+Mental model:
+
+```text
+Business table
+  = source of truth for this service's state
+
+Outbox table
+  = durable queue of events that must be published
+
+Message broker
+  = transport for delivering events to other services
+
+Processed messages table
+  = consumer-side duplicate protection
 ```
 
 ---
