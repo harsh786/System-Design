@@ -3,25 +3,33 @@ import java.util.*;
 /**
  * Problem 1: Valid Parentheses (LeetCode 20)
  * 
- * Given a string containing just '(', ')', '{', '}', '[' and ']',
+ * Given a string s containing just the characters '(', ')', '{', '}', '[' and ']',
  * determine if the input string is valid.
  * 
- * Approach: Use a stack to push opening brackets and pop/match closing brackets.
- * Time Complexity: O(n)
- * Space Complexity: O(n)
+ * Approach: Use a stack to match opening brackets with closing brackets.
+ * Push opening brackets onto stack, pop and compare for closing brackets.
  * 
- * Production Analogy: Like validating XML/HTML tag nesting in a parser,
- * or ensuring every opened resource (file, connection) is properly closed.
+ * Time Complexity: O(n) - single pass through string
+ * Space Complexity: O(n) - stack can hold all opening brackets
+ * 
+ * Production Analogy: Like validating nested XML/HTML tags in a document parser,
+ * or ensuring matching begin/end blocks in configuration files. Load balancers
+ * use similar logic to validate HTTP request/response pairing.
  */
 public class Problem01_ValidParentheses {
     
     public static boolean isValid(String s) {
         Deque<Character> stack = new ArrayDeque<>();
         for (char c : s.toCharArray()) {
-            if (c == '(') stack.push(')');
-            else if (c == '{') stack.push('}');
-            else if (c == '[') stack.push(']');
-            else if (stack.isEmpty() || stack.pop() != c) return false;
+            if (c == '(' || c == '{' || c == '[') {
+                stack.push(c);
+            } else {
+                if (stack.isEmpty()) return false;
+                char top = stack.pop();
+                if (c == ')' && top != '(') return false;
+                if (c == '}' && top != '{') return false;
+                if (c == ']' && top != '[') return false;
+            }
         }
         return stack.isEmpty();
     }
@@ -32,7 +40,8 @@ public class Problem01_ValidParentheses {
         System.out.println(isValid("(]"));        // false
         System.out.println(isValid("([)]"));      // false
         System.out.println(isValid("{[]}"));      // true
-        System.out.println(isValid(""));          // true
+        System.out.println(isValid(""));          // true (empty)
         System.out.println(isValid("("));         // false
+        System.out.println(isValid("]"));         // false
     }
 }

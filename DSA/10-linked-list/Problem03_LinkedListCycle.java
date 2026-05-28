@@ -1,16 +1,17 @@
 /**
- * Problem 3: Linked List Cycle (LeetCode 141)
+ * Problem 3: Linked List Cycle
  * 
- * Approach: Floyd's Tortoise and Hare - slow moves 1 step, fast moves 2 steps.
- * If they meet, there's a cycle.
- * Time: O(n), Space: O(1)
+ * Approach: Floyd's cycle detection - slow/fast pointers. If they meet, cycle exists.
+ * Time Complexity: O(n)
+ * Space Complexity: O(1)
  * 
- * Production Analogy: Detecting circular dependencies in microservice call graphs
- * or deadlock detection in distributed systems.
+ * Production Analogy: Detecting infinite redirect loops in a web crawler or 
+ * circular dependencies in a microservice dependency graph.
  */
 public class Problem03_LinkedListCycle {
     static class ListNode {
-        int val; ListNode next;
+        int val;
+        ListNode next;
         ListNode(int val) { this.val = val; }
     }
 
@@ -25,23 +26,19 @@ public class Problem03_LinkedListCycle {
     }
 
     public static void main(String[] args) {
-        // Test 1: Has cycle
+        // Test 1: Cycle exists
         ListNode n1 = new ListNode(3), n2 = new ListNode(2), n3 = new ListNode(0), n4 = new ListNode(-4);
         n1.next = n2; n2.next = n3; n3.next = n4; n4.next = n2;
-        System.out.println(hasCycle(n1)); // true
+        System.out.println("Test1 (cycle): " + hasCycle(n1)); // true
 
         // Test 2: No cycle
-        ListNode a = new ListNode(1); a.next = new ListNode(2);
-        System.out.println(hasCycle(a)); // false
+        ListNode h2 = new ListNode(1); h2.next = new ListNode(2);
+        System.out.println("Test2 (no cycle): " + hasCycle(h2)); // false
 
         // Test 3: Single node no cycle
-        System.out.println(hasCycle(new ListNode(1))); // false
+        System.out.println("Test3 (single): " + hasCycle(new ListNode(1))); // false
 
-        // Test 4: Single node with cycle
-        ListNode s = new ListNode(1); s.next = s;
-        System.out.println(hasCycle(s)); // true
-
-        // Test 5: Null
-        System.out.println(hasCycle(null)); // false
+        // Test 4: Null
+        System.out.println("Test4 (null): " + hasCycle(null)); // false
     }
 }

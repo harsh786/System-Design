@@ -3,14 +3,17 @@ import java.util.*;
 /**
  * Problem 3: Evaluate Reverse Polish Notation (LeetCode 150)
  * 
- * Evaluate the value of an arithmetic expression in Reverse Polish Notation.
+ * Evaluate an arithmetic expression in Reverse Polish Notation.
  * 
- * Approach: Push numbers onto stack. On operator, pop two operands, compute, push result.
+ * Approach: Push numbers onto stack. When operator encountered, pop two operands,
+ * apply operator, push result back.
+ * 
  * Time Complexity: O(n)
  * Space Complexity: O(n)
  * 
- * Production Analogy: How compilers evaluate expressions after converting to postfix.
- * Also used in stack-based VMs (JVM bytecode evaluation).
+ * Production Analogy: Compilers use postfix notation for expression evaluation.
+ * Calculator engines and query planners in databases evaluate execution plans
+ * in a similar bottom-up fashion.
  */
 public class Problem03_EvaluateReversePolishNotation {
 

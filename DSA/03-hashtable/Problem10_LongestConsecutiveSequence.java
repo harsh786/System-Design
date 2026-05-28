@@ -2,30 +2,30 @@ import java.util.*;
 
 /**
  * Problem 10: Longest Consecutive Sequence
- * Find the length of the longest consecutive elements sequence in O(n).
+ * Given an unsorted array, find the length of the longest consecutive elements sequence in O(n).
  *
- * Approach: Put all numbers in HashSet. For each number that is a sequence start
- * (num-1 not in set), count consecutive elements.
+ * Approach: Put all numbers in a HashSet. For each number that is the START of a sequence
+ * (num-1 not in set), count consecutive numbers forward.
  *
- * Time Complexity: O(n) - each element visited at most twice
+ * Time Complexity: O(n)
  * Space Complexity: O(n)
  *
- * Production Analogy: Gap detection in event streams - finding longest uninterrupted
- * sequence of sequential IDs (detecting missing messages in distributed queues).
+ * Production Analogy: Like finding the longest uninterrupted uptime window in a monitoring system.
+ * Each timestamp is checked to see if it starts a continuous sequence.
  */
 public class Problem10_LongestConsecutiveSequence {
     public int longestConsecutive(int[] nums) {
         Set<Integer> set = new HashSet<>();
         for (int n : nums) set.add(n);
-        int longest = 0;
-        for (int num : set) {
-            if (!set.contains(num - 1)) { // start of sequence
+        int maxLen = 0;
+        for (int n : set) {
+            if (!set.contains(n - 1)) { // start of sequence
                 int len = 1;
-                while (set.contains(num + len)) len++;
-                longest = Math.max(longest, len);
+                while (set.contains(n + len)) len++;
+                maxLen = Math.max(maxLen, len);
             }
         }
-        return longest;
+        return maxLen;
     }
 
     public static void main(String[] args) {

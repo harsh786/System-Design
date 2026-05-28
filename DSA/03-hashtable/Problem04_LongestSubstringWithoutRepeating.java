@@ -2,16 +2,16 @@ import java.util.*;
 
 /**
  * Problem 4: Longest Substring Without Repeating Characters
- * Find the length of the longest substring without repeating characters.
+ * Given a string, find the length of the longest substring without repeating characters.
  *
- * Approach: Sliding window with HashMap storing char -> last index.
- * When duplicate found, move left pointer past the previous occurrence.
+ * Approach: Sliding window with HashMap storing last seen index of each character.
+ * When duplicate found, move left pointer to max(left, lastSeen+1).
  *
  * Time Complexity: O(n)
  * Space Complexity: O(min(n, charset_size))
  *
- * Production Analogy: Session uniqueness tracking - like ensuring no duplicate
- * events in a streaming window (Kafka dedup window, unique visitors in time range).
+ * Production Analogy: Like session window management in stream processing.
+ * Track unique events in a sliding window; when duplicate detected, slide window forward.
  */
 public class Problem04_LongestSubstringWithoutRepeating {
     public int lengthOfLongestSubstring(String s) {
@@ -19,8 +19,8 @@ public class Problem04_LongestSubstringWithoutRepeating {
         int maxLen = 0, left = 0;
         for (int right = 0; right < s.length(); right++) {
             char c = s.charAt(right);
-            if (map.containsKey(c) && map.get(c) >= left) {
-                left = map.get(c) + 1;
+            if (map.containsKey(c)) {
+                left = Math.max(left, map.get(c) + 1);
             }
             map.put(c, right);
             maxLen = Math.max(maxLen, right - left + 1);
@@ -35,6 +35,5 @@ public class Problem04_LongestSubstringWithoutRepeating {
         System.out.println(sol.lengthOfLongestSubstring("pwwkew")); // 3
         System.out.println(sol.lengthOfLongestSubstring("")); // 0
         System.out.println(sol.lengthOfLongestSubstring("abcdef")); // 6
-        System.out.println(sol.lengthOfLongestSubstring(" ")); // 1
     }
 }

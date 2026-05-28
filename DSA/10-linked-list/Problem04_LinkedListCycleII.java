@@ -1,16 +1,18 @@
 /**
- * Problem 4: Linked List Cycle II (LeetCode 142)
+ * Problem 4: Linked List Cycle II - Find the node where the cycle begins
  * 
- * Approach: Floyd's algorithm - after detecting cycle, reset one pointer to head.
- * Move both one step at a time; they meet at cycle start.
- * Time: O(n), Space: O(1)
+ * Approach: Floyd's algorithm. After slow/fast meet, reset one pointer to head.
+ * Move both at same speed - they meet at cycle start.
+ * Time Complexity: O(n)
+ * Space Complexity: O(1)
  * 
- * Production Analogy: Finding the exact service in a circular dependency chain
- * where the loop begins - critical for breaking deadlocks in distributed transactions.
+ * Production Analogy: Identifying the exact service in a circular dependency chain
+ * that initiates the loop, enabling targeted resolution.
  */
 public class Problem04_LinkedListCycleII {
     static class ListNode {
-        int val; ListNode next;
+        int val;
+        ListNode next;
         ListNode(int val) { this.val = val; }
     }
 
@@ -29,18 +31,13 @@ public class Problem04_LinkedListCycleII {
     }
 
     public static void main(String[] args) {
-        // Test 1: Cycle at node with val 2
         ListNode n1 = new ListNode(3), n2 = new ListNode(2), n3 = new ListNode(0), n4 = new ListNode(-4);
         n1.next = n2; n2.next = n3; n3.next = n4; n4.next = n2;
-        System.out.println(detectCycle(n1).val); // 2
+        System.out.println("Test1: cycle starts at val=" + detectCycle(n1).val); // 2
 
-        // Test 2: No cycle
-        ListNode a = new ListNode(1); a.next = new ListNode(2);
-        System.out.println(detectCycle(a)); // null
+        ListNode h2 = new ListNode(1); h2.next = new ListNode(2);
+        System.out.println("Test2: " + detectCycle(h2)); // null
 
-        // Test 3: Cycle at head
-        ListNode s = new ListNode(1); ListNode s2 = new ListNode(2);
-        s.next = s2; s2.next = s;
-        System.out.println(detectCycle(s).val); // 1
+        System.out.println("Test3: " + detectCycle(null)); // null
     }
 }

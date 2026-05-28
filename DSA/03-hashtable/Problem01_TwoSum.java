@@ -8,10 +8,11 @@ import java.util.*;
  * For each element, check if it exists as a key in the map.
  *
  * Time Complexity: O(n) - single pass
- * Space Complexity: O(n) - HashMap storage
+ * Space Complexity: O(n) - hash map storage
  *
- * Production Analogy: Like a matchmaking service - for each request, check if a compatible
- * partner already registered. Similar to order matching in trading systems.
+ * Production Analogy: Like a caching layer where you store partial results
+ * (complements) to avoid redundant computation. Similar to how a CDN caches
+ * partial responses to quickly serve complete requests.
  */
 public class Problem01_TwoSum {
     public int[] twoSum(int[] nums, int target) {
@@ -36,5 +37,7 @@ public class Problem01_TwoSum {
         System.out.println(Arrays.toString(sol.twoSum(new int[]{3,3}, 6))); // [0,1]
         // Test 4: Negative numbers
         System.out.println(Arrays.toString(sol.twoSum(new int[]{-1,-2,-3,-4,-5}, -8))); // [2,4]
+        // Test 5: Large numbers
+        System.out.println(Arrays.toString(sol.twoSum(new int[]{1000000, 500000, -1500000}, -1000000))); // [1,2]
     }
 }

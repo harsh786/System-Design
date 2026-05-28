@@ -2,16 +2,15 @@ import java.util.*;
 
 /**
  * Problem 3: Valid Anagram
- * Determine if two strings are anagrams of each other.
+ * Given two strings s and t, return true if t is an anagram of s.
  *
- * Approach: Count character frequencies using HashMap (or int[26] for lowercase).
- * Increment for s, decrement for t. All counts should be zero.
+ * Approach: Count character frequencies. If all counts are zero after processing both strings, they're anagrams.
  *
  * Time Complexity: O(n)
- * Space Complexity: O(1) - at most 26 characters
+ * Space Complexity: O(1) - fixed 26-char array
  *
- * Production Analogy: Data integrity verification - ensuring a transformed payload
- * contains exactly the same components as the original (like checksum validation).
+ * Production Analogy: Like checksum verification in data transfer.
+ * Two packets with same checksum (frequency signature) contain equivalent data.
  */
 public class Problem03_ValidAnagram {
     public boolean isAnagram(String s, String t) {
@@ -25,24 +24,11 @@ public class Problem03_ValidAnagram {
         return true;
     }
 
-    // Unicode-safe version using HashMap
-    public boolean isAnagramUnicode(String s, String t) {
-        if (s.length() != t.length()) return false;
-        Map<Character, Integer> map = new HashMap<>();
-        for (char c : s.toCharArray()) map.merge(c, 1, Integer::sum);
-        for (char c : t.toCharArray()) {
-            map.merge(c, -1, Integer::sum);
-            if (map.get(c) < 0) return false;
-        }
-        return true;
-    }
-
     public static void main(String[] args) {
         Problem03_ValidAnagram sol = new Problem03_ValidAnagram();
         System.out.println(sol.isAnagram("anagram", "nagaram")); // true
         System.out.println(sol.isAnagram("rat", "car")); // false
         System.out.println(sol.isAnagram("", "")); // true
         System.out.println(sol.isAnagram("a", "ab")); // false
-        System.out.println(sol.isAnagramUnicode("anagram", "nagaram")); // true
     }
 }

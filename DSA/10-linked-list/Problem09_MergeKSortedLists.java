@@ -1,48 +1,51 @@
 /**
- * Problem 9: Merge k Sorted Lists (LeetCode 23)
+ * Problem 9: Merge k Sorted Lists
  * 
- * Approach: Min-heap (PriorityQueue) to always pick the smallest head among k lists.
- * Time: O(N log k) where N = total nodes, Space: O(k)
+ * Approach: Min-heap (priority queue) holding one node from each list.
+ * Time Complexity: O(N log k) where N = total nodes, k = number of lists
+ * Space Complexity: O(k)
  * 
- * Production Analogy: K-way merge in distributed databases (like LSM-tree compaction
- * in Cassandra/RocksDB) merging sorted SSTables.
+ * Production Analogy: Like a distributed merge-sort in MapReduce - each mapper
+ * produces a sorted stream and the reducer merges them via priority queue.
  */
 import java.util.*;
 
 public class Problem09_MergeKSortedLists {
     static class ListNode {
-        int val; ListNode next;
+        int val;
+        ListNode next;
         ListNode(int val) { this.val = val; }
+        ListNode(int val, ListNode next) { this.val = val; this.next = next; }
     }
 
     public static ListNode mergeKLists(ListNode[] lists) {
         PriorityQueue<ListNode> pq = new PriorityQueue<>((a, b) -> a.val - b.val);
         for (ListNode l : lists) if (l != null) pq.offer(l);
-        ListNode dummy = new ListNode(0), curr = dummy;
+        ListNode dummy = new ListNode(0), tail = dummy;
         while (!pq.isEmpty()) {
             ListNode node = pq.poll();
-            curr.next = node; curr = curr.next;
+            tail.next = node;
+            tail = tail.next;
             if (node.next != null) pq.offer(node.next);
         }
         return dummy.next;
     }
 
-    static ListNode buildList(int... vals) {
-        ListNode dummy = new ListNode(0), curr = dummy;
-        for (int v : vals) { curr.next = new ListNode(v); curr = curr.next; }
-        return dummy.next;
-    }
-
-    static String listToString(ListNode head) {
+    static String toString(ListNode h) {
         StringBuilder sb = new StringBuilder();
-        while (head != null) { sb.append(head.val).append("->"); head = head.next; }
-        return sb.append("null").toString();
+        while (h != null) { sb.append(h.val).append("->"); h = h.next; }
+        sb.append("null"); return sb.toString();
     }
 
     public static void main(String[] args) {
-        ListNode[] lists = {buildList(1,4,5), buildList(1,3,4), buildList(2,6)};
-        System.out.println(listToString(mergeKLists(lists))); // 1->1->2->3->4->4->5->6->null
-        System.out.println(listToString(mergeKLists(new ListNode[]{}))); // null
-        System.out.println(listToString(mergeKLists(new ListNode[]{null}))); // null
+        ListNode[] lists = {
+            new ListNode(1, new ListNode(4, new ListNode(5))),
+            new ListNode(1, new ListNode(3, new ListNode(4))),
+            new ListNode(2, new ListNode(6))
+        };
+        System.out.println("Test1: " + toString(mergeKLists(lists)));
+
+        System.out.println("Test2: " + toString(mergeKLists(new ListNode[]{}))); // null
+        System.out.println("Test3: " + toString(mergeKLists(new ListNode[]{null}))); // null
     }
 }

@@ -1,16 +1,20 @@
 /**
- * Problem 6: Reorder List (LeetCode 143)
+ * Problem 6: Reorder List
+ * L0→L1→...→Ln-1→Ln becomes L0→Ln→L1→Ln-1→L2→Ln-2→...
  * 
- * Approach: 1) Find middle 2) Reverse second half 3) Merge alternating
- * Time: O(n), Space: O(1)
+ * Approach: 1) Find middle 2) Reverse second half 3) Merge alternately
+ * Time Complexity: O(n)
+ * Space Complexity: O(1)
  * 
- * Production Analogy: Load balancing requests by interleaving hot and cold partition
- * data to ensure even distribution across processing nodes.
+ * Production Analogy: Like interleaving priority requests with normal requests
+ * in a load balancer to ensure fair processing distribution.
  */
 public class Problem06_ReorderList {
     static class ListNode {
-        int val; ListNode next;
+        int val;
+        ListNode next;
         ListNode(int val) { this.val = val; }
+        ListNode(int val, ListNode next) { this.val = val; this.next = next; }
     }
 
     public static void reorderList(ListNode head) {
@@ -25,30 +29,25 @@ public class Problem06_ReorderList {
         // Merge
         ListNode first = head, second = prev;
         while (second != null) {
-            ListNode tmp1 = first.next, tmp2 = second.next;
-            first.next = second; second.next = tmp1;
-            first = tmp1; second = tmp2;
+            ListNode t1 = first.next, t2 = second.next;
+            first.next = second; second.next = t1;
+            first = t1; second = t2;
         }
     }
 
-    static ListNode buildList(int... vals) {
-        ListNode dummy = new ListNode(0), curr = dummy;
-        for (int v : vals) { curr.next = new ListNode(v); curr = curr.next; }
-        return dummy.next;
-    }
-
-    static String listToString(ListNode head) {
+    static String toString(ListNode h) {
         StringBuilder sb = new StringBuilder();
-        while (head != null) { sb.append(head.val).append("->"); head = head.next; }
-        return sb.append("null").toString();
+        while (h != null) { sb.append(h.val).append("->"); h = h.next; }
+        sb.append("null"); return sb.toString();
     }
 
     public static void main(String[] args) {
-        ListNode l1 = buildList(1,2,3,4); reorderList(l1);
-        System.out.println(listToString(l1)); // 1->4->2->3->null
-        ListNode l2 = buildList(1,2,3,4,5); reorderList(l2);
-        System.out.println(listToString(l2)); // 1->5->2->4->3->null
-        ListNode l3 = buildList(1); reorderList(l3);
-        System.out.println(listToString(l3)); // 1->null
+        ListNode h1 = new ListNode(1, new ListNode(2, new ListNode(3, new ListNode(4))));
+        reorderList(h1);
+        System.out.println("Test1: " + toString(h1)); // 1->4->2->3->null
+
+        ListNode h2 = new ListNode(1, new ListNode(2, new ListNode(3, new ListNode(4, new ListNode(5)))));
+        reorderList(h2);
+        System.out.println("Test2: " + toString(h2)); // 1->5->2->4->3->null
     }
 }

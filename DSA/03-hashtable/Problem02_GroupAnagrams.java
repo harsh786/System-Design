@@ -2,16 +2,16 @@ import java.util.*;
 
 /**
  * Problem 2: Group Anagrams
- * Group strings that are anagrams of each other.
+ * Given an array of strings, group anagrams together.
  *
- * Approach: Use sorted string as key in HashMap. All anagrams produce the same sorted key.
+ * Approach: Sort each string to create a canonical key, group by that key in a HashMap.
  * Alternative: Use character frequency array as key for O(n*k) instead of O(n*k*log(k)).
  *
- * Time Complexity: O(n * k * log(k)) where n=number of strings, k=max string length
+ * Time Complexity: O(n * k * log(k)) where k is max string length
  * Space Complexity: O(n * k)
  *
- * Production Analogy: Content deduplication in CDNs - grouping equivalent content
- * regardless of encoding order. Similar to grouping equivalent search queries.
+ * Production Analogy: Like content deduplication in a distributed storage system.
+ * Files with same content but different names are grouped by content hash.
  */
 public class Problem02_GroupAnagrams {
     public List<List<String>> groupAnagrams(String[] strs) {
@@ -25,7 +25,7 @@ public class Problem02_GroupAnagrams {
         return new ArrayList<>(map.values());
     }
 
-    // Optimal: O(n*k) using char count as key
+    // Optimal: frequency-based key
     public List<List<String>> groupAnagramsOptimal(String[] strs) {
         Map<String, List<String>> map = new HashMap<>();
         for (String s : strs) {

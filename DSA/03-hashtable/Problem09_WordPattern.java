@@ -2,15 +2,16 @@ import java.util.*;
 
 /**
  * Problem 9: Word Pattern
- * Check if a pattern string matches a space-separated string (bijection).
+ * Given a pattern and a string s, find if s follows the same pattern.
+ * pattern = "abba", s = "dog cat cat dog" -> true
  *
- * Approach: Bidirectional HashMap mapping pattern char <-> word.
+ * Approach: Bijective mapping between pattern chars and words using two HashMaps.
  *
  * Time Complexity: O(n)
  * Space Complexity: O(n)
  *
- * Production Analogy: Template matching in log analysis - detecting if log entries
- * follow a structural pattern (like structured logging format validation).
+ * Production Analogy: Like URL route pattern matching in web frameworks.
+ * "/users/:id/posts/:id" must have consistent param bindings.
  */
 public class Problem09_WordPattern {
     public boolean wordPattern(String pattern, String s) {
@@ -19,12 +20,12 @@ public class Problem09_WordPattern {
         Map<Character, String> pToW = new HashMap<>();
         Map<String, Character> wToP = new HashMap<>();
         for (int i = 0; i < pattern.length(); i++) {
-            char p = pattern.charAt(i);
+            char c = pattern.charAt(i);
             String w = words[i];
-            if (pToW.containsKey(p) && !pToW.get(p).equals(w)) return false;
-            if (wToP.containsKey(w) && wToP.get(w) != p) return false;
-            pToW.put(p, w);
-            wToP.put(w, p);
+            if (pToW.containsKey(c) && !pToW.get(c).equals(w)) return false;
+            if (wToP.containsKey(w) && wToP.get(w) != c) return false;
+            pToW.put(c, w);
+            wToP.put(w, c);
         }
         return true;
     }

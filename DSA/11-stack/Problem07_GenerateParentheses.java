@@ -3,15 +3,16 @@ import java.util.*;
 /**
  * Problem 7: Generate Parentheses (LeetCode 22)
  * 
- * Generate all combinations of well-formed parentheses for n pairs.
+ * Generate all combinations of well-formed parentheses given n pairs.
  * 
- * Approach: Backtracking with implicit stack (recursion). Track open/close counts.
- * Only add '(' if open < n, only add ')' if close < open.
+ * Approach: Backtracking with implicit stack (recursion). Add '(' if open < n,
+ * add ')' if close < open. Base case when length == 2*n.
+ * 
  * Time Complexity: O(4^n / sqrt(n)) - Catalan number
  * Space Complexity: O(n) recursion depth
  * 
- * Production Analogy: Like generating all valid configuration templates
- * with nested scoping rules.
+ * Production Analogy: Like generating all valid configuration combinations
+ * for nested resource hierarchies (VPCs > Subnets > Security Groups).
  */
 public class Problem07_GenerateParentheses {
 

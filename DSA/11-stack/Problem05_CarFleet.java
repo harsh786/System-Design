@@ -3,36 +3,38 @@ import java.util.*;
 /**
  * Problem 5: Car Fleet (LeetCode 853)
  * 
- * N cars heading to a target. A car fleet is formed when a faster car catches up.
- * Return the number of car fleets arriving at destination.
+ * N cars heading to a target. Each car has position and speed.
+ * A car can't pass another; it joins a fleet. Return number of fleets.
  * 
- * Approach: Sort by position descending. Use stack to track fleet times.
- * If current car takes longer than stack top, it forms a new fleet.
+ * Approach: Sort cars by position descending. Calculate time to reach target.
+ * Use stack: if current car takes longer than top of stack, it forms a new fleet.
+ * 
  * Time Complexity: O(n log n) for sorting
  * Space Complexity: O(n)
  * 
- * Production Analogy: Like batch processing where faster jobs merge into slower preceding batches.
+ * Production Analogy: Like request batching in message queues - slower requests
+ * ahead cause faster ones behind to "merge" into the same batch/fleet.
  */
 public class Problem05_CarFleet {
 
     public static int carFleet(int target, int[] position, int[] speed) {
         int n = position.length;
-        double[][] cars = new double[n][2];
+        if (n == 0) return 0;
+        int[][] cars = new int[n][2];
         for (int i = 0; i < n; i++) {
             cars[i][0] = position[i];
-            cars[i][1] = (double)(target - position[i]) / speed[i];
+            cars[i][1] = speed[i];
         }
-        Arrays.sort(cars, (a, b) -> Double.compare(b[0], a[0])); // sort by position desc
+        Arrays.sort(cars, (a, b) -> b[0] - a[0]); // sort by position desc
         
-        int fleets = 0;
-        double maxTime = 0;
-        for (double[] car : cars) {
-            if (car[1] > maxTime) {
-                maxTime = car[1];
-                fleets++;
+        Deque<Double> stack = new ArrayDeque<>();
+        for (int[] car : cars) {
+            double time = (double)(target - car[0]) / car[1];
+            if (stack.isEmpty() || time > stack.peek()) {
+                stack.push(time);
             }
         }
-        return fleets;
+        return stack.size();
     }
 
     public static void main(String[] args) {

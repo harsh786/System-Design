@@ -2,24 +2,23 @@ import java.util.*;
 
 /**
  * Problem 5: Top K Frequent Elements
- * Return the k most frequent elements from an array.
+ * Given an integer array and k, return the k most frequent elements.
  *
  * Approach: Count frequencies with HashMap, then use bucket sort (index = frequency).
- * Alternative: Min-heap of size k for O(n log k).
+ * This achieves O(n) vs O(n log k) with heap.
  *
- * Time Complexity: O(n) with bucket sort
+ * Time Complexity: O(n)
  * Space Complexity: O(n)
  *
- * Production Analogy: Trending topics calculation, hot key detection in distributed
- * caches, top-N query results for dashboards and analytics.
+ * Production Analogy: Like identifying hot keys in a distributed cache (e.g., Redis hot key detection)
+ * to decide which keys need replication across more shards.
  */
 public class Problem05_TopKFrequentElements {
-    @SuppressWarnings("unchecked")
     public int[] topKFrequent(int[] nums, int k) {
         Map<Integer, Integer> freq = new HashMap<>();
         for (int n : nums) freq.merge(n, 1, Integer::sum);
 
-        // Bucket sort: index = frequency
+        // Bucket sort: index is frequency
         List<Integer>[] buckets = new List[nums.length + 1];
         for (var entry : freq.entrySet()) {
             int f = entry.getValue();
@@ -44,6 +43,6 @@ public class Problem05_TopKFrequentElements {
         Problem05_TopKFrequentElements sol = new Problem05_TopKFrequentElements();
         System.out.println(Arrays.toString(sol.topKFrequent(new int[]{1,1,1,2,2,3}, 2))); // [1,2]
         System.out.println(Arrays.toString(sol.topKFrequent(new int[]{1}, 1))); // [1]
-        System.out.println(Arrays.toString(sol.topKFrequent(new int[]{4,4,4,4,5,5,5,6,6,7}, 2))); // [4,5]
+        System.out.println(Arrays.toString(sol.topKFrequent(new int[]{4,4,4,4,5,5,5,6,6,7}, 3))); // [4,5,6]
     }
 }
