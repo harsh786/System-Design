@@ -1,454 +1,1116 @@
-# Design Zoom - Video Conferencing Platform
+# Design Zoom Video Conferencing - World-Class System Design
 
 ## 1. Functional Requirements
 
-- **Video/Audio Meetings**: 1:1 and group video calls (up to 1000 participants)
-- **Screen Sharing**: Share screen, application window, or browser tab
-- **Chat**: In-meeting text chat with file sharing
-- **Recording**: Cloud and local recording with transcription
-- **Scheduling**: Calendar integration, recurring meetings, waiting rooms
-- **Breakout Rooms**: Split participants into sub-groups
-- **Virtual Background**: AI-powered background replacement/blur
-- **Reactions/Polls**: Emoji reactions, polls, Q&A
-- **Webinar Mode**: Panelists + large audience (up to 50K attendees)
-- **Whiteboard**: Collaborative drawing during meetings
-- **Live Transcription/Captions**: Real-time speech-to-text
-- **Meeting Security**: Passwords, waiting rooms, lock meeting, remove participants
-- **Phone Dial-in**: PSTN bridge for audio-only participants
-- **End-to-End Encryption**: Optional E2E for sensitive meetings
+| # | Requirement | Description |
+|---|---|---|
+| FR1 | Video/audio calls | 1:1 and group video/audio calls with up to 1000 participants |
+| FR2 | Screen sharing | Share screen, application window, or whiteboard |
+| FR3 | Meeting scheduling | Schedule meetings with calendar integration, recurring meetings |
+| FR4 | Meeting rooms | Persistent rooms with unique URLs, waiting rooms |
+| FR5 | Recording | Cloud recording with automatic transcription |
+| FR6 | Chat in meeting | Text chat, file sharing, reactions within meetings |
+| FR7 | Breakout rooms | Split participants into smaller groups mid-meeting |
+| FR8 | Virtual backgrounds | Real-time background replacement using ML |
+| FR9 | Noise cancellation | AI-powered noise suppression |
+| FR10 | End-to-end encryption | Optional E2EE for sensitive meetings |
+| FR11 | Adaptive bitrate | Adjust video quality based on network conditions |
+| FR12 | Webinar mode | Large-scale events with panelists and attendees (up to 50K) |
 
 ## 2. Non-Functional Requirements
 
-| Requirement | Target |
-|---|---|
-| Availability | 99.99% for meeting service |
-| Audio latency | < 150ms one-way (same region) |
-| Video latency | < 200ms one-way |
-| Video quality | 720p default, 1080p+ for pro |
-| Join time | < 3s from click to connected |
-| Concurrent meetings | 10M+ simultaneous |
-| Concurrent participants (total) | 300M+ |
-| Scalability | Support 300M DAU |
-| Packet loss tolerance | Acceptable quality up to 10% loss |
-| Bandwidth adaptation | 100kbps - 4Mbps adaptive |
+| # | NFR | Target |
+|---|---|---|
+| NFR1 | Availability | 99.99% (52 min downtime/year) |
+| NFR2 | Latency - audio | < 150ms one-way (mouth-to-ear) |
+| NFR3 | Latency - video | < 200ms one-way |
+| NFR4 | Latency - screen share | < 300ms |
+| NFR5 | Jitter | < 30ms |
+| NFR6 | Packet loss tolerance | Audio: < 5%, Video: < 2% graceful degradation |
+| NFR7 | Concurrent meetings | 10M simultaneous meetings |
+| NFR8 | Concurrent participants | 300M concurrent users |
+| NFR9 | Video quality | Up to 1080p (4K for premium), adaptive 360p-1080p |
+| NFR10 | Scale | 500M registered users, 100M DAU |
+| NFR11 | Recording storage | Petabytes of recorded content |
+| NFR12 | Global reach | < 50ms to nearest media server from any major city |
 
 ## 3. Capacity Estimation
 
+### 3.1 Traffic Metrics
+
 | Metric | Value |
 |---|---|
-| DAU | 300M |
-| Concurrent meetings | 10M |
-| Avg participants/meeting | 8 |
-| Concurrent video streams | 80M |
-| Meetings/day | 100M |
-| Avg meeting duration | 40 minutes |
-| Recordings/day | 10M (10% of meetings) |
-| Recording storage/day | 10M × 40min × 50MB/hr = 333 TB/day |
+| DAU | 100M |
+| Concurrent meetings (peak) | 10M |
+| Concurrent participants (peak) | 300M |
+| Average meeting duration | 40 minutes |
+| Average participants per meeting | 8 |
+| Meetings per day | 500M |
+| Recordings per day | 50M (10% of meetings) |
 
-### Bandwidth
-| Traffic | Calculation | Value |
+### 3.2 Bandwidth Estimation
+
+| Stream Type | Bitrate | Per User | Total (300M users) |
+|---|---|---|---|
+| Video (720p) | 1.5 Mbps send + 1.5 Mbps recv | 3 Mbps | 900 Pbps theoretical |
+| Video (actual with SFU) | 1.5 Mbps send + 4.5 Mbps recv (3 streams) | 6 Mbps | 1.8 Pbps |
+| Audio | 64 Kbps send + 64 Kbps recv | 128 Kbps | 38.4 Pbps |
+| Screen share | 2 Mbps (when active, ~20% of time) | 400 Kbps avg | 120 Pbps |
+
+**Note**: Real-world estimation uses SFU architecture where each user sends 1 stream but receives N-1 streams (or subset with simulcast).
+
+### 3.3 Storage Estimation
+
+| Data | Calculation | Storage |
 |---|---|---|
-| Video ingress | 80M × 1.5 Mbps avg | 120 Tbps |
-| Video egress | 80M × 3 Mbps (recv multiple) | 240 Tbps |
-| Audio (backup) | 80M × 64 kbps | 5.12 Tbps |
-| Screen share | 5M × 2 Mbps | 10 Tbps |
-| Signaling | 100K joins/sec × 5KB | 500 MB/s |
+| Recordings/day | 50M meetings × 40 min × 2 Mbps = 50M × 600 MB | 30 PB/day |
+| Recording retention (90 days) | 30 PB × 90 | 2.7 EB |
+| Meeting metadata | 500M × 2 KB/day | 1 TB/day |
+| Chat messages | 500M meetings × 20 msgs × 500 bytes | 5 TB/day |
+| Transcriptions | 50M × 40 min × 1 KB/min | 2 TB/day |
+
+### 3.4 Server Capacity
+
+| Component | Calculation | Servers Needed |
+|---|---|---|
+| Media servers (SFU) | 300M users / 500 users per server | 600K servers |
+| Signaling servers | 10M meetings / 10K conns per server | 1K servers |
+| TURN servers | 15% of users need relay (45M) / 2K per server | 22.5K servers |
+| Recording servers | 5M concurrent recordings / 50 per server | 100K servers |
 
 ## 4. Data Modeling
 
-### Database Selection
+### 4.1 Database Selection
 
-| Store | Technology | Purpose |
+| Workload | Database | Justification |
 |---|---|---|
-| User/Account data | PostgreSQL (sharded) | Relational, ACID |
-| Meeting metadata | PostgreSQL | Scheduling, settings |
-| Meeting state (live) | Redis Cluster | Real-time, ephemeral |
-| Chat messages | Cassandra | High write, per-meeting |
-| Recordings | S3/GCS | Large blob storage |
-| Recording metadata | PostgreSQL | Search, access control |
-| Analytics | ClickHouse | Usage metrics, reporting |
-| Signaling | Redis Pub/Sub | Low-latency coordination |
-| Calendar events | PostgreSQL | Scheduling integration |
+| User accounts & profiles | PostgreSQL (sharded) | Relational, ACID, complex queries |
+| Meeting metadata | PostgreSQL + Redis cache | Transactional, read-heavy |
+| Meeting state (live) | Redis Cluster | In-memory, sub-ms latency for real-time state |
+| Chat messages | Cassandra | High write throughput, time-series |
+| Recordings metadata | PostgreSQL | Relational queries, access control |
+| Recording files | S3 / Object Storage | Massive scale, lifecycle management |
+| Signaling state | Redis | Ephemeral, connection mapping |
+| Analytics | ClickHouse | Time-series analytics, OLAP |
+| Search (recordings) | Elasticsearch | Full-text search on transcriptions |
+| Calendar/scheduling | PostgreSQL | Complex recurring event logic |
 
-### Schema
+### 4.2 Schema Design
 
+#### PostgreSQL: Meetings
 ```sql
--- Users
-CREATE TABLE users (
-    id UUID PRIMARY KEY,
-    email VARCHAR(255) UNIQUE,
-    name VARCHAR(100),
-    plan_type VARCHAR(20), -- basic, pro, business, enterprise
-    personal_meeting_id VARCHAR(11) UNIQUE, -- 10-digit PMI
-    settings JSONB,
-    created_at TIMESTAMPTZ
-);
-
--- Meetings (scheduled)
 CREATE TABLE meetings (
-    id BIGINT PRIMARY KEY, -- 9-11 digit meeting ID
-    host_id UUID REFERENCES users(id),
-    topic VARCHAR(200),
-    type SMALLINT, -- instant, scheduled, recurring, webinar
-    start_time TIMESTAMPTZ,
-    duration_minutes INT,
-    timezone VARCHAR(50),
-    password VARCHAR(10),
-    waiting_room_enabled BOOLEAN DEFAULT TRUE,
-    recording_type VARCHAR(20), -- none, local, cloud, auto
-    max_participants INT DEFAULT 100,
-    e2e_encrypted BOOLEAN DEFAULT FALSE,
-    recurrence JSONB, -- for recurring meetings
-    settings JSONB, -- all meeting settings
-    status VARCHAR(20) DEFAULT 'scheduled', -- scheduled, started, ended
-    created_at TIMESTAMPTZ
+    meeting_id        UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    host_user_id      UUID NOT NULL REFERENCES users(user_id),
+    title             VARCHAR(255),
+    meeting_type      VARCHAR(20) NOT NULL, -- instant, scheduled, recurring, webinar
+    status            VARCHAR(20) DEFAULT 'scheduled', -- scheduled, live, ended, cancelled
+    password_hash     VARCHAR(128),
+    waiting_room      BOOLEAN DEFAULT FALSE,
+    e2ee_enabled      BOOLEAN DEFAULT FALSE,
+    max_participants  INT DEFAULT 100,
+    scheduled_start   TIMESTAMP WITH TIME ZONE,
+    scheduled_end     TIMESTAMP WITH TIME ZONE,
+    actual_start      TIMESTAMP WITH TIME ZONE,
+    actual_end        TIMESTAMP WITH TIME ZONE,
+    timezone          VARCHAR(50),
+    recurrence_rule   JSONB,              -- RRULE for recurring meetings
+    settings          JSONB,              -- mute on entry, video off, etc.
+    created_at        TIMESTAMP DEFAULT NOW(),
+    updated_at        TIMESTAMP DEFAULT NOW(),
+    version           INT DEFAULT 1
 );
-CREATE INDEX idx_meetings_host ON meetings(host_id, start_time);
-CREATE INDEX idx_meetings_time ON meetings(start_time) WHERE status = 'scheduled';
 
--- Meeting Participants (live state - Redis, historical - PostgreSQL)
+CREATE INDEX idx_meetings_host ON meetings(host_user_id, scheduled_start DESC);
+CREATE INDEX idx_meetings_status ON meetings(status) WHERE status = 'live';
+CREATE INDEX idx_meetings_schedule ON meetings(scheduled_start) WHERE status = 'scheduled';
+
 CREATE TABLE meeting_participants (
-    meeting_id BIGINT,
-    user_id UUID,
-    join_time TIMESTAMPTZ,
-    leave_time TIMESTAMPTZ,
-    role VARCHAR(20), -- host, co-host, participant, attendee
-    audio_status VARCHAR(10), -- muted, unmuted
-    video_status VARCHAR(10), -- on, off
-    duration_seconds INT,
+    meeting_id        UUID REFERENCES meetings(meeting_id),
+    user_id           UUID REFERENCES users(user_id),
+    role              VARCHAR(20) DEFAULT 'participant', -- host, co-host, panelist, participant, attendee
+    join_time         TIMESTAMP WITH TIME ZONE,
+    leave_time        TIMESTAMP WITH TIME ZONE,
+    duration_seconds  INT,
+    device_type       VARCHAR(20),
+    connection_quality VARCHAR(10), -- good, fair, poor
     PRIMARY KEY (meeting_id, user_id, join_time)
 );
 
--- Recordings
+CREATE INDEX idx_participants_user ON meeting_participants(user_id, join_time DESC);
+
 CREATE TABLE recordings (
-    id UUID PRIMARY KEY,
-    meeting_id BIGINT,
-    type VARCHAR(20), -- video, audio, transcript, chat
-    status VARCHAR(20), -- processing, ready, expired, deleted
-    file_url TEXT,
-    file_size_bytes BIGINT,
-    duration_seconds INT,
-    resolution VARCHAR(10),
-    transcript_url TEXT,
-    password VARCHAR(20),
-    expires_at TIMESTAMPTZ,
-    created_at TIMESTAMPTZ
+    recording_id      UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    meeting_id        UUID REFERENCES meetings(meeting_id),
+    recording_type    VARCHAR(20), -- video, audio, transcript, chat
+    status            VARCHAR(20) DEFAULT 'processing', -- processing, ready, failed, deleted
+    storage_path      TEXT,         -- S3 path
+    file_size_bytes   BIGINT,
+    duration_seconds  INT,
+    resolution        VARCHAR(10),  -- 720p, 1080p
+    transcript_path   TEXT,
+    created_at        TIMESTAMP DEFAULT NOW(),
+    expires_at        TIMESTAMP WITH TIME ZONE,
+    access_level      VARCHAR(20) DEFAULT 'host_only'
 );
+
 CREATE INDEX idx_recordings_meeting ON recordings(meeting_id);
+CREATE INDEX idx_recordings_expiry ON recordings(expires_at) WHERE status = 'ready';
 ```
 
-## 5. High-Level Design
-
+#### Redis: Live Meeting State
 ```
-┌────────────────────────────────────────────────────────────────────────────────┐
-│                              CLIENTS                                             │
-│  Desktop App │ Mobile App │ Web (WebRTC) │ Phone (PSTN) │ Room System (H.323)  │
-└──────────────────────────────────┬─────────────────────────────────────────────┘
-                                   │
-┌──────────────────────────────────▼─────────────────────────────────────────────┐
-│                           EDGE LAYER                                             │
-│ ┌────────┐ ┌─────────────┐ ┌──────────┐ ┌───────────────────────────────────┐ │
-│ │  DNS   │ │   Anycast   │ │   WAF    │ │  TURN/STUN Servers (global edge) │ │
-│ │(Geo LB)│ │ Load Balance│ │          │ │  - NAT traversal                 │ │
-│ └────────┘ └─────────────┘ └──────────┘ │  - Relay for restricted networks │ │
-│                                           └───────────────────────────────────┘ │
-└──────────────────────────────────┬─────────────────────────────────────────────┘
-                                   │
-         ┌─────────────────────────┼──────────────────────────────┐
-         ▼                         ▼                              ▼
-┌──────────────────┐    ┌──────────────────────┐    ┌──────────────────────────┐
-│ SIGNALING SERVER │    │   MEDIA SERVER       │    │    WEB API SERVER        │
-│ (WebSocket)      │    │   (SFU Cluster)      │    │                          │
-│ - Join/leave     │    │                      │    │  - REST APIs             │
-│ - Offer/Answer   │    │  ┌────────────────┐  │    │  - Scheduling            │
-│ - ICE candidates │    │  │ Audio Router   │  │    │  - User management       │
-│ - Room control   │    │  │ (Opus codec)   │  │    │  - Recording management  │
-│ - Chat relay     │    │  ├────────────────┤  │    │  - Billing               │
-│                  │    │  │ Video Router   │  │    │  - Admin/Compliance       │
-│                  │    │  │ (VP8/H.264/AV1)│  │    │                          │
-│                  │    │  ├────────────────┤  │    └──────────────────────────┘
-│                  │    │  │ Screen Share   │  │
-│                  │    │  │ Router         │  │    ┌──────────────────────────┐
-│                  │    │  ├────────────────┤  │    │   RECORDING SERVICE      │
-│                  │    │  │ Recording      │  │    │   - Capture streams      │
-│                  │    │  │ Tap            │  │    │   - Transcode            │
-│                  │    │  └────────────────┘  │    │   - Store to S3          │
-│                  │    │                      │    │   - Generate transcript   │
-└──────────────────┘    └──────────────────────┘    └──────────────────────────┘
-                                   │
-┌──────────────────────────────────▼─────────────────────────────────────────────┐
-│                              DATA LAYER                                          │
-│  ┌──────────┐ ┌──────────┐ ┌──────────┐ ┌──────────┐ ┌─────────┐ ┌────────┐  │
-│  │PostgreSQL│ │  Redis   │ │ Cassandra│ │   S3     │ │ClickHse │ │ Kafka  │  │
-│  │(Metadata)│ │(LiveState│ │  (Chat)  │ │(Record.) │ │(Analytcs)│ │(Events)│  │
-│  └──────────┘ └──────────┘ └──────────┘ └──────────┘ └─────────┘ └────────┘  │
-└────────────────────────────────────────────────────────────────────────────────┘
+# Meeting state (lives only during active meeting)
+Key: meeting:live:{meeting_id}
+Type: HASH
+Fields:
+  status: "active"
+  host_user_id: "u_123"
+  participant_count: "8"
+  start_time: "1716003600"
+  media_server_id: "ms_us_east_01"
+  recording_active: "true"
+  screen_share_user: "u_456"
+  breakout_active: "false"
+TTL: None (deleted when meeting ends)
+
+# Participant connection mapping
+Key: meeting:participants:{meeting_id}
+Type: HASH
+Fields:
+  u_123: "ms_us_east_01:conn_abc"   # user → media_server:connection
+  u_456: "ms_us_east_01:conn_def"
+  u_789: "ms_eu_west_01:conn_ghi"   # different region participant
+
+# Signaling channel
+Key: signal:{user_id}:{meeting_id}
+Type: LIST (for SDP offers/answers, ICE candidates)
+TTL: 300s
 ```
 
-### Media Architecture - SFU (Selective Forwarding Unit)
+#### Cassandra: Chat Messages
+```sql
+CREATE TABLE meeting_chat (
+    meeting_id    UUID,
+    message_id    TIMEUUID,
+    sender_id     UUID,
+    message_type  TEXT,      -- text, file, reaction, system
+    content       TEXT,
+    file_url      TEXT,
+    recipient     TEXT,      -- 'all', user_id for DM, breakout_room_id
+    created_at    TIMESTAMP,
+    PRIMARY KEY ((meeting_id), message_id)
+) WITH CLUSTERING ORDER BY (message_id ASC)
+  AND default_time_to_live = 2592000; -- 30 days
+```
+
+## 5. High-Level Design (HLD)
+
+### 5.1 Architecture Diagram
+
+```
+┌─────────────────────────────────────────────────────────────────────────────┐
+│                              CLIENT LAYER                                     │
+│  [Desktop App] [Mobile App] [Web Browser] [Room Systems] [Phone Dial-in]    │
+│                                                                               │
+│  Client Components:                                                           │
+│  ┌────────────┐ ┌────────────┐ ┌────────────┐ ┌────────────┐               │
+│  │ WebRTC     │ │ Codec      │ │ Noise      │ │ Virtual BG │               │
+│  │ Stack      │ │ Engine     │ │ Canceller  │ │ ML Model   │               │
+│  │ (ICE/DTLS/ │ │ (H.264/   │ │ (RNNoise/  │ │            │               │
+│  │  SRTP)     │ │  VP8/VP9/  │ │  Krisp)    │ │            │               │
+│  │            │ │  AV1)      │ │            │ │            │               │
+│  └────────────┘ └────────────┘ └────────────┘ └────────────┘               │
+└───────────────────────────────────┬─────────────────────────────────────────┘
+                                    │ UDP/TCP (SRTP/DTLS)
+                                    │ WSS (Signaling)
+                                    ▼
+┌─────────────────────────────────────────────────────────────────────────────┐
+│                         EDGE / NETWORK LAYER                                  │
+│                                                                               │
+│  ┌──────────┐  ┌──────────────┐  ┌────────────┐  ┌────────────────────┐   │
+│  │ Route 53 │  │ Global       │  │ TURN/STUN  │  │ DDoS Protection    │   │
+│  │ (DNS +   │  │ Anycast      │  │ Servers    │  │ (AWS Shield)       │   │
+│  │  Latency │  │ Network      │  │ (Relay for │  │                    │   │
+│  │  Routing)│  │              │  │  NAT trvsl)│  │                    │   │
+│  └──────────┘  └──────────────┘  └────────────┘  └────────────────────┘   │
+│                                                                               │
+│  ┌──────────────────────────────────────────────────────────────────────┐   │
+│  │              Points of Presence (PoPs) - 200+ locations               │   │
+│  │  Each PoP: TURN servers + Edge media processors + Signaling relay    │   │
+│  └──────────────────────────────────────────────────────────────────────┘   │
+│                                                                               │
+└───────────────────────────────────┬─────────────────────────────────────────┘
+                                    │
+┌───────────────────────────────────┼─────────────────────────────────────────┐
+│                      SIGNALING LAYER                │                         │
+│                                                      ▼                        │
+│  ┌─────────────────────────────────────────────────────────────────────┐    │
+│  │                   Signaling Service (WebSocket)                       │    │
+│  │  • SDP Offer/Answer exchange (WebRTC negotiation)                   │    │
+│  │  • ICE candidate relay                                               │    │
+│  │  • Meeting room management (join/leave/mute/kick)                   │    │
+│  │  • Real-time state sync (who's talking, screen sharing, etc.)       │    │
+│  │  Tech: Go + WebSocket | Stateless | 10K connections/server          │    │
+│  └─────────────────────────────────────────────────────────────────────┘    │
+│                                                                               │
+└───────────────────────────────────┬─────────────────────────────────────────┘
+                                    │
+┌───────────────────────────────────┼─────────────────────────────────────────┐
+│                      MEDIA LAYER (Core)             │                         │
+│                                                      ▼                        │
+│  ┌─────────────────────────────────────────────────────────────────────┐    │
+│  │           Selective Forwarding Unit (SFU) Cluster                     │    │
+│  │                                                                       │    │
+│  │  ┌───────────┐  ┌───────────┐  ┌───────────┐  ┌───────────┐       │    │
+│  │  │  SFU-1    │  │  SFU-2    │  │  SFU-3    │  │  SFU-N    │       │    │
+│  │  │ (500 usr) │  │ (500 usr) │  │ (500 usr) │  │ (500 usr) │       │    │
+│  │  │           │  │           │  │           │  │           │       │    │
+│  │  │ Simulcast │  │ Simulcast │  │ Simulcast │  │ Simulcast │       │    │
+│  │  │ SVC Layer │  │ SVC Layer │  │ SVC Layer │  │ SVC Layer │       │    │
+│  │  │ Selection │  │ Selection │  │ Selection │  │ Selection │       │    │
+│  │  └───────────┘  └───────────┘  └───────────┘  └───────────┘       │    │
+│  │                                                                       │    │
+│  │  Cross-SFU Cascading (for meetings spanning multiple SFUs):          │    │
+│  │  SFU-1 ←──UDP/TCP──→ SFU-2 ←──UDP/TCP──→ SFU-3                    │    │
+│  │                                                                       │    │
+│  └─────────────────────────────────────────────────────────────────────┘    │
+│                                                                               │
+│  ┌─────────────────────────────────────────────────────────────────────┐    │
+│  │           Media Processing Services                                   │    │
+│  │  ┌──────────────┐ ┌──────────────┐ ┌──────────────┐                │    │
+│  │  │ Transcoding  │ │ Recording    │ │ Composition  │                │    │
+│  │  │ Service      │ │ Service      │ │ Service      │                │    │
+│  │  │ (H264→VP8)   │ │ (media→S3)   │ │ (Grid/Speaker│                │    │
+│  │  │              │ │              │ │  view render) │                │    │
+│  │  └──────────────┘ └──────────────┘ └──────────────┘                │    │
+│  │  ┌──────────────┐ ┌──────────────┐ ┌──────────────┐                │    │
+│  │  │ Speech-to-   │ │ Live         │ │ AI Noise     │                │    │
+│  │  │ Text (STT)   │ │ Captioning   │ │ Suppression  │                │    │
+│  │  │              │ │              │ │ (server-side)│                │    │
+│  │  └──────────────┘ └──────────────┘ └──────────────┘                │    │
+│  └─────────────────────────────────────────────────────────────────────┘    │
+│                                                                               │
+└───────────────────────────────────┬─────────────────────────────────────────┘
+                                    │
+┌───────────────────────────────────┼─────────────────────────────────────────┐
+│                   APPLICATION LAYER                  │                         │
+│                                                      ▼                        │
+│  ┌──────────────────┐  ┌──────────────────┐  ┌──────────────────┐          │
+│  │ Meeting Service  │  │ User Service     │  │ Auth Service     │          │
+│  │ (CRUD, schedule) │  │ (profiles, plan) │  │ (OAuth, JWT,SSO) │          │
+│  └──────────────────┘  └──────────────────┘  └──────────────────┘          │
+│  ┌──────────────────┐  ┌──────────────────┐  ┌──────────────────┐          │
+│  │ Recording Service│  │ Notification Svc │  │ Calendar Service │          │
+│  │ (manage, share)  │  │ (email, push)    │  │ (Google, O365)   │          │
+│  └──────────────────┘  └──────────────────┘  └──────────────────┘          │
+│  ┌──────────────────┐  ┌──────────────────┐  ┌──────────────────┐          │
+│  │ Chat Service     │  │ Billing Service  │  │ Analytics Service│          │
+│  └──────────────────┘  └──────────────────┘  └──────────────────┘          │
+│                                                                               │
+└───────────────────────────────────┬─────────────────────────────────────────┘
+                                    │
+┌───────────────────────────────────┼─────────────────────────────────────────┐
+│                      DATA LAYER                     │                         │
+│                                                      ▼                        │
+│  ┌──────────────┐ ┌──────────────┐ ┌──────────────┐ ┌──────────────┐      │
+│  │ PostgreSQL   │ │ Redis Cluster│ │ Cassandra    │ │ S3           │      │
+│  │ (Meetings,   │ │ (Live state, │ │ (Chat, CDR) │ │ (Recordings, │      │
+│  │  Users,      │ │  Signaling,  │ │              │ │  Transcripts)│      │
+│  │  Billing)    │ │  Routing)    │ │              │ │              │      │
+│  └──────────────┘ └──────────────┘ └──────────────┘ └──────────────┘      │
+│  ┌──────────────┐ ┌──────────────┐ ┌──────────────┐                       │
+│  │ ClickHouse   │ │ Elasticsearch│ │ Kafka        │                       │
+│  │ (Analytics)  │ │ (Search)     │ │ (Events)     │                       │
+│  └──────────────┘ └──────────────┘ └──────────────┘                       │
+│                                                                               │
+└─────────────────────────────────────────────────────────────────────────────┘
+```
+
+### 5.2 Media Architecture: SFU vs MCU
 
 ```
 ┌─────────────────────────────────────────────────────────────────┐
-│                    SFU ARCHITECTURE                               │
-├─────────────────────────────────────────────────────────────────┤
+│  SELECTIVE FORWARDING UNIT (SFU) - Chosen Architecture          │
 │                                                                   │
 │  Why SFU over MCU:                                               │
-│  - MCU: server decodes + re-encodes all streams (CPU expensive)  │
-│  - SFU: server just forwards packets (10x less CPU)              │
-│  - SFU: better quality (no re-encoding loss)                     │
-│  - SFU: lower latency (no processing delay)                     │
-│  - Trade-off: client receives N streams, more client bandwidth   │
+│  • Lower latency (no transcoding delay)                          │
+│  • Better scaling (linear vs exponential compute)                │
+│  • Simulcast support (multiple quality layers)                   │
+│  • Lower server cost (forwarding vs encoding)                    │
 │                                                                   │
-│  Simulcast (send multiple qualities):                            │
-│  - Each sender publishes 3 layers:                               │
-│    · High: 720p @ 30fps @ 1.5 Mbps                              │
-│    · Medium: 360p @ 30fps @ 500 Kbps                             │
-│    · Low: 180p @ 15fps @ 150 Kbps                                │
-│  - SFU selects which layer to forward to each receiver           │
-│  - Active speaker gets High, thumbnails get Low                  │
+│  How Simulcast Works:                                            │
 │                                                                   │
-│  SVC (Scalable Video Coding) alternative:                        │
-│  - Single bitstream with embedded layers                         │
-│  - SFU can drop enhancement layers for constrained receivers     │
-│  - Used in newer implementations (AV1/SVC)                       │
+│  Sender encodes 3 layers simultaneously:                         │
+│  ┌─────────┐                                                     │
+│  │ Client  │──→ High (720p, 1.5 Mbps)  ──→ SFU ──→ Good conn  │
+│  │ Camera  │──→ Medium (360p, 500 Kbps) ──→ SFU ──→ Fair conn  │
+│  │         │──→ Low (180p, 150 Kbps)    ──→ SFU ──→ Poor conn  │
+│  └─────────┘                                                     │
 │                                                                   │
-│  Audio Handling:                                                  │
-│  - Opus codec: 6-128 kbps, excellent quality                    │
-│  - Server-side mixing: forward top 3 active speakers only       │
-│  - Reduces bandwidth from N×N to N×3                             │
-│  - Voice Activity Detection (VAD) for speaker selection          │
+│  SFU selects which layer to forward based on:                    │
+│  • Receiver's available bandwidth (REMB/TWCC feedback)           │
+│  • Whether video is in "active speaker" vs "thumbnail"           │
+│  • Explicit quality preference from receiver                     │
 │                                                                   │
-│  Large Meetings (>50 participants):                              │
-│  - Cascaded SFU: multiple SFU nodes cooperate                   │
-│  - Participants grouped by region                                │
-│  - SFU nodes exchange only active speaker streams                │
-│  - Reduces inter-DC bandwidth dramatically                       │
 └─────────────────────────────────────────────────────────────────┘
 ```
 
-## 6. Low-Level Design - APIs
-
-### Meeting Management APIs
+### 5.3 Meeting Topology for Large Meetings
 
 ```
-POST /api/v2/meetings
-Request: {
-  "topic": "Weekly Standup",
-  "type": 2, // scheduled
-  "start_time": "2024-05-28T09:00:00Z",
-  "duration": 30,
-  "timezone": "America/New_York",
-  "password": "abc123",
-  "settings": {
-    "waiting_room": true,
-    "mute_upon_entry": true,
-    "auto_recording": "cloud",
-    "breakout_rooms": true
-  }
-}
-Response: {
-  "id": 98765432109,
-  "host_id": "user_123",
-  "topic": "Weekly Standup",
-  "join_url": "https://zoom.us/j/98765432109?pwd=encoded_pwd",
-  "password": "abc123",
-  "start_url": "https://zoom.us/s/98765432109?zak=host_token"
-}
+Small meeting (≤ 20 participants): Single SFU
+┌─────┐     ┌─────────┐     ┌─────┐
+│User1│◄───►│  SFU-1  │◄───►│User2│
+│User3│◄───►│ (single)│◄───►│User4│
+└─────┘     └─────────┘     └─────┘
 
-GET /api/v2/meetings/{meeting_id}
-Response: { full meeting details + participant count if live }
+Medium meeting (20-300 participants): Cascaded SFUs
+┌─────┐     ┌─────────┐           ┌─────────┐     ┌─────┐
+│User1│◄───►│  SFU-1  │◄─cascade─►│  SFU-2  │◄───►│User5│
+│User2│◄───►│ Region1 │           │ Region2 │◄───►│User6│
+└─────┘     └─────────┘           └─────────┘     └─────┘
 
-DELETE /api/v2/meetings/{meeting_id}
-Response: 204 No Content
+Large meeting/Webinar (300-50K): Hierarchical tree
+                    ┌──────────┐
+                    │ Origin   │ (Host/Panelists)
+                    │ SFU      │
+                    └────┬─────┘
+              ┌──────────┼──────────┐
+              ▼          ▼          ▼
+        ┌──────────┐ ┌──────────┐ ┌──────────┐
+        │ Edge     │ │ Edge     │ │ Edge     │  (Regional)
+        │ SFU-1   │ │ SFU-2   │ │ SFU-3   │
+        └────┬─────┘ └────┬─────┘ └────┬─────┘
+             │             │             │
+        ┌────┴────┐   ┌────┴────┐   ┌────┴────┐
+        │ 1000    │   │ 1000    │   │ 1000    │  (Attendees)
+        │ viewers │   │ viewers │   │ viewers │
+        └─────────┘   └─────────┘   └─────────┘
 ```
 
-### Real-time Signaling (WebSocket)
+## 6. Low-Level Design (LLD)
+
+### 6.1 Signaling Protocol (WebSocket)
 
 ```json
-// Client → Server: Join meeting
-{"action": "join", "meeting_id": 98765432109, "token": "jwt...", "media_caps": {"audio": true, "video": true, "simulcast": true}}
+// Client → Server: Join Meeting
+{
+  "type": "join",
+  "meeting_id": "meet_abc123",
+  "auth_token": "jwt_...",
+  "device_info": {
+    "type": "desktop",
+    "os": "macOS",
+    "browser": "Chrome 125",
+    "audio_codecs": ["opus"],
+    "video_codecs": ["H264", "VP9", "AV1"],
+    "simulcast": true,
+    "max_resolution": "1080p"
+  }
+}
 
-// Server → Client: Room state
-{"event": "room_state", "participants": [...], "settings": {...}, "media_server": "sfu-us-west-1.zoom.us"}
+// Server → Client: Join Accepted + Room State
+{
+  "type": "join_accepted",
+  "participant_id": "part_xyz",
+  "media_server": {
+    "url": "wss://sfu-us-east-01.zoom.example.com",
+    "ice_servers": [
+      {"urls": "stun:stun.zoom.example.com:3478"},
+      {"urls": "turn:turn.zoom.example.com:443", "credential": "temp_cred_..."}
+    ]
+  },
+  "room_state": {
+    "participants": [
+      {"user_id": "u_1", "name": "Alice", "audio": true, "video": true, "role": "host"},
+      {"user_id": "u_2", "name": "Bob", "audio": true, "video": false, "role": "participant"}
+    ],
+    "screen_share": null,
+    "recording": false
+  }
+}
 
-// Client → Server: Publish stream
-{"action": "publish", "kind": "video", "sdp": "v=0\r\n...", "simulcast_layers": ["high", "medium", "low"]}
+// SDP Offer/Answer Exchange
+{
+  "type": "sdp_offer",
+  "sdp": "v=0\r\no=- 12345 2 IN IP4 127.0.0.1\r\n...",
+  "tracks": [
+    {"id": "audio_0", "kind": "audio", "codec": "opus/48000/2"},
+    {"id": "video_0", "kind": "video", "codec": "H264", "simulcast": ["h", "m", "l"]}
+  ]
+}
 
-// Server → Client: Stream available
-{"event": "stream_available", "participant_id": "p_456", "kind": "video", "track_id": "t_789"}
+// ICE Candidate
+{
+  "type": "ice_candidate",
+  "candidate": "candidate:1 1 UDP 2130706431 192.168.1.1 54321 typ host",
+  "sdpMid": "0",
+  "sdpMLineIndex": 0
+}
 
-// Client → Server: Subscribe to stream
-{"action": "subscribe", "track_id": "t_789", "preferred_quality": "high"}
+// Media Control
+{
+  "type": "media_control",
+  "action": "mute_audio"  // mute_audio, unmute_audio, stop_video, start_video
+}
 
-// Server → Client: SDP answer
-{"event": "sdp_answer", "sdp": "v=0\r\n..."}
+// Active Speaker Notification
+{
+  "type": "active_speaker",
+  "user_id": "u_1",
+  "audio_level": 0.85,
+  "timestamp": 1716003600000
+}
 
-// Server → Client: Active speaker changed
-{"event": "active_speaker", "participant_id": "p_456", "audio_level": 0.8}
-
-// Client → Server: Mute/unmute
-{"action": "mute", "kind": "audio", "muted": true}
-
-// Host → Server: Mute all
-{"action": "mute_all", "allow_unmute": true}
+// Quality Adaptation
+{
+  "type": "quality_update",
+  "user_id": "u_2",
+  "layer": "medium",       // high, medium, low
+  "reason": "bandwidth"    // bandwidth, cpu, manual
+}
 ```
 
-## 7. Architecture Deep Dive
+### 6.2 REST APIs
 
-### 7.1 Meeting Join Flow
+```http
+POST /api/v1/meetings
+Authorization: Bearer <token>
+Content-Type: application/json
+
+Request:
+{
+  "title": "Team Standup",
+  "type": "scheduled",
+  "scheduled_start": "2025-05-20T09:00:00Z",
+  "duration_minutes": 30,
+  "timezone": "America/New_York",
+  "settings": {
+    "waiting_room": true,
+    "mute_on_entry": true,
+    "video_off_on_entry": false,
+    "allow_recording": true,
+    "e2ee": false,
+    "max_participants": 50,
+    "breakout_rooms_enabled": true
+  },
+  "recurrence": {
+    "type": "weekly",
+    "days": ["MON", "WED", "FRI"],
+    "end_date": "2025-12-31"
+  }
+}
+
+Response (201 Created):
+{
+  "meeting_id": "meet_abc123",
+  "join_url": "https://zoom.example.com/j/meet_abc123",
+  "host_url": "https://zoom.example.com/j/meet_abc123?host_key=hk_xyz",
+  "password": "123456",
+  "dial_in_numbers": [
+    {"country": "US", "number": "+1-555-0100", "pin": "12345#"}
+  ],
+  "settings": {...},
+  "created_at": "2025-05-18T10:00:00Z"
+}
+```
+
+```http
+POST /api/v1/meetings/{meeting_id}/join
+Authorization: Bearer <token>
+
+Request:
+{
+  "display_name": "John Doe",
+  "password": "123456",
+  "device_type": "desktop"
+}
+
+Response (200 OK):
+{
+  "participant_id": "part_xyz",
+  "signaling_url": "wss://signal-us-east.zoom.example.com/ws",
+  "signaling_token": "sig_token_...",
+  "media_region": "us-east-1",
+  "ice_servers": [...],
+  "meeting_info": {
+    "title": "Team Standup",
+    "host": "Alice",
+    "participant_count": 5,
+    "recording_active": false,
+    "waiting_room_active": true
+  }
+}
+```
+
+### 6.3 Internal gRPC APIs
+
+```protobuf
+syntax = "proto3";
+package media.v1;
+
+service MediaRoutingService {
+  rpc AllocateMediaServer(AllocateRequest) returns (AllocateResponse);
+  rpc CascadeSFUs(CascadeRequest) returns (CascadeResponse);
+  rpc MigrateParticipant(MigrateRequest) returns (MigrateResponse);
+  rpc GetServerLoad(LoadRequest) returns (LoadResponse);
+}
+
+service RecordingService {
+  rpc StartRecording(StartRecordingRequest) returns (StartRecordingResponse);
+  rpc StopRecording(StopRecordingRequest) returns (StopRecordingResponse);
+  rpc GetRecordingStatus(StatusRequest) returns (StatusResponse);
+  rpc ProcessRecording(ProcessRequest) returns (ProcessResponse);  // transcode + upload
+}
+
+service TranscriptionService {
+  rpc StartLiveTranscription(stream AudioFrame) returns (stream TranscriptSegment);
+  rpc TranscribeRecording(TranscribeRequest) returns (TranscribeResponse);
+  rpc GetTranscript(GetTranscriptRequest) returns (TranscriptResponse);
+}
+```
+
+## 7. Architecture Components Deep Dive
+
+### 7.1 WebRTC Media Pipeline
 
 ```
-1. User clicks join link → DNS resolves to nearest edge
-2. Client connects WebSocket to signaling server
-3. Signaling authenticates token, checks meeting exists/started
-4. Signaling assigns media server (nearest SFU with capacity)
-5. Client establishes WebRTC connection to SFU:
-   a. STUN: discover public IP
-   b. ICE: find best connectivity path
-   c. DTLS: secure the connection
-   d. SRTP: begin encrypted media flow
-6. Client publishes audio/video tracks to SFU
-7. SFU notifies other participants of new stream
-8. Other participants subscribe to new stream
-9. Total time: < 3 seconds
+┌─────────────────────────────────────────────────────────────────┐
+│                  MEDIA PIPELINE (Per Participant)                 │
+│                                                                   │
+│  SEND PATH:                                                      │
+│  Microphone → Noise Cancel → Opus Encode → SRTP → Network      │
+│  Camera → Background → H264 Encode (3 layers) → SRTP → Network │
+│                                                                   │
+│  RECEIVE PATH:                                                   │
+│  Network → SRTP Decrypt → Jitter Buffer → Decoder → Render     │
+│                                                                   │
+│  SFU FORWARDING (No transcoding!):                               │
+│  Recv SRTP from sender → Select layer → Forward SRTP to recv   │
+│                                                                   │
+│  Bandwidth Estimation:                                           │
+│  ┌─────────────────────────────────────────────────────────┐    │
+│  │ TWCC (Transport-Wide Congestion Control):                │    │
+│  │ • Receiver sends feedback every 100ms                    │    │
+│  │ • Reports packet arrival times                            │    │
+│  │ • Sender estimates available bandwidth                    │    │
+│  │ • Adjusts encoding bitrate + simulcast layer selection   │    │
+│  │                                                           │    │
+│  │ GCC (Google Congestion Control):                          │    │
+│  │ • Delay-based + loss-based estimation                    │    │
+│  │ • Ramp-up slowly, back-off quickly                       │    │
+│  │ • Target: fill available bandwidth without causing loss  │    │
+│  └─────────────────────────────────────────────────────────┘    │
+│                                                                   │
+└─────────────────────────────────────────────────────────────────┘
 ```
 
-### 7.2 Bandwidth Adaptation (Congestion Control)
+### 7.2 SFU Server Design
 
 ```
-Algorithm: Google Congestion Control (GCC) / Transport-CC
-
-Sender Side:
-1. Start at 1 Mbps, probe for available bandwidth
-2. Increase gradually (additive increase)
-3. On packet loss or delay spike: reduce immediately (multiplicative decrease)
-4. Select simulcast layer based on estimated bandwidth:
-   - > 1.5 Mbps: send High + Medium + Low
-   - 500K - 1.5M: send Medium + Low
-   - < 500K: send Low only
-
-Receiver Side (SFU):
-1. Monitor each receiver's available bandwidth
-2. Switch forwarded layer based on receiver bandwidth:
-   - Receiver has 2 Mbps: forward High for speaker, Medium for others
-   - Receiver has 500 Kbps: forward Low for all, Medium for speaker
-3. Temporal scalability: drop frames to reduce bitrate without resolution change
-
-Network Quality Indicators:
-- RTT measurement (RTCP sender/receiver reports)
-- Packet loss percentage
-- Jitter (variation in packet arrival time)
-- Available bandwidth estimation
+┌─────────────────────────────────────────────────────────────────┐
+│                    SFU SERVER INTERNALS                           │
+│                                                                   │
+│  ┌─────────────────────────────────────────────────────────┐    │
+│  │  Transport Layer                                          │    │
+│  │  • ICE/DTLS/SRTP stack per participant                   │    │
+│  │  • UDP sockets (primary) + TCP fallback                  │    │
+│  │  • TURN relay integration                                │    │
+│  └────────────────────────────────┬────────────────────────┘    │
+│                                    │                              │
+│  ┌─────────────────────────────────▼──────────────────────────┐ │
+│  │  Router Layer                                                │ │
+│  │  • Per-meeting "Room" object                                 │ │
+│  │  • Track subscription management                             │ │
+│  │  • Simulcast layer selection per subscriber                  │ │
+│  │  • Active speaker detection (audio level + VAD)              │ │
+│  │  • Bandwidth allocation across tracks                        │ │
+│  └────────────────────────────────┬────────────────────────────┘ │
+│                                    │                              │
+│  ┌─────────────────────────────────▼──────────────────────────┐ │
+│  │  Quality Layer                                               │ │
+│  │  • Per-receiver bandwidth estimation                         │ │
+│  │  • Temporal/Spatial layer switching (VP9 SVC)               │ │
+│  │  • Keyframe requests (PLI/FIR)                              │ │
+│  │  • Packet loss concealment                                   │ │
+│  │  • FEC (Forward Error Correction) for lossy links           │ │
+│  └─────────────────────────────────────────────────────────────┘ │
+│                                                                   │
+│  Capacity: 500 participants per SFU server                       │
+│  Hardware: 32 cores, 64GB RAM, 25 Gbps NIC                     │
+│  OS: Linux with tuned UDP buffer sizes                           │
+│  Language: C++ or Rust for performance                           │
+│                                                                   │
+└─────────────────────────────────────────────────────────────────┘
 ```
 
 ### 7.3 Recording Architecture
 
 ```
-┌─────────────────────────────────────────────────────────┐
-│              RECORDING PIPELINE                           │
-├─────────────────────────────────────────────────────────┤
-│                                                           │
-│  1. Recording Tap (on SFU):                              │
-│     - Capture all media streams as RTP packets           │
-│     - Write raw streams to local SSD buffer              │
-│     - Forward to recording processor                     │
-│                                                           │
-│  2. Recording Processor:                                 │
-│     - Decode all video streams                           │
-│     - Compose into gallery/speaker layout                │
-│     - Encode as H.264 MP4 (720p/1080p)                  │
-│     - Mix all audio into single track                    │
-│     - Generate: full_video.mp4, audio_only.m4a,          │
-│       speaker_view.mp4, gallery_view.mp4                 │
-│                                                           │
-│  3. Post-Processing:                                     │
-│     - Upload to S3 (multi-part, parallel)                │
-│     - Generate transcript (Whisper/DeepSpeech ASR)       │
-│     - Generate chapters/highlights                       │
-│     - Thumbnail generation at key moments                │
-│     - Encrypt with meeting-specific key                  │
-│                                                           │
-│  4. Delivery:                                             │
-│     - Notify host: "Recording ready"                     │
-│     - Generate share link with access control            │
-│     - Retention policy: auto-delete after 30/60/90 days  │
-│     - Download or stream via CDN                         │
-│                                                           │
-│  Storage Tiers:                                           │
-│  - Hot (7 days): S3 Standard                             │
-│  - Warm (30 days): S3 IA                                │
-│  - Cold (90+ days): S3 Glacier                           │
-└─────────────────────────────────────────────────────────┘
+┌─────────────────────────────────────────────────────────────────┐
+│                  RECORDING PIPELINE                               │
+│                                                                   │
+│  1. CAPTURE (on SFU):                                           │
+│     SFU forks media streams to Recording Agent                   │
+│     Recording Agent receives raw RTP/SRTP packets                │
+│                                                                   │
+│  2. MUX (Recording Service):                                    │
+│     ┌────────────────────────────────────────┐                  │
+│     │ Individual Track Recording:             │                  │
+│     │ • Each participant → separate file      │                  │
+│     │ • Audio: Opus → PCM → WAV segment      │                  │
+│     │ • Video: H264 → MP4 segment            │                  │
+│     │ • Segments: 30-second chunks to S3      │                  │
+│     └────────────────────────────────────────┘                  │
+│                                                                   │
+│  3. POST-PROCESS (Async - after meeting ends):                  │
+│     ┌────────────────────────────────────────┐                  │
+│     │ Composition Service:                    │                  │
+│     │ • Merge all tracks into single file     │                  │
+│     │ • Active speaker view / Gallery view    │                  │
+│     │ • Add chapter markers (speaker changes) │                  │
+│     │ • Transcode to multiple qualities       │                  │
+│     │   (1080p, 720p, 480p, audio-only)      │                  │
+│     │ • Generate thumbnail                    │                  │
+│     │ • Run STT for transcript               │                  │
+│     │ • Upload final to S3                    │                  │
+│     │                                         │                  │
+│     │ Processing time: ~0.5x real-time        │                  │
+│     │ (40 min meeting → 20 min processing)    │                  │
+│     └────────────────────────────────────────┘                  │
+│                                                                   │
+│  4. STORAGE:                                                     │
+│     S3 path: s3://recordings/{org_id}/{meeting_id}/              │
+│       ├── raw/                                                    │
+│       │   ├── audio_user1.opus                                   │
+│       │   ├── video_user1.h264                                   │
+│       │   └── ...                                                 │
+│       ├── processed/                                              │
+│       │   ├── meeting_1080p.mp4                                  │
+│       │   ├── meeting_720p.mp4                                   │
+│       │   ├── meeting_audio.m4a                                  │
+│       │   └── thumbnail.jpg                                       │
+│       ├── transcript/                                             │
+│       │   ├── transcript.json (timestamped)                      │
+│       │   ├── transcript.vtt (subtitles)                         │
+│       │   └── chapters.json                                       │
+│       └── metadata.json                                           │
+│                                                                   │
+└─────────────────────────────────────────────────────────────────┘
 ```
 
-## 8. Optimization
+### 7.4 TURN/STUN Infrastructure
 
-### 8.1 Media Server Optimization
-- **SIMD (AVX2/NEON)**: Hardware-accelerated packet routing
-- **Zero-copy networking**: sendfile/splice for media forwarding
-- **DPDK or XDP**: Kernel bypass for ultra-low latency packet handling
-- **Connection pooling**: Reuse DTLS sessions for same client
-- **Memory pools**: Pre-allocated buffers for RTP packets (avoid GC)
+- **STUN**: Lightweight, helps client discover its public IP/port. Stateless.
+- **TURN**: Heavy relay, used when direct P2P/SFU connection fails (symmetric NAT, corporate firewalls)
+- **Deployment**: TURN on TCP 443 (looks like HTTPS to firewalls)
+- **Capacity**: Each TURN server relays ~2000 streams
+- **Selection**: Client tries direct → STUN → TURN (ICE negotiation)
+- **Authentication**: Short-lived credentials generated per session (HMAC-based)
 
-### 8.2 Global Infrastructure
+## 8. Deep Dive Components
+
+### 8.1 Adaptive Bitrate & Congestion Control (Deep Dive)
+
 ```
-Media Server Regions: 20+ regions worldwide
-  US: us-east-1, us-west-2, us-central
-  EU: eu-west-1, eu-central-1, eu-north-1
-  APAC: ap-southeast-1, ap-northeast-1, ap-south-1
-  
-Meeting Allocation:
-  - Determine optimal region based on participant locations
-  - If all in same city: use nearest region
-  - If distributed: use central region or cascade across regions
-  - Dynamic migration: if participants change, can relocate meeting
+┌─────────────────────────────────────────────────────────────────┐
+│           ADAPTIVE BITRATE CONTROL LOOP                          │
+│                                                                   │
+│  Input signals:                                                  │
+│  • TWCC feedback (packet delay gradient)                         │
+│  • RTCP Receiver Reports (packet loss %)                        │
+│  • PLI/FIR requests (keyframe requests = quality issue)         │
+│  • CPU usage on sender                                           │
+│                                                                   │
+│  Algorithm (Sender-side GCC):                                    │
+│  ┌─────────────────────────────────────────────────────┐        │
+│  │                                                       │        │
+│  │  estimated_bw = delay_based_estimate()               │        │
+│  │  if (packet_loss > 10%):                             │        │
+│  │      target_bw = estimated_bw * 0.7                  │        │
+│  │  elif (packet_loss > 2%):                            │        │
+│  │      target_bw = estimated_bw * 0.9                  │        │
+│  │  else:                                               │        │
+│  │      target_bw = estimated_bw * 1.05  // probe up   │        │
+│  │                                                       │        │
+│  │  target_bw = clamp(target_bw, MIN_BW, MAX_BW)       │        │
+│  │  encoder.setBitrate(target_bw)                        │        │
+│  │                                                       │        │
+│  │  // Simulcast layer selection on SFU side:            │        │
+│  │  if (receiver_bw > 1.5 Mbps): forward HIGH layer     │        │
+│  │  elif (receiver_bw > 500 Kbps): forward MEDIUM       │        │
+│  │  else: forward LOW layer                              │        │
+│  │                                                       │        │
+│  └─────────────────────────────────────────────────────┘        │
+│                                                                   │
+│  Adaptation Timeline Example:                                    │
+│  t=0s:   Good network → 720p high quality                       │
+│  t=5s:   Congestion detected → switch to 360p medium            │
+│  t=10s:  Severe loss → switch to 180p low + audio priority      │
+│  t=15s:  Recovery → probe up to 360p                             │
+│  t=20s:  Stable → back to 720p                                   │
+│                                                                   │
+└─────────────────────────────────────────────────────────────────┘
 ```
 
-### 8.3 Caching & CDN
+### 8.2 Active Speaker Detection (Deep Dive)
+
 ```
-- Meeting metadata: Redis cache (TTL 5 min)
-- User profiles/avatars: CDN with long TTL
-- Virtual backgrounds: CDN edge cache
-- Recordings: CloudFront with signed URLs
-- Static assets: Aggressive caching (1 year, immutable)
+Algorithm: Server-side Voice Activity Detection (VAD)
+
+Input: Audio levels from all participants (extracted from RTP header extensions)
+
+Processing (every 100ms):
+1. Calculate audio energy per participant (dBFS)
+2. Apply voice activity detection threshold (-40 dBFS)
+3. Smooth with exponential moving average (α = 0.7)
+4. Rank participants by smoothed audio level
+5. Apply hysteresis: speaker must be active for 300ms before switching
+6. Maximum switch rate: once per 2 seconds (prevents rapid flipping)
+
+Output:
+- Active speaker ID → clients reorder video layout
+- Top-3 speakers → SFU forwards their HIGH simulcast layer
+- Non-speakers → SFU forwards LOW layer (saves bandwidth)
+
+Code:
+```python
+class ActiveSpeakerDetector:
+    def __init__(self):
+        self.levels = {}           # user_id → smoothed level
+        self.active_since = {}     # user_id → timestamp
+        self.current_speaker = None
+        self.last_switch = 0
+        self.ALPHA = 0.7
+        self.THRESHOLD_DB = -40
+        self.SWITCH_DELAY_MS = 300
+        self.MIN_SWITCH_INTERVAL_MS = 2000
+    
+    def update(self, user_id, audio_level_db, timestamp):
+        # Exponential smoothing
+        prev = self.levels.get(user_id, -100)
+        self.levels[user_id] = self.ALPHA * audio_level_db + (1 - self.ALPHA) * prev
+        
+        # Voice activity check
+        if self.levels[user_id] > self.THRESHOLD_DB:
+            if user_id not in self.active_since:
+                self.active_since[user_id] = timestamp
+        else:
+            self.active_since.pop(user_id, None)
+        
+        # Speaker switch logic
+        if (timestamp - self.last_switch) < self.MIN_SWITCH_INTERVAL_MS:
+            return self.current_speaker
+        
+        # Find loudest active speaker
+        candidates = [
+            (uid, self.levels[uid]) for uid, start in self.active_since.items()
+            if (timestamp - start) >= self.SWITCH_DELAY_MS
+        ]
+        
+        if candidates:
+            new_speaker = max(candidates, key=lambda x: x[1])[0]
+            if new_speaker != self.current_speaker:
+                self.current_speaker = new_speaker
+                self.last_switch = timestamp
+        
+        return self.current_speaker
 ```
 
-## 9. Observability
+### 8.3 End-to-End Encryption (Deep Dive)
+
+```
+┌─────────────────────────────────────────────────────────────────┐
+│                 E2EE Architecture (Insertable Streams)            │
+│                                                                   │
+│  Problem: SFU needs to forward encrypted media but shouldn't    │
+│           be able to decrypt content                              │
+│                                                                   │
+│  Solution: Double encryption                                     │
+│  Layer 1: SRTP (transport encryption, SFU can decrypt)          │
+│  Layer 2: E2EE frame encryption (only participants can decrypt) │
+│                                                                   │
+│  Flow:                                                           │
+│  Sender:                                                         │
+│    Raw frame → E2EE encrypt (inner) → SRTP encrypt (outer) → SFU│
+│                                                                   │
+│  SFU:                                                            │
+│    SRTP decrypt (outer) → [E2EE encrypted blob] → SRTP encrypt → Recv│
+│    SFU can route but CANNOT read the actual media content        │
+│                                                                   │
+│  Receiver:                                                       │
+│    SRTP decrypt (outer) → E2EE decrypt (inner) → Raw frame      │
+│                                                                   │
+│  Key Exchange:                                                   │
+│  • Each participant generates ephemeral keys per meeting         │
+│  • Key distribution via MLS (Messaging Layer Security) protocol  │
+│  • Ratcheting: keys rotate periodically for forward secrecy      │
+│  • When participant joins/leaves: key rotation triggered          │
+│                                                                   │
+│  Trade-offs with E2EE:                                           │
+│  ✗ No server-side recording                                      │
+│  ✗ No live transcription                                         │
+│  ✗ No server-side noise cancellation                             │
+│  ✗ No SFU-based simulcast layer switching (workaround: SVC)     │
+│  ✓ Maximum privacy                                               │
+│  ✓ Compliance with strict security requirements                  │
+│                                                                   │
+└─────────────────────────────────────────────────────────────────┘
+```
+
+## 9. Component Optimization
+
+### 9.1 Kafka (Event Processing)
 
 ```yaml
-Key Metrics:
-  zoom_meeting_join_latency_seconds{region, quantile}
-  zoom_active_meetings_total{region}
-  zoom_concurrent_participants{region}
-  zoom_media_packet_loss_ratio{direction="send|recv", region}
-  zoom_audio_mos_score{region}  # Mean Opinion Score (1-5)
-  zoom_video_quality_score{resolution, region}
-  zoom_sfu_cpu_utilization{node}
-  zoom_sfu_bandwidth_usage_gbps{node, direction}
-  zoom_recording_processing_time_seconds{quantile}
-  zoom_signaling_latency_seconds{quantile}
+# Meeting events topic
+meeting-events:
+  partitions: 32
+  replication.factor: 3
+  retention.ms: 604800000     # 7 days
+  compression.type: lz4
+  # Partition by meeting_id for ordering within a meeting
 
-Alerts:
-  Critical: packet_loss > 5% in region, MOS < 3.0, join_latency > 10s
-  Warning: CPU > 80% on SFU, recording queue > 1000, bandwidth > 80% capacity
+# Recording events
+recording-events:
+  partitions: 16
+  replication.factor: 3
+  retention.ms: 2592000000    # 30 days
+
+# Analytics events (high volume)
+media-quality-events:
+  partitions: 64
+  replication.factor: 2
+  retention.ms: 86400000      # 1 day
+  compression.type: zstd
+  # High volume: quality metrics every 5 seconds per participant
 ```
 
-## 10. Considerations
+### 9.2 Caching Strategy
 
-### Key Trade-offs
-| Decision | Chosen | Trade-off |
+```
+Layer 1: Client-side cache
+  - Meeting metadata (title, settings) - cached until meeting starts
+  - User profiles (name, avatar) - cached 1 hour
+  - ICE server credentials - cached per session
+
+Layer 2: Edge cache (CDN)
+  - Static assets (JS/CSS/images)
+  - Recording playback (HLS segments)
+  - Avatar images, meeting backgrounds
+
+Layer 3: Redis (application cache)
+  - Live meeting state: TTL = meeting duration
+  - User session tokens: TTL = 24 hours
+  - Media server load: TTL = 10 seconds
+  - TURN credentials: TTL = session duration
+  - Meeting participant list: TTL = meeting duration
+
+Layer 4: Local in-process cache (per SFU)
+  - Participant track subscriptions
+  - Active speaker state
+  - Bandwidth estimates per connection
+```
+
+### 9.3 WebSocket Optimization
+
+```
+Signaling WebSocket:
+- Use binary protocol (Protobuf over WS) for signaling messages
+- Heartbeat: 15 second ping/pong
+- Compression: permessage-deflate for text messages
+- Connection pooling: reuse WS for multiple meeting signals
+- Graceful migration: during SFU failover, signal new SFU via WS
+
+Media Transport (UDP):
+- SO_REUSEPORT for multi-core UDP socket distribution
+- GRO (Generic Receive Offload) for batch packet processing
+- XDP (eXpress Data Path) for kernel-bypass packet forwarding
+- DSCP marking for QoS prioritization in enterprise networks
+- ECN (Explicit Congestion Notification) for early congestion detection
+```
+
+### 9.4 Database Optimization
+
+```sql
+-- PostgreSQL: Partition meetings by month for performance
+CREATE TABLE meetings (
+    meeting_id UUID,
+    created_at TIMESTAMP DEFAULT NOW(),
+    ...
+) PARTITION BY RANGE (created_at);
+
+CREATE TABLE meetings_2025_05 PARTITION OF meetings
+    FOR VALUES FROM ('2025-05-01') TO ('2025-06-01');
+
+-- Index for finding live meetings quickly
+CREATE INDEX CONCURRENTLY idx_live_meetings 
+    ON meetings(status, media_server_region) 
+    WHERE status = 'live';
+
+-- ClickHouse: Meeting quality analytics
+CREATE TABLE meeting_quality_metrics (
+    meeting_id       UUID,
+    participant_id   UUID,
+    timestamp        DateTime64(3),
+    audio_bitrate    UInt32,
+    video_bitrate    UInt32,
+    packet_loss_pct  Float32,
+    jitter_ms        Float32,
+    rtt_ms           UInt32,
+    resolution       LowCardinality(String),
+    fps              UInt8,
+    cpu_usage_pct    UInt8
+) ENGINE = MergeTree()
+PARTITION BY toYYYYMMDD(timestamp)
+ORDER BY (meeting_id, participant_id, timestamp)
+TTL timestamp + INTERVAL 30 DAY;
+```
+
+### 9.5 S3 / Storage Optimization
+
+```
+Recording Storage Strategy:
+1. Hot tier (S3 Standard): First 7 days - frequent playback
+2. Warm tier (S3 IA): 7-90 days - occasional access
+3. Cold tier (S3 Glacier): >90 days - archival/compliance
+
+Lifecycle Policy:
+{
+  "Rules": [
+    {"Transition": [
+      {"Days": 7, "StorageClass": "STANDARD_IA"},
+      {"Days": 90, "StorageClass": "GLACIER_INSTANT"},
+      {"Days": 365, "StorageClass": "GLACIER_DEEP_ARCHIVE"}
+    ]},
+    {"Expiration": {"Days": 730}}  // Auto-delete after 2 years
+  ]
+}
+
+Playback Optimization:
+- Store recordings in HLS format (chunked .ts segments + .m3u8 manifest)
+- CDN caches popular recordings at edge
+- Byte-range requests for seeking without downloading full file
+- Adaptive bitrate playlist (multiple quality variants)
+```
+
+### 9.6 Flink (Real-time Quality Analytics)
+
+```java
+// Real-time meeting quality monitoring
+StreamExecutionEnvironment env = StreamExecutionEnvironment.getExecutionEnvironment();
+
+DataStream<QualityMetric> metrics = env
+    .addSource(new FlinkKafkaConsumer<>("media-quality-events", schema, props));
+
+// Detect degraded meetings in real-time
+metrics
+    .keyBy(QualityMetric::getMeetingId)
+    .window(SlidingEventTimeWindows.of(Time.seconds(30), Time.seconds(5)))
+    .aggregate(new MeetingQualityAggregator())
+    .filter(agg -> agg.getAvgPacketLoss() > 5.0 || agg.getAvgJitter() > 50)
+    .addSink(new QualityAlertSink());  // Trigger SFU migration or TURN fallback
+
+// Real-time concurrent meeting count per region
+metrics
+    .map(m -> new RegionMeeting(m.getRegion(), m.getMeetingId()))
+    .keyBy(RegionMeeting::getRegion)
+    .window(TumblingEventTimeWindows.of(Time.minutes(1)))
+    .aggregate(new UniqueCountAggregator())
+    .addSink(new CapacityDashboardSink());
+```
+
+## 10. Observability
+
+### 10.1 Key Metrics
+
+```yaml
+# Meeting Metrics
+zoom_meetings_active{region, plan_type}                    # Gauge
+zoom_meetings_started_total{region}                        # Counter
+zoom_meeting_duration_seconds                              # Histogram
+zoom_participants_active{region}                           # Gauge
+zoom_participants_joined_total{region, device_type}        # Counter
+
+# Media Quality Metrics (per participant, sampled)
+zoom_media_packet_loss_pct{direction, media_type}          # Histogram
+zoom_media_jitter_ms{direction, media_type}                # Histogram
+zoom_media_rtt_ms{region_pair}                             # Histogram
+zoom_media_bitrate_bps{direction, media_type, quality}     # Gauge
+zoom_media_fps{quality}                                     # Histogram
+zoom_media_resolution{quality}                              # Gauge
+
+# SFU Metrics
+zoom_sfu_connections_active{server_id}                      # Gauge
+zoom_sfu_cpu_usage{server_id}                               # Gauge
+zoom_sfu_bandwidth_bps{server_id, direction}                # Gauge
+zoom_sfu_rooms_active{server_id}                            # Gauge
+zoom_sfu_cascade_latency_ms{src_region, dst_region}         # Histogram
+
+# Signaling Metrics
+zoom_signaling_connections{server_id}                       # Gauge
+zoom_signaling_latency_ms{message_type}                    # Histogram
+zoom_ice_negotiation_duration_ms                            # Histogram
+zoom_ice_candidate_type_selected{type}                      # Counter (host/srflx/relay)
+
+# Recording Metrics
+zoom_recording_active{region}                               # Gauge
+zoom_recording_processing_duration_ratio                    # Histogram (processing_time/meeting_duration)
+zoom_recording_storage_bytes{tier}                          # Gauge
+
+# Infrastructure
+zoom_turn_relay_active{server_id}                           # Gauge
+zoom_turn_bandwidth_bps{server_id}                          # Gauge
+zoom_cdn_cache_hit_ratio{region}                            # Gauge
+```
+
+### 10.2 Alerting
+
+| Alert | Condition | Severity | Action |
+|---|---|---|---|
+| Meeting join failure rate | >2% failures in 5 min | P1 | Check signaling/SFU allocation |
+| Media quality degraded (region) | >10% participants with >5% loss | P1 | Check network, scale TURN |
+| SFU capacity critical | >85% CPU on >50% of fleet | P1 | Scale SFU fleet, redirect traffic |
+| Recording pipeline backlog | >10K unprocessed recordings | P2 | Scale recording workers |
+| TURN relay saturation | >80% bandwidth on TURN fleet | P2 | Scale TURN, check network paths |
+| ICE negotiation slow | p99 > 10 seconds | P2 | Check STUN/TURN availability |
+| Cross-region cascade latency | >100ms between SFUs | P3 | Check inter-region network |
+
+## 11. Considerations and Assumptions
+
+### 11.1 Key Assumptions
+
+| # | Assumption | Impact |
 |---|---|---|
-| SFU over MCU | Lower server cost, better quality | More client bandwidth needed |
-| Simulcast over SVC | Broader codec support | Less bandwidth efficient |
-| Regional SFU | Low latency | Cascading complexity for global meetings |
-| Cloud recording | No client resources used | Server storage/processing cost |
-| WebRTC (web) | No plugin needed | Browser limitations for advanced features |
+| 1 | Average meeting has 8 participants | SFU capacity planning |
+| 2 | 85% of connections succeed P2P/SFU-direct, 15% need TURN | TURN fleet sizing |
+| 3 | 70% of participants use video, 95% use audio | Bandwidth planning |
+| 4 | Peak hours: 9-11 AM and 2-4 PM per timezone | Capacity staggered globally |
+| 5 | Enterprise users need higher quality than free tier | Resource allocation per plan |
+| 6 | 10% of meetings are recorded | Recording infrastructure sizing |
+| 7 | Average network: 10 Mbps down, 5 Mbps up | Simulcast layer selection |
+| 8 | Mobile data: 5 Mbps down, 2 Mbps up | Lower default quality for mobile |
 
-### Security
-- SRTP encryption for all media (mandatory)
-- DTLS key exchange for peer authentication
-- Optional E2E encryption (host enables, server can't decrypt)
-- Waiting room to prevent uninvited participants (Zoom-bombing)
-- Meeting passwords, meeting lock, remove participants
-- Watermarking for screenshots/recordings (enterprise)
-- SOC2, HIPAA, FedRAMP compliance options
+### 11.2 Trade-offs
+
+| Decision | Choice | Trade-off |
+|---|---|---|
+| SFU vs MCU | SFU | Lower latency but more client bandwidth needed |
+| Simulcast vs SVC | Simulcast (H264) + SVC (VP9) | Wider codec support vs better adaptation |
+| Recording: real-time vs post | Post-processing composition | Higher quality output but delayed availability |
+| E2EE | Optional per-meeting | Maximum privacy sacrifices server-side features |
+| Global vs regional | Regional SFU + cross-region cascade | Lower intra-region latency, some cross-region lag |
+| UDP vs TCP for media | UDP primary, TCP 443 fallback | Better media quality but may be blocked by firewalls |
+
+### 11.3 Security
+
+| Concern | Implementation |
+|---|---|
+| Authentication | OAuth 2.0 + JWT for API, short-lived tokens for media sessions |
+| Transport security | DTLS 1.2 for media (mandatory in WebRTC), TLS 1.3 for signaling |
+| Media encryption | SRTP with AES-128-CM (standard), optional E2EE layer |
+| Meeting security | Passwords, waiting rooms, host approval, meeting locks |
+| Abuse prevention | Rate limiting, meeting bomb detection, automatic mute/remove |
+| Data sovereignty | Regional media processing, no data leaving region |
+| Compliance | SOC 2, HIPAA (healthcare), FedRAMP (government) |
