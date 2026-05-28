@@ -1,612 +1,1778 @@
-# Design Pastebin / GitHub Gist - System Design Deep Dive
+# Design Pastebin / GitHub Gist — Complete System Design
 
-**Problem #2**  
-**Category:** Core web scale  
-**Primary pattern:** core platform  
-**Deep-dive focus:** paste storage, expiration, privacy, syntax rendering, spam control
+## 1. Problem Statement
 
-## 0. Interview Framing
+Design a web-scale paste/snippet sharing service (like Pastebin or GitHub Gist) that allows users to create, share, and manage text/code snippets with features like syntax highlighting, expiration, versioning, privacy controls, and collaboration.
 
-A platform primitive where correctness, low latency, predictable scaling, and operability matter more than product breadth.
+---
 
-In an interview, start by narrowing the product scope, then anchor the design around the highest-risk path. For this problem, the highest-risk path is usually the path involving **paste storage**. Keep secondary capabilities asynchronous unless they affect correctness, money, privacy, or user-visible availability.
+## 2. Functional Requirements
 
-## 1. Requirements
+### Core Features
+| # | Feature | Description |
+|---|---------|-------------|
+| F1 | Create Paste | Users create text/code snippets with optional title, language, expiration |
+| F2 | Read Paste | Anyone with the URL can read public/unlisted pastes; auth required for private |
+| F3 | Raw Content | Serve raw text without HTML rendering |
+| F4 | Syntax Highlighting | Server-side highlight for 200+ languages |
+| F5 | Expiration/TTL | Auto-delete after configured time (10min, 1hr, 1day, 1week, 1month, never) |
+| F6 | Privacy Modes | Public (searchable), Unlisted (URL-only), Private (auth-required) |
+| F7 | Edit/Update | Authenticated users edit their own pastes |
+| F8 | Delete | Soft-delete with 30-day recovery window |
+| F9 | Short URL/Slug | Unique 8-char slug for each paste |
+| F10 | User Accounts | Registration, login, paste management dashboard |
 
-### Functional Requirements
+### Extended Features
+| # | Feature | Description |
+|---|---------|-------------|
+| F11 | Multi-file Pastes | Gist-style multiple files per paste |
+| F12 | Versioning | Full revision history with diffs |
+| F13 | Forking | Clone another user's paste to your account |
+| F14 | Comments | Threaded comments on pastes |
+| F15 | Burn-after-read | Self-destruct after first view |
+| F16 | Password Protection | Additional password layer for access |
+| F17 | Search | Full-text search across public pastes |
+| F18 | Trending/Recent | Discovery feed of popular public pastes |
+| F19 | API Access | REST API with OAuth2 and API keys |
+| F20 | Embed | Embeddable paste widgets for websites |
+| F21 | Content Deduplication | Detect identical content, store once |
+| F22 | Spam/Malware Detection | Block malicious content |
 
-- Create text/code snippets with privacy and expiration settings.
-- Render syntax-highlighted read views.
-- Support public, unlisted, and private sharing.
-- Detect spam, malware links, and sensitive leakage.
-- Expose admin operations for investigation, replay, correction, and policy changes.
-- Publish domain events for analytics, search, notifications, and downstream systems.
-- Support regional failover and controlled degradation for non-critical features.
+---
 
-### Non-Functional Requirements
+## 3. Non-Functional Requirements
 
-- p99 latency under 150 ms for online decisions.
-- 99.99% availability for the data plane.
-- horizontal scale without single-node hot spots.
-- bounded blast radius per tenant, region, and shard.
+| Category | Requirement | Target |
+|----------|-------------|--------|
+| Availability | Service uptime | 99.95% (≤ 4.38 hours downtime/year) |
+| Latency | Read paste (cached) | p50 < 20ms, p99 < 100ms |
+| Latency | Read paste (uncached) | p50 < 50ms, p99 < 200ms |
+| Latency | Create paste | p50 < 100ms, p99 < 500ms |
+| Throughput | Read QPS | 50K avg, 200K peak |
+| Throughput | Write QPS | 5K avg, 20K peak |
+| Durability | Paste content | 99.999999999% (11 nines, S3-backed) |
+| Consistency | Read-after-write | Strong for creator, eventual for others (< 2s) |
+| Scalability | Horizontal | Linear scale with traffic, no single-node bottleneck |
+| Security | Data at rest | AES-256 encryption |
+| Security | Data in transit | TLS 1.3 |
+| Compliance | GDPR | Right to deletion, data export within 72 hours |
+| Rate Limiting | Anonymous | 10 creates/hour, 100 reads/minute |
+| Rate Limiting | Authenticated | 100 creates/hour, 1000 reads/minute |
 
-### Non-Goals
+---
 
-- Do not design every client UI screen; focus on backend, data, and platform contracts.
-- Do not optimize rare administrative workflows ahead of the user-visible hot path.
-- Do not couple offline analytics correctness to online request latency.
-- Do not rely on one shared database node as the scalability plan.
+## 4. Capacity Estimation
 
-## 2. Capacity, Traffic, And Size Estimation
+### Traffic Estimation
 
-Use these as interview-scale assumptions. State that numbers are adjustable and use formulas so the interviewer can change scale.
+```
+DAU = 5M users
+MAU = 30M users
 
-| Dimension | Baseline Assumption |
-|---|---|
-| Active users | 10M DAU, 80M MAU |
-| Read path | 50K average QPS, 250K peak QPS |
-| Write path | 2K average QPS, 15K peak QPS |
-| Data growth | 1-5 TB/day depending on logs and analytics |
-| Latency target | p50 < 30 ms for hot path, p99 < 150 ms |
+Read:Write ratio = 10:1
 
-### Estimation Formulas
+Writes:
+- 5M DAU × 2 pastes/day = 10M pastes/day
+- QPS_write = 10M / 86400 ≈ 115 writes/sec (avg)
+- Peak: 115 × 5 = 575 writes/sec
 
-- Average QPS = daily operations / 86,400.
-- Peak QPS = average QPS x peak multiplier, usually 3x to 20x depending on virality or business events.
-- Storage/day = write_count/day x average_record_size x replication_factor.
-- Event log volume/day = events/day x average_event_size x retention_multiplier.
-- Cache memory = hot_key_count x average_value_size x replication_factor x overhead_factor.
-- Network egress = response_size x read_requests x cache_miss_or_delivery_factor.
+Reads:
+- QPS_read = 115 × 10 = 1,150 reads/sec (avg)
+- Peak: 1,150 × 5 = 5,750 reads/sec
+- CDN absorbs 70%: origin sees ~1,725 reads/sec peak
+```
 
-### Sizing Notes
+### Storage Estimation
 
-- Keep the online source-of-truth data model small; move large payloads, media, traces, and analytics to object storage or specialized stores.
-- Partition before you need it. Pick a stable high-cardinality partition key and document how resharding works.
-- Track hot partitions separately from total QPS. Most interview failures come from average estimates hiding hot keys, celebrity users, viral objects, or large tenants.
+```
+Average paste size = 10 KB (text content)
+Metadata per paste = 500 bytes
 
-## 3. API Design
+Daily storage:
+- Content: 10M × 10 KB = 100 GB/day
+- Metadata: 10M × 500 B = 5 GB/day
+- Highlighted HTML: 10M × 15 KB = 150 GB/day (stored in S3)
 
-Use REST for public/admin APIs and gRPC for internal service-to-service calls. Every mutation accepts an idempotency key. Every list API supports cursor pagination, filtering, and a stable sort.
+Monthly: (100 + 5 + 150) × 30 = 7.65 TB/month
+Yearly: ~92 TB/year (before dedup)
 
-### Public APIs
+With deduplication (~30% duplicate): 
+- Effective: 92 × 0.7 = ~64 TB/year
 
-```http
+5-year projection: ~320 TB total storage
+```
+
+### Network Bandwidth Estimation
+
+```
+Ingress (writes):
+- Peak: 575 × 10 KB = 5.75 MB/s ≈ 46 Mbps
+
+Egress (reads, origin only after CDN):
+- Peak: 1,725 × 15 KB (with HTML) = 25.9 MB/s ≈ 207 Mbps
+- Total with CDN pass-through: ~1.5 Gbps
+
+CDN Egress:
+- 5,750 × 15 KB = 86.25 MB/s ≈ 690 Mbps
+```
+
+### Database QPS
+
+```
+PostgreSQL (metadata):
+- Write: 575/sec peak
+- Read: 1,725/sec peak (after cache)
+- With Redis cache (90% hit rate): ~172 reads/sec to DB
+
+DynamoDB (slug → paste_id lookup):
+- Read: 5,750/sec peak (before cache)
+- Write: 575/sec peak
+
+Redis:
+- GET/SET: ~10K ops/sec
+- Cache hit ratio target: 90%+
+```
+
+### Compute Estimation
+
+```
+Syntax highlighting (CPU-intensive):
+- 575 pastes/sec × 50ms CPU per highlight = 29 vCPUs needed
+- With queue batching: 10-15 vCPUs sufficient
+
+API servers:
+- 7,500 total requests/sec peak ÷ 2,000 req/sec per instance = 4 instances
+- With 3x headroom: 12 ECS tasks (2 vCPU, 4 GB each)
+```
+
+---
+
+## 5. Data Modeling
+
+### Database Selection
+
+| Store | Purpose | Justification |
+|-------|---------|---------------|
+| PostgreSQL (Citus) | Paste metadata, users, comments | ACID transactions, rich queries, shardable |
+| Amazon S3 | Paste content blobs | 11-nines durability, cost-effective for large objects |
+| Amazon DynamoDB | Slug-to-paste lookup | Single-digit ms latency, auto-scaling |
+| Redis Cluster | Hot paste cache, rate limiting, sessions | Sub-ms reads, TTL support |
+| Elasticsearch | Full-text search across pastes | Inverted index, language analyzers |
+| ClickHouse | Analytics (views, trends) | Columnar, fast aggregation |
+
+### PostgreSQL Schema
+
+```sql
+-- Users table
+CREATE TABLE users (
+    id              UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    username        VARCHAR(40) UNIQUE NOT NULL,
+    email           VARCHAR(255) UNIQUE NOT NULL,
+    password_hash   VARCHAR(255) NOT NULL,
+    display_name    VARCHAR(100),
+    avatar_url      TEXT,
+    api_key_hash    VARCHAR(255),
+    is_pro          BOOLEAN DEFAULT FALSE,
+    created_at      TIMESTAMPTZ DEFAULT NOW(),
+    updated_at      TIMESTAMPTZ DEFAULT NOW()
+);
+
+CREATE INDEX idx_users_username ON users(username);
+CREATE INDEX idx_users_email ON users(email);
+CREATE INDEX idx_users_api_key ON users(api_key_hash) WHERE api_key_hash IS NOT NULL;
+
+-- Pastes table (partitioned by created_at month)
+CREATE TABLE pastes (
+    id              UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    slug            VARCHAR(12) UNIQUE NOT NULL,
+    user_id         UUID REFERENCES users(id),
+    title           VARCHAR(255),
+    description     TEXT,
+    visibility      VARCHAR(10) NOT NULL DEFAULT 'unlisted'
+                    CHECK (visibility IN ('public', 'unlisted', 'private')),
+    expires_at      TIMESTAMPTZ,
+    burn_after_read BOOLEAN DEFAULT FALSE,
+    password_hash   VARCHAR(255),
+    fork_of         UUID REFERENCES pastes(id),
+    version         INTEGER DEFAULT 1,
+    total_size_bytes BIGINT DEFAULT 0,
+    view_count      BIGINT DEFAULT 0,
+    is_deleted      BOOLEAN DEFAULT FALSE,
+    deleted_at      TIMESTAMPTZ,
+    created_at      TIMESTAMPTZ DEFAULT NOW(),
+    updated_at      TIMESTAMPTZ DEFAULT NOW()
+) PARTITION BY RANGE (created_at);
+
+-- Monthly partitions
+CREATE TABLE pastes_2026_01 PARTITION OF pastes
+    FOR VALUES FROM ('2026-01-01') TO ('2026-02-01');
+CREATE TABLE pastes_2026_02 PARTITION OF pastes
+    FOR VALUES FROM ('2026-02-01') TO ('2026-03-01');
+
+CREATE UNIQUE INDEX idx_pastes_slug ON pastes(slug);
+CREATE INDEX idx_pastes_user_id ON pastes(user_id) WHERE is_deleted = FALSE;
+CREATE INDEX idx_pastes_expires_at ON pastes(expires_at) WHERE expires_at IS NOT NULL;
+CREATE INDEX idx_pastes_visibility_created ON pastes(visibility, created_at DESC)
+    WHERE visibility = 'public' AND is_deleted = FALSE;
+CREATE INDEX idx_pastes_fork_of ON pastes(fork_of) WHERE fork_of IS NOT NULL;
+
+-- Paste files (multi-file support)
+CREATE TABLE paste_files (
+    id              UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    paste_id        UUID NOT NULL REFERENCES pastes(id) ON DELETE CASCADE,
+    filename        VARCHAR(255) NOT NULL DEFAULT 'untitled.txt',
+    language        VARCHAR(50),
+    content_hash    VARCHAR(64) NOT NULL,  -- SHA-256 for dedup
+    size_bytes      INTEGER NOT NULL,
+    sort_order      SMALLINT DEFAULT 0,
+    created_at      TIMESTAMPTZ DEFAULT NOW()
+);
+
+CREATE INDEX idx_paste_files_paste_id ON paste_files(paste_id);
+CREATE INDEX idx_paste_files_content_hash ON paste_files(content_hash);
+
+-- Paste versions (revision history)
+CREATE TABLE paste_versions (
+    id              UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    paste_id        UUID NOT NULL REFERENCES pastes(id) ON DELETE CASCADE,
+    version_number  INTEGER NOT NULL,
+    content_hash    VARCHAR(64) NOT NULL,
+    diff_hash       VARCHAR(64),  -- stored unified diff
+    message         VARCHAR(500),
+    author_id       UUID REFERENCES users(id),
+    created_at      TIMESTAMPTZ DEFAULT NOW(),
+    UNIQUE (paste_id, version_number)
+);
+
+CREATE INDEX idx_paste_versions_paste ON paste_versions(paste_id, version_number DESC);
+
+-- Comments
+CREATE TABLE comments (
+    id              UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    paste_id        UUID NOT NULL REFERENCES pastes(id) ON DELETE CASCADE,
+    user_id         UUID NOT NULL REFERENCES users(id),
+    parent_id       UUID REFERENCES comments(id),
+    body            TEXT NOT NULL,
+    line_number     INTEGER,  -- inline comment on specific line
+    is_deleted      BOOLEAN DEFAULT FALSE,
+    created_at      TIMESTAMPTZ DEFAULT NOW(),
+    updated_at      TIMESTAMPTZ DEFAULT NOW()
+);
+
+CREATE INDEX idx_comments_paste ON comments(paste_id, created_at)
+    WHERE is_deleted = FALSE;
+```
+
+### Amazon S3 Layout
+
+```
+pastebin-content-{region}/
+├── raw/
+│   └── {content_hash}              # Raw text (deduplicated)
+├── highlighted/
+│   └── {content_hash}/
+│       └── {language}.html         # Pre-rendered HTML
+├── diffs/
+│   └── {diff_hash}                 # Unified diff between versions
+└── thumbnails/
+    └── {paste_id}.png              # Code preview image for embeds
+```
+
+### DynamoDB Schema (Slug Lookup)
+
+```
+Table: paste_slugs
+  Partition Key: slug (String)
+  Attributes:
+    - paste_id (String/UUID)
+    - created_at (Number/epoch)
+    - expires_at (Number/epoch, with TTL)
+    - visibility (String)
+    - is_burned (Boolean)
+
+GSI: paste_id-index
+  Partition Key: paste_id
+  (For reverse lookup: paste_id → slug)
+```
+
+### Redis Data Structures
+
+```
+# Hot paste cache (serialized metadata + content pointer)
+paste:{slug} → Hash {
+    paste_id, title, visibility, language,
+    content_hash, user_id, created_at, expires_at
+}
+TTL: 1 hour (extended on access)
+
+# Rate limiting (sliding window)
+ratelimit:{ip}:{endpoint} → Sorted Set (timestamps)
+TTL: 1 minute
+
+# User session
+session:{token} → Hash { user_id, roles, created_at }
+TTL: 24 hours
+
+# View counter (buffered writes to DB)
+views:{paste_id} → Integer (INCR, flushed every 60s)
+
+# Trending score (sorted set)
+trending:pastes → Sorted Set { paste_id → score }
+TTL: refreshed every 5 minutes
+
+# Burn-after-read lock
+burn:{slug} → "1" (SET NX EX 30)
+```
+
+---
+
+## 6. High-Level Design (HLD)
+
+### System Architecture Diagram
+
+```
+┌─────────────────────────────────────────────────────────────────────────┐
+│                              CLIENTS                                      │
+│  [Web App]   [CLI Tool]   [API Clients]   [Embed Widgets]               │
+└───────────────────────────────┬──────────────────────────────────────────┘
+                                │ HTTPS
+                                ▼
+┌───────────────────────────────────────────────────────────────────────────┐
+│  EDGE LAYER                                                                │
+│  ┌──────────┐  ┌──────────────┐  ┌──────────┐                            │
+│  │ Route 53 │→ │ CloudFront   │→ │   WAF    │                            │
+│  │  (DNS)   │  │   (CDN)      │  │(L7 Rules)│                            │
+│  └──────────┘  └──────────────┘  └──────────┘                            │
+└───────────────────────────────┬───────────────────────────────────────────┘
+                                │
+                                ▼
+┌───────────────────────────────────────────────────────────────────────────┐
+│  LOAD BALANCING LAYER                                                      │
+│  ┌─────────────────────────────────────────┐                              │
+│  │     Application Load Balancer (ALB)      │                              │
+│  │  - Path-based routing                    │                              │
+│  │  - Health checks                         │                              │
+│  │  - TLS termination                       │                              │
+│  └─────────────────────────────────────────┘                              │
+└───────────────────────────────┬───────────────────────────────────────────┘
+                                │
+                                ▼
+┌───────────────────────────────────────────────────────────────────────────┐
+│  API GATEWAY LAYER                                                         │
+│  ┌─────────────────────────────────────────┐                              │
+│  │         Kong API Gateway                 │                              │
+│  │  - Authentication (JWT/API Key)          │                              │
+│  │  - Rate limiting                         │                              │
+│  │  - Request/Response transformation       │                              │
+│  │  - Circuit breaker                       │                              │
+│  └─────────────────────────────────────────┘                              │
+└───────────────────────────────┬───────────────────────────────────────────┘
+                                │
+                                ▼
+┌───────────────────────────────────────────────────────────────────────────┐
+│  APPLICATION SERVICES (ECS Fargate)                                        │
+│                                                                            │
+│  ┌──────────────┐  ┌──────────────┐  ┌──────────────┐  ┌──────────────┐  │
+│  │ Paste Write  │  │  Paste Read  │  │   Search     │  │    User      │  │
+│  │   Service    │  │   Service    │  │   Service    │  │   Service    │  │
+│  └──────┬───────┘  └──────┬───────┘  └──────┬───────┘  └──────┬───────┘  │
+│         │                  │                  │                  │          │
+│  ┌──────────────┐  ┌──────────────┐  ┌──────────────┐  ┌──────────────┐  │
+│  │  Highlight   │  │  Expiration  │  │   Analytics  │  │   Comment    │  │
+│  │   Service    │  │   Service    │  │   Service    │  │   Service    │  │
+│  └──────────────┘  └──────────────┘  └──────────────┘  └──────────────┘  │
+│                                                                            │
+│  ┌──────────────┐  ┌──────────────┐                                       │
+│  │    Spam      │  │  Notification│                                       │
+│  │  Detection   │  │   Service    │                                       │
+│  └──────────────┘  └──────────────┘                                       │
+└───────────────────────────────┬───────────────────────────────────────────┘
+                                │
+                                ▼
+┌───────────────────────────────────────────────────────────────────────────┐
+│  EVENT BUS                                                                 │
+│  ┌─────────────────────────────────────────┐                              │
+│  │           Apache Kafka                   │                              │
+│  │  Topics: paste.created, paste.viewed,    │                              │
+│  │  paste.expired, spam.detected,           │                              │
+│  │  highlight.completed, analytics.event    │                              │
+│  └─────────────────────────────────────────┘                              │
+└───────────────────────────────┬───────────────────────────────────────────┘
+                                │
+                                ▼
+┌───────────────────────────────────────────────────────────────────────────┐
+│  DATA LAYER                                                                │
+│                                                                            │
+│  ┌──────────┐ ┌──────────┐ ┌──────────┐ ┌───────────┐ ┌──────────────┐  │
+│  │PostgreSQL│ │ DynamoDB │ │  Redis   │ │    S3     │ │Elasticsearch │  │
+│  │ (Citus)  │ │(Slug Map)│ │ Cluster  │ │ (Content) │ │  (Search)    │  │
+│  └──────────┘ └──────────┘ └──────────┘ └───────────┘ └──────────────┘  │
+│                                                                            │
+│  ┌──────────────┐                                                          │
+│  │  ClickHouse  │                                                          │
+│  │ (Analytics)  │                                                          │
+│  └──────────────┘                                                          │
+└───────────────────────────────────────────────────────────────────────────┘
+```
+
+### Create Paste Data Flow
+
+```
+Client → CloudFront → WAF → ALB → Kong → Paste Write Service
+                                              │
+                                              ├─ 1. Validate input (size, format)
+                                              ├─ 2. Generate slug (Base62, 8 chars)
+                                              ├─ 3. Compute content_hash (SHA-256)
+                                              ├─ 4. Check dedup (S3 HEAD on content_hash)
+                                              ├─ 5. Upload to S3 (if new content)
+                                              ├─ 6. Insert metadata → PostgreSQL
+                                              ├─ 7. Insert slug mapping → DynamoDB
+                                              ├─ 8. Set cache → Redis
+                                              ├─ 9. Publish event → Kafka (paste.created)
+                                              └─ 10. Return slug URL to client
+                                              
+Async consumers:
+  paste.created → Highlight Service (render HTML)
+  paste.created → Spam Detection Service
+  paste.created → Search Indexer (if public)
+  paste.created → Analytics Service
+```
+
+### Read Paste Data Flow
+
+```
+Client → CloudFront (cache check)
+          │
+          ├─ HIT → Return cached content
+          │
+          └─ MISS → WAF → ALB → Kong → Paste Read Service
+                                            │
+                                            ├─ 1. Lookup slug → Redis cache
+                                            │     └─ MISS → DynamoDB slug lookup
+                                            ├─ 2. Check visibility/auth
+                                            ├─ 3. Check burn-after-read (Redis SET NX)
+                                            ├─ 4. Check password (if protected)
+                                            ├─ 5. Fetch content from S3 (or Redis cache)
+                                            ├─ 6. Fetch highlighted HTML (if available)
+                                            ├─ 7. Increment view counter (Redis INCR)
+                                            ├─ 8. Publish event → Kafka (paste.viewed)
+                                            └─ 9. Return response
+                                            
+If burn_after_read:
+  - After successful read, mark as burned in DynamoDB + PostgreSQL
+  - Invalidate CDN cache for this slug
+```
+
+### Microservice Communication Patterns
+
+| Pattern | Usage |
+|---------|-------|
+| Synchronous REST | Client ↔ API Gateway ↔ Services (user-facing) |
+| gRPC | Service ↔ Service (internal, e.g., Write → Highlight) |
+| Event-Driven (Kafka) | Async workflows (highlighting, search indexing, analytics) |
+| CQRS | Separate Write Service and Read Service with different data models |
+| Saga Pattern | Multi-step operations (fork paste → copy files → update refs) |
+
+---
+
+## 7. Low-Level Design (LLD)
+
+### API Contracts
+
+#### Create Paste
+
+```
 POST /v1/pastes
-Idempotency-Key: <uuid>
-Authorization: Bearer <token>
+Authorization: Bearer {token} (optional for anonymous)
 Content-Type: application/json
 
+Request:
 {
-  "client_request_id": "req_123",
-  "attributes": {}
+    "title": "My Python Script",
+    "files": [
+        {
+            "filename": "main.py",
+            "language": "python",
+            "content": "def hello():\n    print('Hello, World!')"
+        },
+        {
+            "filename": "utils.py",
+            "language": "python",
+            "content": "import os\n..."
+        }
+    ],
+    "visibility": "unlisted",        // public | unlisted | private
+    "expires_in": "1d",              // 10m | 1h | 1d | 1w | 1m | never
+    "burn_after_read": false,
+    "password": null                 // optional password protection
+}
+
+Response: 201 Created
+{
+    "data": {
+        "id": "a1b2c3d4-...",
+        "slug": "xK9mPq2v",
+        "url": "https://paste.example.com/xK9mPq2v",
+        "raw_url": "https://paste.example.com/xK9mPq2v/raw",
+        "title": "My Python Script",
+        "visibility": "unlisted",
+        "expires_at": "2026-05-29T10:30:00Z",
+        "files": [
+            {
+                "filename": "main.py",
+                "language": "python",
+                "size_bytes": 42,
+                "raw_url": "https://paste.example.com/xK9mPq2v/raw/main.py"
+            }
+        ],
+        "created_at": "2026-05-28T10:30:00Z",
+        "owner": {
+            "username": "harsh",
+            "avatar_url": "https://..."
+        }
+    }
+}
+
+Error: 400 Bad Request
+{
+    "error": {
+        "code": "VALIDATION_FAILED",
+        "message": "Content exceeds maximum size",
+        "details": [
+            { "field": "files[0].content", "issue": "Exceeds 512KB limit" }
+        ]
+    }
+}
+
+Error: 429 Too Many Requests
+{
+    "error": {
+        "code": "RATE_LIMITED",
+        "message": "Too many paste creations",
+        "retry_after": 3600
+    }
 }
 ```
 
-```http
-GET /v1/pastes/{id}
-Authorization: Bearer <token>
+#### Get Paste
+
 ```
+GET /v1/pastes/{slug}
+Authorization: Bearer {token} (required for private pastes)
+X-Paste-Password: {password} (for password-protected)
 
-```http
-GET /v1/pastes?cursor=<cursor>&limit=50&filter=<filter>&sort=<sort>
-Authorization: Bearer <token>
-```
-
-```http
-PATCH /v1/pastes/{id}
-Idempotency-Key: <uuid>
-Content-Type: application/json
-
+Response: 200 OK
 {
-  "expected_version": 12,
-  "changes": {}
+    "data": {
+        "id": "a1b2c3d4-...",
+        "slug": "xK9mPq2v",
+        "title": "My Python Script",
+        "visibility": "unlisted",
+        "expires_at": "2026-05-29T10:30:00Z",
+        "files": [
+            {
+                "filename": "main.py",
+                "language": "python",
+                "content": "def hello():\n    print('Hello, World!')",
+                "highlighted_html": "<pre><code class=\"python\">...</code></pre>",
+                "size_bytes": 42
+            }
+        ],
+        "version": 1,
+        "view_count": 142,
+        "fork_count": 3,
+        "is_forked": false,
+        "owner": { "username": "harsh" },
+        "created_at": "2026-05-28T10:30:00Z",
+        "updated_at": "2026-05-28T10:30:00Z"
+    }
+}
+
+Error: 404 Not Found
+{ "error": { "code": "PASTE_NOT_FOUND", "message": "Paste not found or has expired" } }
+
+Error: 410 Gone
+{ "error": { "code": "PASTE_BURNED", "message": "This paste was set to burn after reading" } }
+```
+
+#### Get Raw Content
+
+```
+GET /v1/pastes/{slug}/raw
+GET /v1/pastes/{slug}/raw/{filename}
+
+Response: 200 OK
+Content-Type: text/plain; charset=utf-8
+Content-Disposition: inline
+
+def hello():
+    print('Hello, World!')
+```
+
+#### Update Paste
+
+```
+PATCH /v1/pastes/{slug}
+Authorization: Bearer {token}
+
+Request:
+{
+    "title": "Updated Title",
+    "files": [
+        {
+            "filename": "main.py",
+            "content": "def hello():\n    print('Updated!')"
+        }
+    ],
+    "version_message": "Fixed typo in print statement"
+}
+
+Response: 200 OK
+{
+    "data": {
+        "slug": "xK9mPq2v",
+        "version": 2,
+        "updated_at": "2026-05-28T11:00:00Z"
+    }
 }
 ```
 
-```http
-POST /v1/pastes/{id}/actions/{action}
-Idempotency-Key: <uuid>
-Content-Type: application/json
+#### Delete Paste
 
+```
+DELETE /v1/pastes/{slug}
+Authorization: Bearer {token}
+
+Response: 204 No Content
+
+Error: 403 Forbidden
+{ "error": { "code": "NOT_OWNER", "message": "Cannot delete paste you don't own" } }
+```
+
+#### List Paste Versions
+
+```
+GET /v1/pastes/{slug}/versions?page=1&limit=20
+
+Response: 200 OK
 {
-  "reason": "operator_or_user_reason",
-  "parameters": {}
+    "data": [
+        {
+            "version": 2,
+            "message": "Fixed typo",
+            "author": "harsh",
+            "created_at": "2026-05-28T11:00:00Z",
+            "diff_url": "/v1/pastes/xK9mPq2v/diff/1..2"
+        },
+        {
+            "version": 1,
+            "message": "Initial version",
+            "author": "harsh",
+            "created_at": "2026-05-28T10:30:00Z"
+        }
+    ],
+    "meta": { "page": 1, "per_page": 20, "total": 2 }
 }
 ```
 
-### Domain-Specific API Examples
+#### Get Diff Between Versions
 
-```http
-POST /v1/pastes/evaluate
-Idempotency-Key: <uuid>
+```
+GET /v1/pastes/{slug}/diff/{from_version}..{to_version}
 
+Response: 200 OK
 {
-  "subject": "tenant_or_user_or_key",
-  "context": {"route": "/api/resource", "region": "us-east-1"}
+    "data": {
+        "from_version": 1,
+        "to_version": 2,
+        "files_changed": 1,
+        "additions": 1,
+        "deletions": 1,
+        "diff": "--- a/main.py\n+++ b/main.py\n@@ -1,2 +1,2 @@\n def hello():\n-    print('Hello, World!')\n+    print('Updated!')\n"
+    }
 }
 ```
 
-```http
-GET /v1/pastes/{id}/metrics?from=2026-05-25T00:00:00Z&to=2026-05-25T01:00:00Z
+#### Fork Paste
+
+```
+POST /v1/pastes/{slug}/fork
+Authorization: Bearer {token}
+
+Response: 201 Created
+{
+    "data": {
+        "slug": "yL8nQr3w",
+        "url": "https://paste.example.com/yL8nQr3w",
+        "forked_from": "xK9mPq2v"
+    }
+}
 ```
 
-```http
-POST /v1/pastes/{id}/admin/quarantine
-Idempotency-Key: <uuid>
+#### Search Pastes
 
-{"reason": "abuse_or_operational_safety"}
+```
+GET /v1/pastes/search?q=fibonacci&language=python&sort=relevance&page=1&limit=20
+
+Response: 200 OK
+{
+    "data": [
+        {
+            "slug": "xK9mPq2v",
+            "title": "Fibonacci Sequence",
+            "language": "python",
+            "snippet": "...def fibonacci(n):\n    if n <= 1...",
+            "owner": "harsh",
+            "created_at": "2026-05-28T10:30:00Z",
+            "view_count": 342
+        }
+    ],
+    "meta": { "page": 1, "total": 47, "took_ms": 12 }
+}
 ```
 
-### Internal APIs
+#### Trending Pastes
+
+```
+GET /v1/pastes/trending?period=24h&language=all&limit=20
+
+Response: 200 OK
+{
+    "data": [
+        {
+            "slug": "abc123",
+            "title": "Quick Sort in Rust",
+            "language": "rust",
+            "view_count": 5420,
+            "fork_count": 89,
+            "score": 9847.2
+        }
+    ]
+}
+```
+
+### Internal gRPC Definitions
 
 ```protobuf
-service PasteService {
-  rpc CreatePaste(CreatePasteRequest) returns (Paste);
-  rpc GetPaste(GetPasteRequest) returns (Paste);
-  rpc UpdatePaste(UpdatePasteRequest) returns (Paste);
-  rpc EvaluatePaste(EvaluatePasteRequest) returns (EvaluatePasteResponse);
-  rpc ListPasteEvents(ListPasteEventsRequest) returns (stream PasteEvent);
+service HighlightService {
+    rpc HighlightContent (HighlightRequest) returns (HighlightResponse);
+    rpc DetectLanguage (DetectRequest) returns (DetectResponse);
+    rpc BatchHighlight (stream HighlightRequest) returns (stream HighlightResponse);
+}
+
+message HighlightRequest {
+    string content_hash = 1;
+    string language = 2;
+    string theme = 3;  // "dark" | "light"
+}
+
+message HighlightResponse {
+    string content_hash = 1;
+    string html = 2;
+    string detected_language = 3;
+    int32 line_count = 4;
+}
+
+service SpamDetectionService {
+    rpc CheckContent (SpamCheckRequest) returns (SpamCheckResponse);
+}
+
+message SpamCheckRequest {
+    string paste_id = 1;
+    string content = 2;
+    string user_id = 3;
+    string ip_address = 4;
+}
+
+message SpamCheckResponse {
+    bool is_spam = 1;
+    float confidence = 2;
+    repeated string reasons = 3;
+    string action = 4;  // "allow" | "flag" | "block"
 }
 ```
 
-### Error Model
+### Design Patterns Used
 
-- `400`: invalid request or unsupported transition.
-- `401/403`: missing identity or policy denial.
-- `404`: resource not found or intentionally hidden by authorization.
-- `409`: version conflict, duplicate idempotency key with different payload, or state transition race.
-- `429`: tenant/user/key quota exceeded with `Retry-After`.
-- `5xx`: dependency or internal failure. Return a request ID for support and tracing.
+| Pattern | Where | Why |
+|---------|-------|-----|
+| Content-Addressable Storage | S3 content storage | Deduplication via SHA-256 hash |
+| CQRS | Write Service / Read Service split | Different scaling and optimization needs |
+| Repository Pattern | Data access layer | Abstract DB details from business logic |
+| Strategy Pattern | Slug generation | Swap algorithm (Base62, NanoID, Snowflake) |
+| Observer/Pub-Sub | Kafka events | Decouple write path from async processing |
+| Circuit Breaker | External service calls | Prevent cascade failures |
+| Bulkhead | Service isolation | Limit blast radius of failures |
+| Decorator | Caching layer | Transparent cache wrap around data access |
 
-## 4. Async Event Contracts
+### Slug Generation Algorithm
 
-Use an outbox table or transactional event publisher so state changes and emitted events cannot diverge.
+```python
+import hashlib
+import secrets
+import string
+
+BASE62_CHARS = string.ascii_letters + string.digits  # a-zA-Z0-9
+SLUG_LENGTH = 8
+
+def generate_slug(content: str, attempt: int = 0) -> str:
+    """
+    Generate unique 8-char Base62 slug.
+    Uses content hash + random salt to avoid collision.
+    
+    Collision probability: 62^8 = 218 trillion combinations
+    With 10B pastes: collision chance ≈ 0.005%
+    """
+    salt = secrets.token_bytes(8)
+    hash_input = f"{content}{salt}{attempt}".encode()
+    hash_bytes = hashlib.sha256(hash_input).digest()
+    
+    # Convert first 6 bytes to Base62
+    num = int.from_bytes(hash_bytes[:6], 'big')
+    slug = []
+    for _ in range(SLUG_LENGTH):
+        slug.append(BASE62_CHARS[num % 62])
+        num //= 62
+    
+    return ''.join(slug)
+
+def create_slug_with_retry(content: str, max_retries: int = 5) -> str:
+    """Retry on collision (check DynamoDB for existence)."""
+    for attempt in range(max_retries):
+        slug = generate_slug(content, attempt)
+        if not slug_exists_in_dynamodb(slug):
+            return slug
+    raise SlugCollisionError("Failed to generate unique slug")
+```
+
+---
+
+## 8. Architecture Components Deep Dive
+
+### Route 53 (DNS)
+
+```
+Configuration:
+- Latency-based routing to nearest regional ALB
+- Health checks every 10 seconds on /health endpoints
+- Automatic failover to secondary region on 3 consecutive failures
+- DNSSEC enabled for domain security
+
+Records:
+  paste.example.com → ALIAS → CloudFront distribution
+  api.paste.example.com → ALIAS → ALB (regional)
+  *.paste.example.com → CNAME → paste.example.com
+```
+
+### CloudFront (CDN)
+
+```
+Distribution Configuration:
+- Origins:
+  - ALB (dynamic API requests): /v1/*
+  - S3 (raw content): /raw/*
+  - S3 (static assets): /static/*
+
+- Cache Behaviors:
+  - /v1/pastes/{slug} (GET): Cache 60s for public, no-cache for private
+  - /v1/pastes/{slug}/raw: Cache 300s, vary by Accept-Encoding
+  - /static/*: Cache 1 year (immutable, versioned filenames)
+  - Default: Forward to ALB, no caching
+
+- Edge Functions (Lambda@Edge):
+  - Viewer Request: Add request ID, validate origin
+  - Origin Request: Auth token forwarding, slug normalization
+  - Origin Response: Add security headers, CORS
+
+- Error Pages:
+  - 404 → custom /404.html (cached 60s)
+  - 503 → custom /maintenance.html
+```
+
+### WAF (Web Application Firewall)
+
+```
+Rule Groups:
+1. AWS Managed Rules:
+   - AWSManagedRulesCommonRuleSet (XSS, path traversal)
+   - AWSManagedRulesSQLiRuleSet (SQL injection)
+   - AWSManagedRulesKnownBadInputsRuleSet
+
+2. Custom Rules:
+   - Rate limit: 1000 requests/5min per IP (read)
+   - Rate limit: 50 requests/5min per IP (write)
+   - Block requests with body > 512KB
+   - Block user agents matching known scrapers
+   - GeoBlock sanctioned countries (OFAC list)
+   - Block if >5 failed auth attempts in 1 minute
+
+3. Bot Control:
+   - Allow verified search engine bots
+   - Challenge suspicious automated traffic
+   - Block credential stuffing patterns
+```
+
+### Application Load Balancer (ALB)
+
+```
+Configuration:
+- Listeners:
+  - HTTPS:443 → Target groups (TLS 1.3, cipher suite AEAD)
+  - HTTP:80 → Redirect to HTTPS:443
+
+- Target Groups:
+  - paste-write-tg: /v1/pastes (POST, PATCH, DELETE)
+  - paste-read-tg: /v1/pastes (GET)
+  - search-tg: /v1/pastes/search, /v1/pastes/trending
+  - user-tg: /v1/users/*
+  - health-tg: /health, /ready
+
+- Health Checks:
+  - Path: /health
+  - Interval: 15s
+  - Healthy threshold: 2
+  - Unhealthy threshold: 3
+  - Timeout: 5s
+
+- Sticky Sessions: Disabled (services are stateless)
+- Cross-zone: Enabled
+- Idle timeout: 60s
+- Deregistration delay: 30s
+```
+
+### Kong API Gateway
+
+```yaml
+# Kong Configuration
+services:
+  - name: paste-write
+    url: http://paste-write.internal:8080
+    routes:
+      - paths: ["/v1/pastes"]
+        methods: ["POST", "PATCH", "DELETE"]
+    plugins:
+      - name: jwt
+        config:
+          claims_to_verify: ["exp"]
+      - name: rate-limiting
+        config:
+          minute: 100
+          policy: redis
+          redis_host: redis.internal
+      - name: request-size-limiting
+        config:
+          allowed_payload_size: 512  # KB
+
+  - name: paste-read
+    url: http://paste-read.internal:8080
+    routes:
+      - paths: ["/v1/pastes"]
+        methods: ["GET"]
+    plugins:
+      - name: rate-limiting
+        config:
+          minute: 1000
+      - name: response-transformer
+        config:
+          add:
+            headers:
+              - "Cache-Control: public, max-age=60"
+
+  - name: search
+    url: http://search.internal:8080
+    routes:
+      - paths: ["/v1/pastes/search", "/v1/pastes/trending"]
+    plugins:
+      - name: rate-limiting
+        config:
+          minute: 300
+
+# Global Plugins
+plugins:
+  - name: correlation-id
+    config:
+      header_name: X-Request-ID
+      generator: uuid
+  - name: prometheus
+  - name: opentelemetry
+    config:
+      endpoint: http://otel-collector:4318/v1/traces
+```
+
+### ECS Fargate (Compute)
+
+```
+Service Definitions:
+┌────────────────────┬───────┬────────┬──────────┬──────────────┐
+│ Service            │ vCPU  │ Memory │ Min/Max  │ Scaling      │
+├────────────────────┼───────┼────────┼──────────┼──────────────┤
+│ paste-write        │ 2     │ 4 GB   │ 3/20     │ CPU > 60%    │
+│ paste-read         │ 2     │ 4 GB   │ 5/50     │ CPU > 50%    │
+│ highlight-worker   │ 4     │ 8 GB   │ 2/15     │ Queue depth  │
+│ search-service     │ 2     │ 4 GB   │ 2/10     │ CPU > 60%    │
+│ expiration-worker  │ 1     │ 2 GB   │ 1/3      │ Fixed        │
+│ spam-detector      │ 2     │ 4 GB   │ 2/8      │ Queue depth  │
+│ analytics-worker   │ 1     │ 2 GB   │ 2/5      │ Queue depth  │
+│ user-service       │ 1     │ 2 GB   │ 2/8      │ CPU > 60%    │
+└────────────────────┴───────┴────────┴──────────┴──────────────┘
+```
+
+### Database Layer Configuration
+
+```
+PostgreSQL (Citus - Distributed):
+- Coordinator: 1 node (r6g.xlarge)
+- Workers: 4 nodes (r6g.2xlarge), expandable
+- Shard key: user_id (for pastes, paste_files)
+- Reference tables: languages, expiration_options
+- Replication: Streaming with 2 read replicas
+- Connection pooling: PgBouncer (max 200 connections per worker)
+- WAL archival: S3 with 30-day retention
+
+DynamoDB:
+- Table: paste_slugs
+- Capacity mode: On-demand (auto-scaling)
+- Global tables: us-east-1, eu-west-1, ap-southeast-1
+- Point-in-time recovery: Enabled
+- TTL attribute: expires_at (auto-delete expired pastes)
+
+Redis Cluster:
+- Nodes: 6 (3 primary + 3 replica)
+- Instance: r6g.xlarge (13 GB memory each)
+- Total memory: ~78 GB
+- Eviction policy: allkeys-lru
+- Persistence: AOF (appendfsync everysec)
+- Cluster mode: Enabled (16384 hash slots)
+```
+
+---
+
+## 9. Deep Dive of Each Component/Service
+
+### Paste Write Service
+
+```
+Responsibilities:
+- Validate input (size, format, allowed languages)
+- Generate unique slug
+- Compute content hash (SHA-256)
+- Upload content to S3 (with dedup check)
+- Store metadata in PostgreSQL
+- Store slug mapping in DynamoDB
+- Warm Redis cache
+- Emit paste.created event to Kafka
+
+Flow:
+1. Receive POST request with paste data
+2. Validate: size ≤ 512KB per file, ≤ 10 files per paste, ≤ 100 total pastes/hour
+3. For each file:
+   a. Compute SHA-256 hash of content
+   b. S3 HEAD to check if content_hash already exists (dedup)
+   c. If not exists: S3 PUT raw/{content_hash}
+4. Generate 8-char Base62 slug (retry on collision)
+5. DynamoDB PutItem (slug → paste_id) with condition: attribute_not_exists(slug)
+6. PostgreSQL INSERT paste metadata + paste_files records
+7. Redis SET paste:{slug} with TTL 3600s
+8. Kafka produce: paste.created { paste_id, slug, user_id, files[], visibility }
+9. Return 201 with paste URL
+
+Error Handling:
+- S3 upload failure → Retry 3x with exponential backoff → 500 error
+- DynamoDB collision → Regenerate slug (up to 5 attempts) → 500 error
+- PostgreSQL failure → Compensate: delete DynamoDB entry, delete S3 → 500 error
+```
+
+### Paste Read Service
+
+```
+Responsibilities:
+- Resolve slug to paste metadata
+- Enforce visibility/auth/password checks
+- Handle burn-after-read semantics
+- Serve content from cache or S3
+- Increment view counters (async)
+
+Flow:
+1. Receive GET request for slug
+2. Redis GET paste:{slug}
+   └─ MISS → DynamoDB GetItem(slug) → populate Redis cache
+3. Check visibility:
+   - public/unlisted: allow
+   - private: verify JWT token matches owner
+4. Check password (if set):
+   - Compare bcrypt hash of X-Paste-Password header
+5. Check burn_after_read:
+   - Redis SET NX burn:{slug} (atomic lock)
+   - If already burned: return 410 Gone
+   - After response sent: mark deleted in DynamoDB + PostgreSQL
+6. Fetch content:
+   - Redis GET content:{content_hash} → S3 GET raw/{content_hash}
+7. Fetch highlighted HTML (if available):
+   - S3 GET highlighted/{content_hash}/{language}.html
+   - If not yet highlighted: return raw with language hint for client-side highlight
+8. Redis INCR views:{paste_id} (batched flush to DB every 60s)
+9. Kafka produce: paste.viewed { paste_id, viewer_ip_hash, timestamp }
+10. Return 200 with paste data
+```
+
+### Syntax Highlighting Service
+
+```
+Responsibilities:
+- Consume paste.created events from Kafka
+- Detect language if not specified
+- Generate highlighted HTML using tree-sitter / Pygments
+- Store result in S3
+- Update paste metadata with language detection result
+
+Technology: tree-sitter (fast, incremental parsing) + custom themes
+
+Flow:
+1. Consume from Kafka topic: paste.created
+2. Download raw content from S3
+3. If language not specified:
+   - Use linguist/guesslang for detection
+   - Fallback: file extension → MIME type mapping
+4. Parse with tree-sitter grammar for detected language
+5. Apply syntax theme (both dark/light variants)
+6. Generate HTML: <pre><code class="hljs {lang}">...</code></pre>
+7. Upload to S3: highlighted/{content_hash}/{language}.html
+8. Kafka produce: highlight.completed { paste_id, language, line_count }
+
+Performance:
+- Average highlight time: 20-50ms per file
+- Maximum content size for highlight: 1MB
+- Timeout: 5 seconds (skip large files)
+- Supported languages: 200+ (tree-sitter grammars)
+```
+
+### Expiration Service
+
+```
+Responsibilities:
+- Delete expired pastes on schedule
+- Cascade: remove S3 content (if no other references), DynamoDB entry, Redis cache
+- Respect dedup: only delete S3 if content_hash reference count = 0
+
+Implementation:
+1. DynamoDB TTL auto-deletes slug entries (built-in)
+2. Cron worker (every 5 minutes):
+   - Query PostgreSQL: SELECT * FROM pastes WHERE expires_at < NOW() AND is_deleted = FALSE LIMIT 1000
+   - For each expired paste:
+     a. Soft-delete in PostgreSQL (is_deleted = TRUE, deleted_at = NOW())
+     b. Delete from Redis cache
+     c. Invalidate CDN (CloudFront invalidation API)
+     d. Check if content_hash is used by other pastes
+     e. If orphaned: schedule S3 deletion (after 24h grace period)
+     f. Kafka produce: paste.expired { paste_id, user_id }
+
+3. Hard-delete worker (daily):
+   - Query: pastes WHERE is_deleted = TRUE AND deleted_at < NOW() - INTERVAL '30 days'
+   - Permanently remove from PostgreSQL
+   - Remove orphaned S3 objects
+
+Cleanup Rate: ~100K pastes/day expired (at scale)
+```
+
+### Spam Detection Service
+
+```
+Responsibilities:
+- Analyze paste content for spam/malware/sensitive data
+- Score pastes and take action (allow, flag, block)
+- Learn from flagged content (feedback loop)
+
+Detection Layers:
+1. URL Analysis:
+   - Extract all URLs from content
+   - Check against blacklist (Google Safe Browsing API)
+   - Check domain reputation
+   
+2. Content Analysis:
+   - Regex patterns for known spam (crypto scams, phishing templates)
+   - ML model: trained on labeled spam/ham pastes
+   - Sensitive data detection (API keys, passwords, credit cards)
+   
+3. Behavioral Signals:
+   - Paste creation rate from IP
+   - Account age vs paste volume
+   - Content entropy (very low = repeated spam)
+   - Similar content posted across multiple accounts
+
+Actions:
+- Score 0.0-0.3: Allow (normal content)
+- Score 0.3-0.7: Flag for human review, paste stays public
+- Score 0.7-1.0: Block immediately, notify user, restrict account
+
+Flow:
+1. Consume paste.created event
+2. Run all detection layers in parallel
+3. Aggregate scores with weighted average
+4. If blocked: update paste visibility to 'hidden' in PostgreSQL
+5. Kafka produce: spam.detected { paste_id, score, reasons[], action }
+```
+
+### Search Service
+
+```
+Responsibilities:
+- Index public pastes for full-text search
+- Support language-filtered search
+- Provide trending/popular pastes feed
+
+Elasticsearch Index Mapping:
+{
+    "pastes": {
+        "mappings": {
+            "properties": {
+                "slug": { "type": "keyword" },
+                "title": { "type": "text", "analyzer": "standard" },
+                "content": { "type": "text", "analyzer": "code_analyzer" },
+                "language": { "type": "keyword" },
+                "tags": { "type": "keyword" },
+                "username": { "type": "keyword" },
+                "created_at": { "type": "date" },
+                "view_count": { "type": "integer" },
+                "fork_count": { "type": "integer" }
+            }
+        },
+        "settings": {
+            "analysis": {
+                "analyzer": {
+                    "code_analyzer": {
+                        "type": "custom",
+                        "tokenizer": "standard",
+                        "filter": ["lowercase", "camelcase_split"]
+                    }
+                }
+            }
+        }
+    }
+}
+
+Indexing Flow:
+1. Consume paste.created event (only visibility = public)
+2. Fetch content from S3
+3. Index into Elasticsearch with metadata
+4. On paste.deleted: remove from index
+
+Trending Algorithm:
+score = (views_24h × 1.0) + (forks_24h × 5.0) + (recency_boost)
+recency_boost = max(0, 1.0 - (hours_since_creation / 48))
+```
+
+---
+
+## 10. Component Optimization
+
+### Kafka Configuration
+
+```
+Topics:
+┌─────────────────────┬────────────┬──────────┬───────────┬────────────┐
+│ Topic               │ Partitions │ Replicas │ Retention │ Consumers  │
+├─────────────────────┼────────────┼──────────┼───────────┼────────────┤
+│ paste.created       │ 12         │ 3        │ 7 days    │ 4 services │
+│ paste.viewed        │ 6          │ 2        │ 3 days    │ 2 services │
+│ paste.expired       │ 3          │ 2        │ 1 day     │ 1 service  │
+│ highlight.completed │ 6          │ 2        │ 1 day     │ 1 service  │
+│ spam.detected       │ 3          │ 3        │ 30 days   │ 2 services │
+│ analytics.event     │ 12         │ 2        │ 7 days    │ 1 service  │
+└─────────────────────┴────────────┴──────────┴───────────┴────────────┘
+
+Partitioning Strategy:
+- paste.created: partition by hash(user_id) for ordering per user
+- paste.viewed: partition by hash(paste_id) for per-paste ordering
+- analytics.event: partition by hash(event_type) for parallel consumption
+
+Producer Config:
+  acks: all (for paste.created — must not lose)
+  acks: 1 (for paste.viewed — acceptable loss)
+  batch.size: 16KB
+  linger.ms: 5
+  compression.type: lz4
+
+Consumer Config:
+  enable.auto.commit: false (manual commit after processing)
+  max.poll.records: 500
+  session.timeout.ms: 30000
+```
+
+### Multi-Layer Caching Strategy
+
+```
+Layer 1: CDN (CloudFront)
+├── Public paste HTML: TTL 60s
+├── Raw content: TTL 300s
+├── Static assets: TTL 1 year
+└── Hit rate target: 70% of reads
+
+Layer 2: Redis Cluster
+├── Paste metadata: TTL 3600s (extended on access)
+├── Hot content (<100KB): TTL 1800s
+├── User session: TTL 86400s
+├── Rate limit counters: TTL 60s
+└── Hit rate target: 90% of origin reads
+
+Layer 3: DynamoDB DAX (optional)
+├── Slug lookups: microsecond latency
+└── Eventually consistent reads
+
+Layer 4: S3 (origin)
+├── All content (source of truth)
+├── 11-nines durability
+└── Cross-region replication for DR
+```
+
+### Cache Invalidation Strategy
+
+```
+On paste update:
+1. Redis DEL paste:{slug}
+2. Redis DEL content:{old_content_hash}
+3. CloudFront invalidation: /v1/pastes/{slug}*
+
+On paste delete:
+1. Redis DEL paste:{slug}
+2. Redis DEL content:{content_hash}
+3. DynamoDB DeleteItem (or set TTL to now)
+4. CloudFront invalidation: /v1/pastes/{slug}*
+
+On burn-after-read:
+1. Redis SET burn:{slug} "1" NX EX 30 (atomic)
+2. If SET succeeded → serve content → then invalidate all layers
+3. If SET failed → return 410 (already burned)
+
+Cache warming:
+- On paste creation: proactively SET in Redis
+- On trending calculation: pre-warm top 100 pastes
+```
+
+### Database Partitioning and Sharding
+
+```
+PostgreSQL Partitioning (Time-based):
+- Table: pastes
+- Partition by: RANGE(created_at), monthly
+- Benefit: Efficient expiration queries, archival of old partitions
+- Maintenance: pg_partman auto-creates future partitions
+
+Citus Sharding (Hash-based):
+- Shard key: user_id
+- Distribution: 64 shards across 4 worker nodes
+- Benefit: User queries (my pastes) hit single shard
+- Cross-shard: slug lookups use DynamoDB (avoid scatter-gather)
+
+DynamoDB Partitioning (Automatic):
+- Partition key: slug (high cardinality, even distribution)
+- Hot partition prevention: slug is random (Base62 hash)
+- Adaptive capacity: auto-redistributes on hot keys
+
+Index Strategy:
+- B-tree: slug (unique lookup), user_id (user's pastes), expires_at (cleanup)
+- GIN: content search (pg_trgm for trigram matching)
+- BRIN: created_at (range scans on time-partitioned data)
+```
+
+### WebSocket / SSE for Real-time Features
+
+```
+Use Case: Live collaborative editing (Gist-style)
+
+Architecture:
+Client ←→ WebSocket ←→ Collaboration Service ←→ Redis Pub/Sub
+
+Implementation:
+- WebSocket connection per active editor
+- CRDT (Conflict-free Replicated Data Types) for concurrent edits
+- Redis Pub/Sub for broadcasting changes across instances
+- Operational Transform as fallback
+
+SSE Use Cases:
+- Live view count updates on trending page
+- Notification stream for paste comments
+- Build status for CI-integrated pastes
+
+Connection Management:
+- Max connections per instance: 10K WebSocket
+- Heartbeat interval: 30s
+- Idle disconnect: 5 minutes
+- Sticky sessions via ALB for WebSocket upgrades
+```
+
+### S3 Storage Optimization
+
+```
+Storage Classes:
+┌──────────────────┬────────────────┬───────────────────────────────┐
+│ Content Age      │ Storage Class  │ Rationale                     │
+├──────────────────┼────────────────┼───────────────────────────────┤
+│ 0-30 days       │ S3 Standard    │ Frequently accessed            │
+│ 30-90 days      │ S3 IA          │ Less frequent, but instant     │
+│ 90-365 days     │ S3 Glacier IR  │ Rare access, still instant     │
+│ 365+ days       │ S3 Glacier DA  │ Archival (restore in 12 hours) │
+└──────────────────┴────────────────┴───────────────────────────────┘
+
+Lifecycle Policy:
+- Transition to IA after 30 days (if paste not accessed in 14 days)
+- Transition to Glacier IR after 90 days
+- Delete after paste hard-deletion (30 days post soft-delete)
+- Abort incomplete multipart uploads after 7 days
+
+Cost Optimization:
+- Deduplication saves ~30% storage
+- S3 Intelligent Tiering for uncertain access patterns
+- Compression (gzip for content > 1KB) saves ~60% for code
+- Total monthly S3 cost at 100TB: ~$2,300/month (blended tiers)
+```
+
+### Elasticsearch Optimization
+
+```
+Index Design:
+- Shards: 5 primary + 1 replica (for ~50M documents)
+- Refresh interval: 5s (near real-time, not instant)
+- Merge policy: tiered (optimal for mixed workloads)
+
+Query Optimization:
+- Use bool queries with filter context for non-scoring clauses
+- Apply language filter as keyword (not analyzed)
+- Limit result fields with _source filtering
+- Use search_after for deep pagination (not offset)
+
+Index Lifecycle Management (ILM):
+- Hot phase: 7 days (all shards on fast SSD nodes)
+- Warm phase: 30 days (merge to 1 shard, force merge)
+- Cold phase: 90 days (searchable snapshots)
+- Delete phase: 365 days (remove from index)
+
+Memory:
+- Heap: 50% of RAM, max 31GB (compressed OOPs)
+- Fielddata circuit breaker: 40% of heap
+- OS cache for remaining 50% (Lucene segments)
+```
+
+### ClickHouse Analytics
+
+```
+Schema:
+CREATE TABLE paste_events (
+    event_id        UUID,
+    event_type      LowCardinality(String),  -- 'view', 'create', 'fork', 'delete'
+    paste_id        UUID,
+    user_id         Nullable(UUID),
+    ip_hash         FixedString(16),
+    country_code    LowCardinality(FixedString(2)),
+    language        LowCardinality(String),
+    referrer_domain LowCardinality(String),
+    user_agent      String,
+    created_at      DateTime
+) ENGINE = MergeTree()
+PARTITION BY toYYYYMM(created_at)
+ORDER BY (event_type, paste_id, created_at)
+TTL created_at + INTERVAL 1 YEAR;
+
+Materialized Views:
+- Hourly view counts per paste (for trending)
+- Daily active users per country
+- Language distribution over time
+- Top referrer domains
+
+Query Examples:
+-- Trending pastes (last 24h)
+SELECT paste_id, count() as views
+FROM paste_events
+WHERE event_type = 'view'
+  AND created_at > now() - INTERVAL 24 HOUR
+GROUP BY paste_id
+ORDER BY views DESC
+LIMIT 100;
+```
+
+---
+
+## 11. Observability
+
+### SLI/SLO Definitions
+
+| Service | SLI | SLO | Measurement |
+|---------|-----|-----|-------------|
+| Paste Read | Availability | 99.95% | Successful responses / total requests |
+| Paste Read | Latency | p99 < 200ms | Response time distribution |
+| Paste Write | Availability | 99.9% | Successful creates / total attempts |
+| Paste Write | Latency | p99 < 500ms | Response time distribution |
+| Paste Write | Durability | 99.999% | Pastes retrievable after creation |
+| Search | Availability | 99.9% | Successful queries / total queries |
+| Search | Freshness | < 30s | Time from creation to searchable |
+| Highlight | Completion | 99% | Highlighted within 60s of creation |
+
+### Prometheus Metrics
+
+```
+# API metrics
+http_requests_total{service, method, endpoint, status_code}
+http_request_duration_seconds{service, method, endpoint, quantile}
+http_request_size_bytes{service, method, endpoint}
+http_response_size_bytes{service, method, endpoint}
+
+# Business metrics
+pastes_created_total{visibility, language, has_expiration}
+pastes_viewed_total{cache_hit, visibility}
+pastes_expired_total{reason}  // ttl, burned, deleted
+paste_content_bytes{quantile}
+active_pastes_gauge{visibility}
+slug_collisions_total{}
+
+# Infrastructure metrics
+s3_operations_total{operation, bucket, status}
+s3_operation_duration_seconds{operation, bucket, quantile}
+dynamodb_operations_total{table, operation, status}
+dynamodb_consumed_capacity{table, operation}
+redis_commands_total{command, status}
+redis_memory_used_bytes{}
+kafka_consumer_lag{topic, consumer_group}
+kafka_produce_total{topic, status}
+pg_connections_active{database, state}
+pg_query_duration_seconds{query_type, quantile}
+
+# Cache metrics
+cache_hits_total{layer}       // cdn, redis, dax
+cache_misses_total{layer}
+cache_hit_ratio{layer}
+cache_evictions_total{layer, reason}
+```
+
+### OpenTelemetry Distributed Tracing
+
+```
+Trace Structure (Create Paste):
+
+Span: POST /v1/pastes (API Gateway)
+  ├── Span: auth.validate_token (Kong JWT plugin)
+  ├── Span: rate_limit.check (Kong rate limiter)
+  └── Span: paste_write.create (Paste Write Service)
+       ├── Span: validate.input
+       ├── Span: slug.generate
+       │    └── Span: dynamodb.condition_check
+       ├── Span: content.hash (SHA-256 compute)
+       ├── Span: s3.head_object (dedup check)
+       ├── Span: s3.put_object (upload content)
+       ├── Span: pg.insert (paste metadata)
+       ├── Span: dynamodb.put_item (slug mapping)
+       ├── Span: redis.set (cache warm)
+       └── Span: kafka.produce (paste.created event)
+
+Sampling Strategy:
+- 100% sampling for errors (status >= 500)
+- 100% sampling for slow requests (> 1s)
+- 10% sampling for normal traffic
+- 1% sampling for health checks
+
+Trace Context Propagation:
+- W3C Trace Context headers (traceparent, tracestate)
+- Baggage: user_id, paste_id, request_id
+```
+
+### Alerting Rules
+
+```yaml
+# Critical (P1 - pages on-call)
+- alert: PasteReadLatencyHigh
+  expr: histogram_quantile(0.99, http_request_duration_seconds{service="paste-read"}) > 0.5
+  for: 5m
+  labels:
+    severity: critical
+  annotations:
+    summary: "Paste read p99 latency > 500ms for 5 minutes"
+    runbook: "https://runbooks.internal/paste-read-latency"
+
+- alert: PasteWriteErrorRateHigh
+  expr: rate(http_requests_total{service="paste-write", status_code=~"5.."}[5m]) / rate(http_requests_total{service="paste-write"}[5m]) > 0.01
+  for: 3m
+  labels:
+    severity: critical
+  annotations:
+    summary: "Paste write error rate > 1%"
+
+- alert: S3UploadFailures
+  expr: rate(s3_operations_total{operation="PutObject", status="error"}[5m]) > 0
+  for: 2m
+  labels:
+    severity: critical
+
+# Warning (P2 - Slack notification)
+- alert: KafkaConsumerLag
+  expr: kafka_consumer_lag{consumer_group="highlight-service"} > 10000
+  for: 10m
+  labels:
+    severity: warning
+  annotations:
+    summary: "Highlight service falling behind by {{ $value }} messages"
+
+- alert: CacheHitRateLow
+  expr: cache_hit_ratio{layer="redis"} < 0.8
+  for: 15m
+  labels:
+    severity: warning
+
+- alert: DatabaseConnectionPoolExhaustion
+  expr: pg_connections_active / pg_connections_max > 0.8
+  for: 5m
+  labels:
+    severity: warning
+
+- alert: DiskSpaceLow
+  expr: node_filesystem_avail_bytes / node_filesystem_size_bytes < 0.2
+  for: 10m
+  labels:
+    severity: warning
+```
+
+### Grafana Dashboards
+
+```
+Dashboard: Paste Service Overview
+┌─────────────────────────────────────────────────────────────────┐
+│  Request Rate          │  Error Rate           │  Latency p50/99│
+│  [line chart: 24h]     │  [line chart: 24h]    │  [line: 24h]   │
+├─────────────────────────────────────────────────────────────────┤
+│  Pastes Created/min    │  Active Pastes        │  Storage Used  │
+│  [counter + sparkline] │  [gauge: by type]     │  [bar: by tier]│
+├─────────────────────────────────────────────────────────────────┤
+│  Cache Hit Rates       │  Kafka Consumer Lag   │  DB Connections│
+│  [multi-line: layers]  │  [bar: by topic]      │  [gauge: pool] │
+├─────────────────────────────────────────────────────────────────┤
+│  Top Languages         │  Visibility Split     │  Expiry Profile│
+│  [pie chart]           │  [donut chart]        │  [histogram]   │
+└─────────────────────────────────────────────────────────────────┘
+
+Dashboard: Infrastructure Health
+- ECS task count and CPU/memory per service
+- S3 request latency and error rate
+- DynamoDB consumed capacity vs provisioned
+- Redis memory, connections, hit rate
+- PostgreSQL query duration, active connections, replication lag
+```
+
+### Structured Logging
 
 ```json
 {
-  "event_id": "evt_01H...",
-  "event_type": "pastes.updated.v1",
-  "occurred_at": "2026-05-25T10:15:30Z",
-  "producer": "pastes-service",
-  "tenant_id": "tenant_123",
-  "aggregate_id": "paste_123",
-  "aggregate_version": 13,
-  "idempotency_key": "idem_123",
-  "actor": {
-    "type": "user|service|system",
-    "id": "user_123"
-  },
-  "payload": {}
+    "timestamp": "2026-05-28T10:30:00.123Z",
+    "level": "INFO",
+    "service": "paste-write",
+    "instance_id": "i-abc123",
+    "trace_id": "4bf92f3577b34da6a3ce929d0e0e4736",
+    "span_id": "00f067aa0ba902b7",
+    "request_id": "req-uuid-here",
+    "user_id": "user-uuid-here",
+    "event": "paste.created",
+    "paste_id": "paste-uuid-here",
+    "slug": "xK9mPq2v",
+    "visibility": "unlisted",
+    "file_count": 2,
+    "total_size_bytes": 4567,
+    "content_deduplicated": true,
+    "duration_ms": 87,
+    "s3_duration_ms": 34,
+    "pg_duration_ms": 12,
+    "dynamo_duration_ms": 8
 }
 ```
 
-### Core Events
+---
 
-- `pastes.created.v1`
-- `pastes.updated.v1`
-- `pastes.state_changed.v1`
-- `pastes.deleted_or_expired.v1`
-- `pastes.policy_denied.v1`
-- `pastes.operation_failed.v1`
+## 12. Considerations and Assumptions
 
-## 5. High-Level Architecture
+### Security Considerations
 
-### Architecture Design
+| Concern | Mitigation |
+|---------|------------|
+| Content injection (XSS) | HTML-escape all content; syntax highlight in sandbox |
+| Sensitive data leaks | Automated scanning for API keys, passwords, PII |
+| Brute-force slug enumeration | Rate limiting + non-sequential slugs (62^8 space) |
+| DDoS on popular pastes | CDN caching + WAF rate limiting + auto-scaling |
+| Data exfiltration | Audit logs, anomaly detection on bulk downloads |
+| Password-protected paste bypass | bcrypt hashing, timing-safe comparison |
+| Token theft | Short-lived JWTs (15min), secure refresh token rotation |
 
-```text
-Pastebin / GitHub Gist Architecture
+### Scalability Assumptions
 
-Actors / Clients / Partner Systems
-        |
-        v
-DNS / Global Traffic Manager / CDN where useful
-        |
-        v
-Edge/API gateway
-        |
-        +--> Synchronous Command Path
-        |       -> Hot-path data-plane service -> Control-plane API -> Shard manager -> Policy/config cache
-        |       -> Source-of-Truth Write + Transactional Outbox
-        |
-        +--> Query / Serving Path
-        |       -> Hot-path data-plane service / Policy/config cache
-        |       -> Canonical Store fallback when strong freshness is required
-        |
-        +--> Async/Event Path
-        |       -> Event Bus / Stream Processing / Workflow Queues
-        |       -> Async analytics pipeline / Admin and audit service
-        |
-        +--> Operations Path
-                -> Admin Console / Audit / Reconciliation / Backfill / Disaster Recovery
+```
+Current Design Supports:
+- 100M+ total pastes stored
+- 50K read QPS peak (with CDN absorption)
+- 20K write QPS peak
+- 500 TB total content storage
+- 30M MAU
 
-Data Stores: Metadata/quorum store + replicated data shards + cache/index + repair log + audit/event log
-Ops/Integrations: Placement/rebalancing + repair/compaction + backup/restore + admin control plane
+Horizontal Scaling Levers:
+1. Read replicas for PostgreSQL (add more read capacity)
+2. Redis cluster expansion (add shards for memory)
+3. ECS auto-scaling (CPU/queue-depth based)
+4. DynamoDB on-demand (automatic partition splitting)
+5. S3 unlimited (no capacity planning needed)
+6. Kafka partition increase (more parallelism)
+7. Elasticsearch shard splitting (reindex)
 ```
 
-### Request And Data Flow
+### Cost Estimation (Monthly at Scale)
 
-1. **Request entry:** actors enter through edge controls that authenticate, authorize, rate-limit, route, and attach trace context before reaching the Pastebin / GitHub Gist service boundary.
-2. **Synchronous command path:** correctness-sensitive mutations stay inside Hot-path data-plane service -> Control-plane API -> Shard manager -> Policy/config cache; this path performs validation, idempotency checks, source-of-truth writes, and outbox publication.
-3. **Query path:** read-heavy traffic is served by Hot-path data-plane service / Policy/config cache; strong reads fall back to the canonical store when stale projections are unsafe.
-4. **Async path:** Async analytics pipeline / Admin and audit service consume committed events for notifications, indexing, analytics, provider calls, ML/risk feedback, cleanup, and reconciliation.
-5. **Operations path:** admin, audit, replay, reconciliation, backfill, and disaster-recovery workflows are isolated from user-facing latency but use the same immutable event/audit history.
-
-### Component Responsibilities
-
-- **Edge/API gateway**: Terminates TLS, authenticates callers, enforces WAF/rate limits/quotas, validates request shape, routes to the correct service/cell, and emits access/audit logs.
-- **Control-plane API**: Owns admin/configuration mutations, tenant/resource ownership, policy changes, rollout controls, and slow-changing metadata.
-- **Hot-path data-plane service**: Serves latency-critical user traffic with minimal dependencies, cached policy/config, bounded fanout, and explicit backpressure.
-- **Shard manager**: Maps tenants/entities/keys to shards, manages placement/rebalancing, exposes routing metadata, and protects hot partitions.
-- **Policy/config cache**: Evaluates versioned policy, quotas, eligibility, and configuration with deterministic decisions and audit-friendly reason codes.
-- **Async analytics pipeline**: Consumes immutable events, computes rollups, powers dashboards/exports, and stays off the synchronous correctness path.
-- **Admin and audit service**: Provides operator workflows for investigation, replay, correction, quarantine, approval, and immutable audit trails.
-
-### Service Responsibility Matrix
-
-| Layer | Services | Responsibility |
-| --- | --- | --- |
-| Edge/API boundary | Edge/API gateway | Authentication, authorization handoff, request validation, rate limits, routing, TLS termination, coarse abuse controls, and trace context propagation. |
-| Core domain services | Hot-path data-plane service, Control-plane API, Shard manager, Policy/config cache | Own Pastebin / GitHub Gist business invariants, source-of-truth writes, state transitions, idempotency, and synchronous API responses. |
-| Query/serving services | Hot-path data-plane service, Policy/config cache | Serve low-latency reads from caches, read models, indexes, or specialized serving stores while exposing freshness/consistency guarantees. |
-| Async workers and integrations | Async analytics pipeline, Admin and audit service | Consume committed events, call external systems, retry safely, update projections, run cleanup, and isolate slow dependencies from user-facing latency. |
-| Data and governance | OLTP DB / cache / search index / object store / warehouse / audit log | Separate canonical state from derived stores; support rebuild, partitioning, retention, encryption, backup, and analytical access. |
-| Operations | Admin console / reconciliation / observability / runbooks | Provide support investigation, replay/backfill, manual correction, compliance evidence, SLO dashboards, and incident response. |
-
-### Data Stores
-
-- Strong metadata store for configuration and ownership.
-- Low-latency cache or in-memory serving tier for hot decisions.
-- Append-only event log for audit, analytics, and replay.
-- OLAP store for usage analytics and reports.
-
-## 6. Low-Level Design
-
-### Core Modules
-
-- `PasteController`: validates requests, extracts identity, enforces coarse rate limits, and maps errors to API responses.
-- `PasteApplicationService`: owns use-case orchestration, idempotency, retries, and state transitions.
-- `PasteDomainModel`: contains state machine rules, validation, and invariants that must not leak into controllers.
-- `PasteRepository`: hides database access, optimistic locking, partitioning, and pagination details.
-- `PastePolicyEvaluator`: centralizes authorization, tenant isolation, quota, and abuse decisions.
-- `PasteEventPublisher`: writes outbox records and publishes domain events to the broker.
-- `PasteReadModelProjector`: builds caches, search documents, counters, and dashboard projections asynchronously.
-
-### Interfaces
-
-```java
-interface PasteRepository {
-    Optional<Paste> findById(PasteId id, ReadConsistency consistency);
-    Page<Paste> list(PasteQuery query, Cursor cursor, int limit);
-    Paste save(Paste aggregate, ExpectedVersion expectedVersion);
-}
-
-interface PastePolicyEvaluator {
-    PolicyDecision canRead(Principal principal, Paste resource);
-    PolicyDecision canMutate(Principal principal, Paste resource, Action action);
-}
-
-interface IdempotencyStore {
-    Optional<StoredResponse> find(String scope, String key, String requestHash);
-    void reserve(String scope, String key, String requestHash, Instant expiresAt);
-    void complete(String scope, String key, StoredResponse response);
-}
+```
+┌──────────────────────────┬──────────────┬───────────────────────────┐
+│ Component                │ Monthly Cost │ Notes                     │
+├──────────────────────────┼──────────────┼───────────────────────────┤
+│ ECS Fargate (all services)│ $4,200      │ ~50 tasks average         │
+│ PostgreSQL (Citus)       │ $3,600      │ 1 coord + 4 workers       │
+│ DynamoDB                 │ $1,800      │ On-demand, 100M items     │
+│ Redis Cluster            │ $2,400      │ 6 nodes r6g.xlarge        │
+│ S3 Storage (100TB)       │ $2,300      │ Blended tiers             │
+│ S3 Requests              │ $500        │ GET/PUT operations        │
+│ CloudFront               │ $3,000      │ 500TB egress/month        │
+│ Kafka (MSK)              │ $2,000      │ 3 brokers m5.large        │
+│ Elasticsearch            │ $2,500      │ 3 nodes, 500GB data       │
+│ ClickHouse               │ $800        │ 2 nodes for analytics     │
+│ ALB                      │ $500        │ LCU-based pricing         │
+│ WAF                      │ $400        │ Rules + request charges   │
+│ Route 53                 │ $50         │ Hosted zone + queries     │
+│ Monitoring (Datadog)     │ $1,500      │ APM + logs + metrics      │
+│ Misc (KMS, VPC, NAT)    │ $600        │ Networking + encryption   │
+├──────────────────────────┼──────────────┼───────────────────────────┤
+│ TOTAL                    │ ~$26,150/mo  │ At 30M MAU scale         │
+└──────────────────────────┴──────────────┴───────────────────────────┘
 ```
 
-### State Machine
-
-```text
-CREATED -> ACTIVE -> PAUSED -> ARCHIVED -> DELETED
-   |         |          |          |
-   |         |          |          -> RESTORE if policy allows
-   |         |          -> ACTIVE after validation
-   |         -> SUSPENDED by abuse/security workflow
-   -> FAILED when creation side effects cannot complete
-```
-
-Adapt the state names to the domain, but always make transitions explicit, versioned, idempotent, and auditable.
-
-## 7. Database Modeling And DB Design
-
-### Logical Model
-
-```text
-Tenant/User
-  -> owns or can access -> Paste
-  -> emits -> PasteEvent
-  -> produces -> ReadModel / SearchDocument / Metric
-  -> audited by -> AuditLog
-```
-
-### Core Tables
-
-| Table | Important Columns |
-|---|---|
-| `pastes` | `id, owner_id, visibility, language, content_ref, ttl_at, checksum, status, created_at` |
-| `paste_versions` | `paste_id, version, content_ref, checksum, author_id, created_at` |
-| `share_tokens` | `token_hash, resource_id, scope, expires_at, revoked_at` |
-| `abuse_reports` | `id, resource_id, reporter_id, reason, evidence_ref, state, decided_by, created_at` |
-| `tenants` | `id, name, plan, region_policy, encryption_key_ref, state, created_at` |
-| `resources` | `id, tenant_id, owner_id, state, payload_ref, version, created_at, updated_at` |
-| `policies` | `id, tenant_id, policy_type, body_json, version, state, created_by, created_at` |
-
-### Database Technology Choice
-
-| Workload / Data | Recommended Database / Store | Why This Choice Fits |
-| --- | --- | --- |
-| Source of truth / primary store | PostgreSQL/CockroachDB for paste metadata, ACLs, TTL, and ownership; object storage for paste bodies and rendered assets | metadata requires permissions and expiration queries, while content payloads belong in cheap durable blob storage |
-| Hot serving / cache | Redis Cluster plus read replicas/materialized views | keeps hot reads, sessions, counters, quotas, and derived views away from the OLTP source of truth |
-| Event stream / outbox | Kafka/Pulsar/Kinesis with compacted topics for keys and retained topics for replay | decouples projections, notifications, analytics, search indexing, and recovery from the write path |
-| Search / analytics | OpenSearch/Elasticsearch for search and ClickHouse/Druid/Pinot for analytics | serves text/filter/OLAP queries without overloading transactional tables |
-| Large immutable payloads | S3/GCS/Azure Blob/object storage for payloads, exports, evidence, backups, and immutable artifacts | large or immutable data is cheaper, durable, and easier to lifecycle outside OLTP rows |
-
-Interview stance: name the source-of-truth database first, then explicitly separate caches, indexes, event logs, and analytics stores. The cache, search index, and warehouse are derived systems; they must be rebuildable from canonical state and immutable events.
-
-### Replication Strategy
-
-- Primary store: multi-AZ synchronous or quorum replication for the primary store; asynchronous cross-region replicas for DR and read locality.
-- Event log: replicate each partition across at least 3 brokers/nodes, require quorum acknowledgements for critical events, and monitor under-replicated partitions.
-- Cache/read models: replicate for availability, but treat them as disposable; rebuild from source-of-truth rows plus events after corruption or cache loss.
-- Object storage: use multi-AZ durability by default; enable cross-region replication only for disaster recovery, compliance, or locality requirements.
-- Analytics/search stores: replicate shards for query availability, but recover by replaying events or rebuilding from snapshots when correctness is in doubt.
-
-### Sharding And Partitioning Strategy
-
-- Primary partition key: `paste_id hash for metadata; owner_id for user lists; time bucket for public/recent lists`. Choose the key that matches the hottest write/read path, not just the entity name.
-- Primary lookup path: `paste_id / slug` should be single-partition whenever possible.
-- Time-partition append-heavy data such as events, audit logs, metrics, and delivery attempts so retention, archival, replay, and backfills do not scan the full corpus.
-- Hot partition mitigation: cache viral pastes and syntax-rendered output; isolate public trending lists from private paste lookup.
-- Keep tenant/cell/region boundaries explicit so one large customer, city, celebrity, event, or provider cannot overload the whole system.
-
-### Indexing Strategy
-
-- Required secondary indexes: `owner_id + created_at, visibility + created_at, expires_at, language, abuse_state`.
-- Keep OLTP indexes minimal on high-write tables; move broad filtering, text search, ranking, and analytics to dedicated search/OLAP stores.
-- Use composite indexes that match real query order: equality columns first, then range/sort columns such as `created_at`, `updated_at`, or `score`.
-- For mutable state machines, index `(state, updated_at)` or `(state, next_attempt_at)` for workers and repair jobs.
-- For audit and event tables, prefer append-only writes with time-bucketed partitions and compact indexes over many mutable secondary indexes.
-
-### CAP Theorem And Consistency Choices
-
-| Data / Operation | CAP Bias During Partition | Consistency Model | Interview Notes |
-| --- | --- | --- | --- |
-| Canonical command path | CP for core state transitions that must not diverge during a partition | strong consistency for source-of-truth writes and policy gates | Prefer rejecting or queuing unsafe writes over accepting divergent state. |
-| Derived read models | AP/eventual for derived or disposable views where stale data is acceptable | Eventual consistency for syntax rendering, search indexing, analytics, spam scores, and preview generation | Expose `pending`, `processing`, `stale_at`, or version metadata when users may observe lag. |
-| Cache | AP with bounded TTL, unless used for a lock/fencing decision | Eventually consistent and invalidated by events or short TTL | Cache is never the only source of truth for correctness-critical state. |
-| Search / analytics | AP/eventual | Asynchronous ingestion with replay/backfill | Results can lag; define freshness SLO and rebuild path. |
-| Audit / ledger / immutable events | CP for append acceptance; replicated for durability | Append-only, immutable, replayable | Used for reconciliation, forensics, and projection rebuilds. |
-
-### Data Lifecycle, Backups, And Rebuilds
-
-- PITR backups, periodic restore drills, immutable event retention, and projection rebuilds from source-of-truth plus event log.
-- Use transactional outbox or change-data-capture so database commits and emitted events cannot silently diverge.
-- Define retention per data class: hot OLTP rows, warm history, cold object-store archives, legal holds, and deletion/anonymization workflows.
-- Run checksum/control-total reconciliation between source-of-truth tables, event streams, search indexes, warehouses, and external providers.
-- Document restore order: primary metadata first, immutable events second, object payloads third, then rebuild caches/search/read models.
-
-### Platform Building Blocks And Microservice Patterns
-
-Use these technologies only where they fit the access pattern and correctness boundary. A strong interview answer says what is on the synchronous hot path, what is asynchronous, what is derived, and what can be rebuilt.
-
-| Concern | Recommended Building Blocks | How To Use In This Design | Key Interview Caveat |
-| --- | --- | --- | --- |
-| Hot-path caching | CDN, Redis Cluster, Memcached, local in-process cache, request coalescing, stale-while-revalidate | Cache hot reads, sessions, tokens, rate-limit counters, derived cards, and expensive computed views. Invalidate through events or short TTLs. | Never make cache the only source of truth for money, permissions, scarce inventory, or irreversible state. |
-| Async processing | Kafka, Pulsar, Kinesis, RabbitMQ/SQS, transactional outbox/inbox, DLQ, retry with jitter | Move notifications, indexing, analytics, projections, provider calls, and slow side effects off the user-visible path. | Consumers must be idempotent; partition by aggregate when ordering matters. |
-| Stream processing | Apache Flink, Kafka Streams, Spark Structured Streaming, Beam | Build rolling counters, fraud/risk signals, ranking features, ETA/features, alerting, and near-real-time materialized views. | Use event time, watermarks, replay, and exactly-once/effectively-once sinks only where the business needs it. |
-| Batch jobs and workflows | Airflow, Dagster, Argo Workflows, Temporal, Cadence, Step Functions, Spark | Run backfills, reconciliation, compaction, expiry, report generation, settlement, lifecycle management, and ML feature generation. | Keep batch workers isolated from online capacity and make every job restartable and idempotent. |
-| CDC and projections | Debezium, database CDC, Kafka Connect, outbox table relay | Feed search indexes, CQRS read models, lakehouse tables, caches, and audit pipelines from committed changes. | CDC is for propagation; business commands still go through domain services. |
-| Event contracts | Schema Registry, Avro, Protobuf, JSON Schema, AsyncAPI, compatibility checks | Version domain events, enforce backward/forward compatibility, and document owners and consumers. | Breaking schema changes require new event versions and migration windows. |
-| CQRS and read models | Command store, query projections, materialized views, search indexes | Keep canonical writes small and strongly owned; serve read-heavy views from projections optimized for query shape. | Expose freshness/version metadata and rebuild projections from events. |
-| Microservice consistency patterns | Saga/process manager, transactional outbox, inbox dedupe, idempotency keys, compensating actions | Coordinate multi-service workflows without distributed transactions. | Make every state transition explicit and auditable; avoid hidden side effects. |
-| Event storming and domain modeling | Commands, aggregates, events, policies, read models, bounded contexts | Identify aggregate owners, event names, invariants, side effects, and read projections before drawing service boxes. | Services should map to ownership boundaries, not arbitrary technical layers. |
-| Object storage and lakehouse | S3/GCS/Azure Blob, Iceberg, Hudi, Delta Lake, Glue/Hive catalog | Store raw events, media, attachments, audit exports, feature data, and replayable history in immutable partitions. | Keep object/lake data partitioned by date/tenant/domain key and govern retention/privacy. |
-| Analytics serving | Pinot, ClickHouse, Druid, Redshift, BigQuery, Snowflake, Athena/Trino/Presto | Serve dashboards, funnels, investigations, operational analytics, ad hoc SQL, and historical reports outside OLTP. | Do not run exploratory analytics against the primary transactional database. |
-| Service runtime and governance | Spring Boot, Quarkus, Micronaut, Go/gRPC, Node.js, Kubernetes, service mesh, mTLS, API gateway, OpenTelemetry, config service, feature flags | Deploy independently, enforce auth, collect traces/metrics/logs, and roll out safely with canaries and kill switches. | More services increase operational load; split only when ownership, scale, or reliability justifies it. |
-
-For this design, use Redis/CDN/local caches for the hot read path, Kafka or Pulsar for async domain events, Flink/Spark for stream enrichment when needed, S3 + Iceberg for long-retention history, and ClickHouse/Pinot/Druid/Redshift/Athena for analytical access.
-
-Implementation rule: start with the simplest reliable building block, then introduce Kafka/Flink/lakehouse/OLAP/microservice patterns when scale, replay, ownership, or query shape demands them. Every added component must have a clear owner, SLO, retention policy, replay story, and failure mode.
-
-## 8. Critical Flows
-
-### Write / Mutation Flow
-
-1. Client sends a mutation with authentication, idempotency key, and expected version when updating existing state.
-2. API gateway applies coarse authentication, quotas, WAF rules, request size limits, and routing.
-3. Application service validates input, checks policy, reserves idempotency key, and loads current aggregate state.
-4. Domain model evaluates the transition and writes primary state plus outbox event in the same transaction.
-5. Async workers publish events, update caches/search/read models, and invoke side effects.
-6. Response returns the committed state, version, request ID, and retry-safe result.
-
-### Read / Serving Flow
-
-1. Client requests a resource or list endpoint with identity and cursor/filter parameters.
-2. Service checks cache/read model for hot data and falls back to primary or search store when needed.
-3. Authorization filters are applied before returning data, not only at ingestion time.
-4. Response includes cache headers, pagination cursor, resource version, and trace/request ID.
-
-### Replay / Recovery Flow
-
-1. Identify the affected tenant, shard, time window, or aggregate IDs.
-2. Pause dangerous side effects if replay can duplicate external calls.
-3. Rebuild read models from the event log or primary source of truth.
-4. Compare counts/checksums against expected control totals.
-5. Resume normal processing and keep an audit note with operator, reason, and evidence.
-
-## 9. Deep-Dive Focus Areas
-
-- **paste storage**: Separate metadata from immutable content blobs and keep render/caching decisions out of the write path.
-- **expiration**: Use soft-expire in reads and background compaction for storage cleanup.
-- **privacy**: Model public, unlisted, private, tenant, and shared-link access explicitly.
-- **syntax rendering**: Precompute popular render formats but keep raw source canonical.
-- **spam control**: Throttle anonymous writes, scan links/secrets, and quarantine suspicious content.
-
-## 10. Scaling Bottlenecks And Mitigations
-
-| Bottleneck | Why It Happens | Mitigation |
-|---|---|---|
-| Hot partition or celebrity object | A small number of keys receives a disproportionate share of reads/writes. | Key splitting, local caches, write buffering, async aggregation, and hybrid fanout. |
-| Synchronous dependency chain | User-visible request waits on too many downstream systems. | Move non-critical work to events, use timeouts, fallbacks, and circuit breakers. |
-| Cache stampede | Popular key expires or is invalidated under high concurrency. | Soft TTL, request coalescing, jittered expiration, stale-while-revalidate. |
-| Large tenant noisy neighbor | One tenant consumes shared pool capacity. | Per-tenant quotas, partitioning, fairness queues, and dedicated capacity for top tenants. |
-| Reindex/rebuild pressure | Backfills or rebuilds compete with online serving. | Separate backfill pools, rate limits, shadow indexes, and atomic cutover. |
-| Operational blind spots | Failures occur without enough context to debug. | Correlate logs, metrics, traces, audit events, and deployment versions. |
-
-## 11. Security, Privacy, Abuse Prevention, And Compliance
-
-- Authenticate every request with user, service, or device identity; use mTLS for internal service calls.
-- Authorize by tenant, ownership, role, resource state, and contextual policy. Do not rely on front-end checks.
-- Encrypt data in transit and at rest. Use tenant-scoped or domain-scoped keys for sensitive data.
-- Store secrets in a managed vault and rotate credentials. Never log tokens, passwords, private keys, or raw sensitive payloads.
-- Apply input validation, WAF rules, bot detection, rate limits, and abuse reputation checks.
-- Keep immutable audit logs for administrative actions, policy decisions, state transitions, and data exports.
-- Implement data retention, deletion, legal hold, and privacy export workflows if the domain stores personal data.
-- Use least privilege for operators and services; require break-glass approvals for emergency access.
-
-## 12. Reliability, Failure Modes, And Recovery
-
-| Failure Mode | Impact | Recovery Strategy |
-|---|---|---|
-| Primary DB shard unavailable | Mutations for affected shard fail or degrade. | Multi-AZ failover, circuit breaker, queued writes only if semantics allow, clear user messaging. |
-| Cache cluster loss | Higher latency and DB load. | Request coalescing, local cache, rate limiting, and progressive cache warmup. |
-| Event broker lag | Search, analytics, notifications, or projections become stale. | Lag alerts, autoscale consumers, replay from offsets, and expose freshness to users/internal teams. |
-| Region outage | Users in region lose access or move to remote region. | Global traffic failover, replicated critical data, documented RPO/RTO, and dependency evacuation runbooks. |
-| Bad deployment or config | Elevated errors or wrong decisions. | Canary, automatic rollback, config version pinning, kill switches, and audit trail. |
-| Poison message or corrupt record | Consumer stalls or produces bad projection. | DLQ, quarantine, schema validation, replay tooling, and repair jobs. |
-
-## 13. Deployment And Operations
-
-- Run stateless services on Kubernetes or an equivalent orchestrator across at least three availability zones.
-- Use infrastructure as code for networking, IAM, databases, queues, caches, alarms, and dashboards.
-- Deploy with canary or blue/green releases. Gate rollout on error rate, latency, saturation, and domain-specific correctness metrics.
-- Apply backward-compatible database migrations: expand, dual-write/backfill if needed, verify, then contract.
-- Separate control plane and data plane where the hot path must survive admin-plane outages.
-- Use feature flags and kill switches for risky paths, expensive jobs, and external integrations.
-- Maintain runbooks for failover, replay, data repair, provider outage, abuse incident, and privacy/security incident.
-
-## 14. Observability: SLIs, SLOs, Dashboards, Alerts
-
-### SLIs And SLOs
-
-| Area | SLI | Example SLO |
-|---|---|---|
-| Availability | successful requests / total requests | 99.9% to 99.99% depending on product criticality |
-| Latency | p50/p95/p99 by endpoint and tenant | p99 under the stated latency target for hot APIs |
-| Correctness | duplicate, lost, or invalid state transitions | zero known correctness violations for critical workflows |
-| Freshness | event lag, projection lag, index lag | 95% of projections within agreed freshness window |
-| Durability | acknowledged writes later readable/replayable | no acknowledged write loss |
-| Saturation | CPU, memory, queue depth, broker lag, DB connections | alert before user-visible impact |
-
-### Dashboards
-
-- API RED metrics: request rate, error rate, duration by endpoint, tenant, region, and deployment version.
-- Dependency metrics: DB latency, cache hit ratio, broker lag, search latency, provider errors.
-- Domain metrics: created/updated/deleted counts, state transition rates, policy denials, retries, DLQ depth.
-- Capacity metrics: shard size, hot keys, queue depth, worker utilization, storage growth, egress.
-- Security metrics: auth failures, suspicious IPs/devices, abuse reports, admin actions, data export/delete requests.
-
-### Alerts
-
-- Page on sustained SLO burn, correctness violations, write unavailability, severe broker lag, or security incidents.
-- Ticket on slow capacity trends, moderate projection lag, rising retries, or low-priority DLQ growth.
-- Suppress duplicate alerts through incident correlation and route to service owners with runbook links.
-
-## 15. Cost Model And Trade-Offs
-
-### Cost Drivers
-
-- data-plane compute at peak QPS.
-- cache memory and replication factor.
-- analytics/event retention volume.
-- cross-region replication and egress.
-
-### Cost Formula
-
-```text
-monthly_cost = compute_hours
-             + primary_storage_tb_months
-             + replicated_storage_tb_months
-             + cache_memory_gb_hours
-             + event_log_retention_gb_months
-             + search_or_olap_storage_tb_months
-             + network_egress_tb
-             + observability_ingest_gb
-             + third_party_api_calls
-```
-
-Use current provider pricing during real planning. In interviews, explain the relative drivers and the levers rather than memorizing vendor-specific prices.
-
-### Cost Controls
-
-- Increase cache hit ratio and use request coalescing for expensive reads.
-- Tier cold data to cheaper storage and compact event/log retention.
-- Autoscale workers from queue depth and isolate expensive backfills from online traffic.
-- Sample high-volume telemetry while retaining all errors, audits, and business-critical events.
-- Use quotas and per-tenant budgets to prevent runaway cost.
-
-## 16. Key Trade-Offs
-
-| Decision | Option A | Option B | Interview Guidance |
-|---|---|---|---|
-| Consistency | Strong consistency | Eventual consistency | Use strong consistency for money, scarce inventory, access control, and metadata that gates safety; use eventual consistency for counters, feeds, analytics, and search. |
-| Fanout/projection | Compute on write | Compute on read | Write-time projections reduce read latency but increase write amplification; read-time computation is flexible but can fail at peak. |
-| Storage | Single general-purpose DB | Polyglot stores | Start simple, then split when access patterns, scale, or correctness boundaries justify it. |
-| Multi-region | Active-passive | Active-active | Active-passive is simpler; active-active needs conflict handling, data residency design, and stronger operational maturity. |
-| Build vs buy | Managed service | Custom platform | Buy undifferentiated primitives unless scale, cost, compliance, or product semantics require ownership. |
-
-## 17. Common Interview Follow-Ups
-
-- How does the design change at 10x traffic or with one extremely large tenant?
-- Which data must be strongly consistent and which can lag?
-- What is the exact partition key and how do you migrate when it becomes hot?
-- How do you replay events or rebuild projections without duplicating side effects?
-- What breaks during a regional outage and what is the expected RPO/RTO?
-- How do you detect abuse, data leakage, or unauthorized access?
-- What metrics prove the system is healthy from the user perspective?
-
-## 18. Final Interview Checklist
-
-- Clarify product scope and non-goals first.
-- State scale assumptions and convert them into QPS, storage, bandwidth, and partition counts.
-- Draw the read path, write path, async path, and operational path separately.
-- Identify the source of truth for every entity and every derived view.
-- Explain idempotency, retries, ordering, backpressure, and failure recovery.
-- Cover security, privacy, compliance, deployment, observability, and cost before closing.
-
-## 19. World-Class Interview Review
-
-### What A Strong Interview Answer Must Demonstrate
-
-- **Correctness boundary:** the canonical aggregate store and immutable event/audit history is the authority; derived caches, search indexes, dashboards, and analytics must be rebuildable.
-- **Hot path clarity:** start from `paste storage` and walk the synchronous command path before discussing secondary features.
-- **Service ownership:** explicitly assign responsibilities to Edge/API gateway, Control-plane API, Hot-path data-plane service, Shard manager, Policy/config cache, Async analytics pipeline; avoid vague boxes that do not own data or decisions.
-- **Data ownership:** ground the design in `canonical aggregate, idempotency, event, and audit tables` and explain partitioning, indexes, retention, and replay.
-- **Event model:** use `pastes.created.v1, pastes.updated.v1, pastes.state_changed.v1, pastes.deleted_or_expired.v1, pastes.policy_denied.v1, pastes.operation_failed.v1` to decouple slow work while preserving idempotency and ordering per aggregate.
-- **Operational maturity:** include backpressure, DLQs, reconciliation, runbooks, audit trails, and safe manual correction.
-
-### Bar-Raiser Drill-Down Prompts
-
-- Which service owns the final decision for `paste storage`, and what exact write makes it durable?
-- What is the idempotency key scope, and what happens if the same key is retried with a different payload?
-- Which read paths can be stale, and which user actions must revalidate against the source of truth?
-- What breaks during a dependency outage, and how does the system converge after callbacks or reports arrive late?
-- Which metric would page the on-call engineer before user-visible correctness, data safety, or money correctness is impacted?
-
-### Common Weak Answers To Avoid
-
-- Drawing only a generic API -> service -> database diagram without ownership boundaries.
-- Skipping idempotency, retries, duplicate callbacks, and reconciliation.
-- Putting all features on the synchronous path and ignoring backpressure or degradation.
-- Treating cache/search/analytics as source of truth for critical decisions.
-- Listing databases without explaining partition key, consistency model, retention, and recovery.
-
-### Domain-Specific Bar Raiser Notes
-- Name metadata authority, shard/replica placement, repair, compaction, and backup/restore path.
-- State read/write consistency guarantees and failure behavior.
-- Separate control plane from data plane.
-
-### 5-Minute Whiteboard Structure
-
-- First minute: scope actors, constraints, and `paste storage`.
-- Minutes 2-3: draw edge, command path, query path, async path, and data stores; name Edge/API gateway, Control-plane API, Hot-path data-plane service, Shard manager, Policy/config cache, Async analytics pipeline.
-- Minute 4: walk one critical flow and call out idempotency, consistency, and failure recovery.
-- Minute 5: close with scale bottlenecks, security/privacy, observability, cost, and trade-offs.
+### Key Trade-offs
+
+| Decision | Trade-off |
+|----------|-----------|
+| DynamoDB for slug lookup vs PostgreSQL | +Latency, +Scale, -Cost efficiency for small scale |
+| S3 for content vs PostgreSQL BYTEA | +Durability, +Scale, -Extra hop, -Complexity |
+| Eventual consistency for reads | +Performance, +Availability, -Immediate visibility |
+| Async highlighting | +Write latency reduction, -Brief window without highlights |
+| Soft delete with 30-day window | +Recovery, +Audit, -Storage cost, -Query complexity |
+| Content dedup via SHA-256 | +Storage savings, -Compute cost, -Can't modify stored content |
+| CQRS (separate read/write services) | +Independent scaling, -Eventual consistency, -More services |
+
+### Failure Modes and Mitigations
+
+| Failure | Impact | Mitigation |
+|---------|--------|------------|
+| S3 outage | Cannot read/write content | Multi-region replication; serve from Redis cache |
+| PostgreSQL down | Cannot create/lookup pastes | Read replica promotion; DynamoDB as fallback for reads |
+| Redis cluster failure | Cache miss storm | Circuit breaker; graceful degradation to DB |
+| Kafka down | Async processing stops | Highlight on-demand; queue to SQS as dead letter |
+| DynamoDB throttle | Slug lookups fail | Auto-scaling + burst capacity; Redis as L1 cache |
+| CloudFront origin failure | CDN cache expires | Stale-while-revalidate; origin shield |
+| Highlight service backlog | Pastes show raw text | Client-side highlight.js fallback; priority queue |
+
+### Future Enhancements
+
+1. **Real-time Collaboration**: WebSocket-based concurrent editing (like Google Docs)
+2. **AI Features**: Auto-generate titles, suggest related pastes, code completion
+3. **CI/CD Integration**: Run tests on paste content, show pass/fail badges
+4. **Custom Domains**: Allow Pro users to host pastes on their domain
+5. **Encryption at Client**: End-to-end encrypted pastes (server sees ciphertext only)
+6. **GraphQL API**: Flexible querying for frontend apps
+7. **Paste Collections**: Group related pastes into projects/notebooks
+8. **Export Formats**: PDF, image (carbon.now.sh style), EPUB for documentation pastes
