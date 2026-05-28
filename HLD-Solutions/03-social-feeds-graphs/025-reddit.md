@@ -1,233 +1,1080 @@
-# Design Reddit - Community Discussion & Voting Platform
+# System Design: Reddit
 
 ## 1. Functional Requirements
 
-- **Subreddits**: Community creation with rules, moderators, customization
-- **Posts**: Text, link, image, video, poll posts within subreddits
-- **Voting**: Upvote/downvote on posts and comments (determines ranking)
-- **Comments**: Threaded comment trees with infinite nesting
-- **Ranking algorithms**: Hot, Top (time-based), New, Controversial, Best
-- **Home feed**: Aggregated feed from subscribed subreddits
-- **r/all & r/popular**: Global trending content
-- **Awards/Medals**: Premium awards on posts/comments
-- **Moderation**: AutoModerator, mod queue, ban, remove, flair
-- **Search**: Subreddit, post, comment search
-- **User profiles**: Karma, post history, about section
-- **Cross-posting**: Share posts to multiple subreddits
-- **Live threads**: Real-time discussion for events
-- **Wiki**: Per-subreddit wiki pages
+### Core Features
+- **Subreddits**: Create/join communities with custom rules, flairs, sidebar, wiki
+- **Posts**: Submit text, link, image, video, poll posts to subreddits
+- **Voting**: Upvote/downvote posts and comments (one vote per user per item)
+- **Comments**: Threaded comment trees with infinite nesting, collapse/expand
+- **Karma**: Accumulated score from upvotes on user's posts/comments
+- **Awards**: Give premium awards (gold, silver, platinum) to posts/comments
+- **Moderation**: Remove posts, ban users, automod rules, mod queue, flair assignment
+- **Custom Feeds**: Multi-reddits combining multiple subreddits
+- **Saved Posts/Comments**: Bookmark content for later
+- **User Profiles**: Post history, comment history, karma breakdown
+- **Search**: Full-text search across posts, comments, subreddits
+- **Notifications**: Replies, mentions, mod actions, award received
+
+### Feed Types
+- **Home Feed**: Aggregated from subscribed subreddits
+- **r/all**: Global feed across all public subreddits
+- **Subreddit Feed**: Posts within a single community
+- **Sorting**: Hot, New, Top (hour/day/week/month/year/all), Rising, Controversial, Best
+
+---
 
 ## 2. Non-Functional Requirements
 
 | Requirement | Target |
 |---|---|
-| Availability | 99.9% |
-| Page load | < 500ms for hot page |
-| Vote processing | < 100ms acknowledgment |
-| Comment tree load | < 300ms for 1000+ comments |
-| Scale | 1.7B MAU, 100K active subreddits |
-| Voting consistency | Accurate within 1 minute |
-| Hot page freshness | Updated every 30-60 seconds |
-| Search freshness | Posts searchable within 5 minutes |
+| Availability | 99.99% uptime |
+| Feed Latency | < 200ms p99 |
+| Comment Tree Load | < 300ms p99 |
+| Vote Processing | < 100ms (async score update < 5s) |
+| DAU | 50M daily active users |
+| Post Throughput | 100M new posts/day (~1,150 posts/sec) |
+| Comment Throughput | 1B new comments/day (~11,500 comments/sec) |
+| Vote Throughput | 10B votes/day (~115,000 votes/sec) |
+| Search Latency | < 500ms p99 |
+| Data Durability | 99.999999999% (11 nines) |
+| Consistency | Eventual for scores/karma, strong for votes (no double-vote) |
+
+---
 
 ## 3. Capacity Estimation
 
-| Metric | Value |
-|---|---|
-| DAU | 100M |
-| Posts/day | 10M |
-| Comments/day | 100M |
-| Votes/day | 2B (posts + comments) |
-| Votes/sec (peak) | 50,000 |
-| Page views/day | 10B |
-| Page views/sec (peak) | 200,000 |
-| Active subreddits | 100K |
-| Avg comments per post | 50 (viral posts: 10K+) |
-| Storage (posts/day) | 10M × 5KB = 50 GB |
-| Storage (comments/day) | 100M × 1KB = 100 GB |
+### Traffic
+```
+DAU: 50M users
+Posts/day: 100M → ~1,150/sec
+Comments/day: 1B → ~11,500/sec
+Votes/day: 10B → ~115,000/sec
+Feed reads/day: 50M users × 20 feeds/day = 1B → ~11,500/sec
+Comment tree reads/day: 500M → ~5,800/sec
+Peak multiplier: 3x → votes peak: 345K/sec
+```
+
+### Storage
+```
+Posts:
+  - Avg post size: 2KB (metadata) + 5KB (content) = 7KB
+  - 100M/day × 7KB = 700GB/day → 255TB/year
+
+Comments:
+  - Avg comment: 1KB (metadata + body)
+  - 1B/day × 1KB = 1TB/day → 365TB/year
+
+Votes:
+  - Vote record: 32 bytes (user_id, item_id, direction, timestamp)
+  - 10B/day × 32B = 320GB/day → 117TB/year
+
+Media:
+  - 10% posts have images (avg 500KB): 10M × 500KB = 5TB/day
+  - 1% posts have video (avg 50MB): 1M × 50MB = 50TB/day
+
+Total storage growth: ~55TB/day, ~20PB/year
+```
+
+### Bandwidth
+```
+Ingress: posts + comments + votes + media = ~60TB/day ≈ 5.5 Gbps
+Egress: feed reads (1B × 50KB avg page) = 50PB/day ≈ 4.6 Tbps
+With CDN offloading 90% media: effective origin egress ≈ 460 Gbps
+```
+
+---
 
 ## 4. Data Modeling
 
+### PostgreSQL — Users, Subreddits, Subscriptions (Strong Consistency)
+
 ```sql
--- Subreddits
+-- Users table
+CREATE TABLE users (
+    user_id         BIGSERIAL PRIMARY KEY,
+    username        VARCHAR(20) UNIQUE NOT NULL,
+    email           VARCHAR(255) UNIQUE NOT NULL,
+    password_hash   VARCHAR(255) NOT NULL,
+    post_karma      BIGINT DEFAULT 0,
+    comment_karma   BIGINT DEFAULT 0,
+    award_karma     BIGINT DEFAULT 0,
+    cake_day        TIMESTAMP NOT NULL DEFAULT NOW(),
+    is_premium      BOOLEAN DEFAULT FALSE,
+    is_suspended    BOOLEAN DEFAULT FALSE,
+    avatar_url      VARCHAR(512),
+    created_at      TIMESTAMP DEFAULT NOW()
+);
+CREATE INDEX idx_users_username ON users(username);
+
+-- Subreddits table
 CREATE TABLE subreddits (
-    id BIGINT PRIMARY KEY,
-    name VARCHAR(21) UNIQUE, -- r/name, max 21 chars
-    title VARCHAR(100),
-    description TEXT,
-    sidebar TEXT,
-    subscriber_count INT DEFAULT 0,
-    active_users INT DEFAULT 0, -- online now
-    type VARCHAR(10), -- public, restricted, private
-    over_18 BOOLEAN DEFAULT FALSE,
-    created_by BIGINT,
-    created_at TIMESTAMP
+    subreddit_id    BIGSERIAL PRIMARY KEY,
+    name            VARCHAR(21) UNIQUE NOT NULL,  -- r/name max 21 chars
+    title           VARCHAR(100),
+    description     TEXT,
+    sidebar_md      TEXT,
+    subscriber_count BIGINT DEFAULT 0,
+    created_by      BIGINT REFERENCES users(user_id),
+    is_nsfw         BOOLEAN DEFAULT FALSE,
+    is_quarantined  BOOLEAN DEFAULT FALSE,
+    post_type       VARCHAR(20) DEFAULT 'any', -- any, text, link
+    created_at      TIMESTAMP DEFAULT NOW()
 );
+CREATE INDEX idx_subreddits_name ON subreddits(name);
+CREATE INDEX idx_subreddits_subscribers ON subreddits(subscriber_count DESC);
 
--- Posts
+-- Subscriptions
+CREATE TABLE subscriptions (
+    user_id         BIGINT REFERENCES users(user_id),
+    subreddit_id    BIGINT REFERENCES subreddits(subreddit_id),
+    subscribed_at   TIMESTAMP DEFAULT NOW(),
+    PRIMARY KEY (user_id, subreddit_id)
+);
+CREATE INDEX idx_subscriptions_subreddit ON subscriptions(subreddit_id);
+
+-- Moderators
+CREATE TABLE moderators (
+    user_id         BIGINT REFERENCES users(user_id),
+    subreddit_id    BIGINT REFERENCES subreddits(subreddit_id),
+    permissions     JSONB, -- {posts: true, comments: true, ban: true, flair: true}
+    added_at        TIMESTAMP DEFAULT NOW(),
+    PRIMARY KEY (user_id, subreddit_id)
+);
+```
+
+### Cassandra — Posts and Comments (High Write Throughput)
+
+```sql
+-- Posts table (partitioned by subreddit for feed queries)
 CREATE TABLE posts (
-    id BIGINT PRIMARY KEY, -- base36 encoded for URL
-    subreddit_id BIGINT,
-    author_id BIGINT,
-    title VARCHAR(300),
-    body TEXT, -- for self posts
-    url TEXT, -- for link posts
-    post_type VARCHAR(10), -- text, link, image, video, poll
-    score INT DEFAULT 0, -- upvotes - downvotes
-    upvotes INT DEFAULT 0,
-    downvotes INT DEFAULT 0,
-    comment_count INT DEFAULT 0,
-    hot_score FLOAT, -- pre-computed hot ranking
-    is_pinned BOOLEAN DEFAULT FALSE,
-    is_locked BOOLEAN DEFAULT FALSE,
-    is_removed BOOLEAN DEFAULT FALSE,
-    flair_text VARCHAR(50),
-    created_at TIMESTAMP
-);
-CREATE INDEX idx_posts_subreddit_hot ON posts(subreddit_id, hot_score DESC);
-CREATE INDEX idx_posts_subreddit_new ON posts(subreddit_id, created_at DESC);
-CREATE INDEX idx_posts_subreddit_top ON posts(subreddit_id, score DESC);
+    subreddit_id    BIGINT,
+    post_id         TIMEUUID,       -- time-sortable unique ID
+    author_id       BIGINT,
+    title           TEXT,
+    body            TEXT,           -- for text posts
+    url             TEXT,           -- for link posts
+    media_urls      LIST<TEXT>,     -- for image/video posts
+    post_type       TEXT,           -- text, link, image, video, poll
+    score           INT,
+    upvotes         INT,
+    downvotes       INT,
+    comment_count   INT,
+    is_pinned       BOOLEAN,
+    is_locked       BOOLEAN,
+    is_removed      BOOLEAN,
+    flair           TEXT,
+    created_at      TIMESTAMP,
+    PRIMARY KEY ((subreddit_id), created_at, post_id)
+) WITH CLUSTERING ORDER BY (created_at DESC, post_id DESC);
 
--- Comments (tree structure)
+-- Posts by author (for profile page)
+CREATE TABLE posts_by_author (
+    author_id       BIGINT,
+    post_id         TIMEUUID,
+    subreddit_id    BIGINT,
+    title           TEXT,
+    score           INT,
+    created_at      TIMESTAMP,
+    PRIMARY KEY ((author_id), created_at, post_id)
+) WITH CLUSTERING ORDER BY (created_at DESC, post_id DESC);
+
+-- Comments table (partitioned by post for tree loading)
 CREATE TABLE comments (
-    id BIGINT PRIMARY KEY,
-    post_id BIGINT,
-    parent_id BIGINT, -- NULL for top-level
-    author_id BIGINT,
-    body TEXT,
-    score INT DEFAULT 0,
-    upvotes INT DEFAULT 0,
-    downvotes INT DEFAULT 0,
-    depth INT DEFAULT 0,
-    path TEXT, -- materialized path: "root.parent.this" for tree queries
-    is_collapsed BOOLEAN DEFAULT FALSE,
-    created_at TIMESTAMP
-);
-CREATE INDEX idx_comments_post_path ON comments(post_id, path);
-CREATE INDEX idx_comments_post_score ON comments(post_id, score DESC);
-
--- Votes
-CREATE TABLE votes (
-    user_id BIGINT,
-    target_id BIGINT, -- post_id or comment_id
-    target_type VARCHAR(10), -- post, comment
-    direction SMALLINT, -- 1 (up), -1 (down), 0 (unvote)
-    created_at TIMESTAMP,
-    PRIMARY KEY (user_id, target_id)
-);
+    post_id         TIMEUUID,
+    comment_id      TIMEUUID,
+    parent_id       TIMEUUID,       -- NULL for top-level
+    author_id       BIGINT,
+    body            TEXT,
+    path            TEXT,           -- materialized path: "root/parent1/parent2/this"
+    depth           INT,
+    score           INT,
+    upvotes         INT,
+    downvotes       INT,
+    is_removed      BOOLEAN,
+    created_at      TIMESTAMP,
+    PRIMARY KEY ((post_id), path, comment_id)
+) WITH CLUSTERING ORDER BY (path ASC, comment_id ASC);
 ```
 
-## 5. High-Level Design
+### Redis — Hot Rankings, Vote Counts, Sessions
 
 ```
-┌────────────────────────────────────────────────────────────────────────┐
-│                        RANKING SYSTEM                                    │
-│                                                                          │
-│  HOT Algorithm (Reddit's classic):                                      │
-│  hot_score = log10(max(|score|, 1)) + sign(score) × t / 45000          │
-│  where t = (post_time - epoch) in seconds                               │
-│                                                                          │
-│  Properties:                                                             │
-│  - Logarithmic: 10 votes ≈ 100 votes (diminishing returns)             │
-│  - Time decay: newer posts get advantage                                 │
-│  - A post with 10 votes NOW beats post with 1000 votes yesterday        │
-│                                                                          │
-│  BEST Algorithm (Wilson Score for comments):                            │
-│  lower_bound = (p + z²/2n - z×√(p(1-p)/n + z²/4n²)) / (1 + z²/n)     │
-│  where p = upvotes/total_votes, z = 1.96 (95% confidence)              │
-│                                                                          │
-│  TOP: Simply sort by score (optionally within time window)              │
-│  NEW: Sort by created_at DESC                                            │
-│  CONTROVERSIAL: high total votes but close to 50/50 split              │
-└────────────────────────────────────────────────────────────────────────┘
+# Subreddit hot feed (sorted set: score = hot_score, member = post_id)
+ZADD subreddit:{id}:hot {hot_score} {post_id}
+ZADD subreddit:{id}:top:day {score} {post_id}
+ZADD subreddit:{id}:new {timestamp} {post_id}
+ZADD subreddit:{id}:rising {rising_score} {post_id}
 
-Architecture:
-  Vote → Kafka → Score Calculator → Update hot_score in DB + Redis Cache
-  Subreddit page request → Redis (hot page cached) → fallback DB query
-  Comment tree → Load full tree for post → sort by algorithm → serve
+# Global feeds
+ZADD global:hot {hot_score} {post_id}
+ZADD global:rising {rising_score} {post_id}
+
+# Vote counts (hash for fast atomic increment)
+HSET post:{id}:votes ups {count} downs {count}
+HSET comment:{id}:votes ups {count} downs {count}
+
+# User vote tracking (prevent double votes)
+HSET user:{uid}:post_votes {post_id} {1|-1}
+HSET user:{uid}:comment_votes {comment_id} {1|-1}
+
+# User karma cache
+HSET user:{uid}:karma post {val} comment {val} award {val}
+
+# Home feed cache (per user, expires after 5 min)
+ZRANGEBYSCORE user:{uid}:home_feed {min} {max}
 ```
 
-## 6. Comment Tree Handling
+### Elasticsearch — Search
 
-```
-Materialized Path Approach:
-  Comment tree stored with path column:
-  - Root comment: path = "001"
-  - Reply to root: path = "001.002"
-  - Reply to reply: path = "001.002.003"
-  
-  Loading tree for post:
-  SELECT * FROM comments WHERE post_id = X ORDER BY path;
-  → Returns pre-ordered tree traversal
-  
-  Loading subtree:
-  SELECT * FROM comments WHERE post_id = X AND path LIKE '001.002%';
-
-For deeply nested threads (Reddit's "continue this thread"):
-  - Load first 3 levels fully
-  - For deeper: "Continue this thread →" link (lazy load)
-  
-Performance at scale (posts with 10K+ comments):
-  - Cache top 200 comments (sorted by best) in Redis
-  - Load more on demand
-  - Collapse low-score comment trees by default
+```json
+{
+  "mappings": {
+    "properties": {
+      "post_id": { "type": "keyword" },
+      "subreddit": { "type": "keyword" },
+      "title": { "type": "text", "analyzer": "english" },
+      "body": { "type": "text", "analyzer": "english" },
+      "author": { "type": "keyword" },
+      "score": { "type": "integer" },
+      "comment_count": { "type": "integer" },
+      "created_at": { "type": "date" },
+      "flair": { "type": "keyword" },
+      "is_nsfw": { "type": "boolean" }
+    }
+  }
+}
 ```
 
-## 7. APIs
+---
+
+## 5. High-Level Architecture
 
 ```
-GET /api/v1/r/{subreddit}/hot?after=t3_abc&limit=25
-Response: {"posts": [...], "after": "t3_xyz"}
+┌─────────────────────────────────────────────────────────────────────────────────┐
+│                              CLIENTS                                             │
+│         Web App (React)  │  iOS App  │  Android App  │  3rd-party APIs          │
+└────────────────────────────────┬────────────────────────────────────────────────┘
+                                 │
+                          ┌──────▼──────┐
+                          │   CloudFront │  (CDN - media, static assets)
+                          │     / CDN    │
+                          └──────┬──────┘
+                                 │
+                          ┌──────▼──────┐
+                          │  API Gateway │  (Rate limiting, Auth, Routing)
+                          │   (Kong)     │
+                          └──────┬──────┘
+                                 │
+              ┌──────────────────┼──────────────────────────────────┐
+              │                  │                                   │
+     ┌────────▼───────┐  ┌──────▼──────┐  ┌────────────────┐  ┌───▼────────────┐
+     │  Post Service   │  │ Vote Service │  │ Comment Service│  │  Feed Service  │
+     │                 │  │              │  │                │  │                │
+     │ - Submit post   │  │ - Cast vote  │  │ - Add comment  │  │ - Home feed    │
+     │ - Edit/delete   │  │ - Undo vote  │  │ - Edit/delete  │  │ - Subreddit    │
+     │ - Media upload  │  │ - Get votes  │  │ - Load tree    │  │ - r/all        │
+     └───────┬─────────┘  └──────┬──────┘  └───────┬────────┘  │ - Sorting      │
+             │                    │                  │           └───┬────────────┘
+             │                    │                  │               │
+     ┌───────▼────────────────────▼──────────────────▼───────────────▼──────────┐
+     │                         Apache Kafka                                      │
+     │  Topics: posts, votes, comments, scores, karma, notifications, moderation│
+     └───────┬──────────────┬───────────────┬──────────────┬────────────────────┘
+             │              │               │              │
+     ┌───────▼───────┐ ┌───▼────────┐ ┌────▼─────┐ ┌─────▼──────────┐
+     │ Ranking Worker │ │Karma Worker│ │ Search   │ │ Notification   │
+     │ (Flink)       │ │ (Flink)    │ │ Indexer  │ │ Service        │
+     │               │ │            │ │          │ │                │
+     │ - Hot score   │ │ - Aggregate│ │ - Index  │ │ - Push notif   │
+     │ - Rising      │ │   karma    │ │   to ES  │ │ - Inbox        │
+     │ - Controversial│ │ - Anti-spam│ │          │ │ - Email digest │
+     └───────┬───────┘ └───┬────────┘ └────┬─────┘ └───────────────┘
+             │              │               │
+     ┌───────▼──────────────▼───────────────▼───────────────────────────────────┐
+     │                          DATA LAYER                                       │
+     │                                                                           │
+     │  ┌──────────┐  ┌───────────┐  ┌───────────┐  ┌────────────┐  ┌───────┐ │
+     │  │PostgreSQL │  │ Cassandra  │  │   Redis    │  │Elasticsearch│ │  S3   │ │
+     │  │           │  │            │  │  Cluster   │  │  Cluster   │  │       │ │
+     │  │- Users    │  │- Posts     │  │- Hot feeds │  │- Full-text │  │-Media │ │
+     │  │- Subreddits│ │- Comments  │  │- Vote cache│  │  search    │  │-Backup│ │
+     │  │- Subs     │  │- Votes log │  │- Sessions  │  │- Autocomplete│ │     │ │
+     │  │- Mods     │  │            │  │- Rankings  │  │            │  │       │ │
+     │  └──────────┘  └───────────┘  └───────────┘  └────────────┘  └───────┘ │
+     └──────────────────────────────────────────────────────────────────────────┘
+     
+     ┌──────────────────────────────────────────────────────────────────────────┐
+     │                       SUPPORTING SERVICES                                 │
+     │                                                                           │
+     │  ┌──────────────┐  ┌──────────────┐  ┌──────────────┐  ┌─────────────┐ │
+     │  │ Moderation   │  │  Award       │  │  Auth        │  │ Anti-Abuse  │ │
+     │  │ Service      │  │  Service     │  │  Service     │  │ Service     │ │
+     │  │              │  │              │  │              │  │             │ │
+     │  │ - AutoMod    │  │ - Give award │  │ - Login/SSO  │  │ - Vote fuzz │ │
+     │  │ - Mod queue  │  │ - Coin mgmt  │  │ - OAuth2     │  │ - Spam det  │ │
+     │  │ - Ban users  │  │ - Premium    │  │ - JWT tokens │  │ - Bot detect│ │
+     │  └──────────────┘  └──────────────┘  └──────────────┘  └─────────────┘ │
+     └──────────────────────────────────────────────────────────────────────────┘
+```
 
-GET /api/v1/r/{subreddit}/comments/{post_id}?sort=best&limit=200
-Response: {"post": {...}, "comments": [tree structure]}
+---
 
+## 6. Low-Level Design — APIs
+
+### Submit Post
+
+```
+POST /api/v1/subreddits/{subreddit_name}/posts
+Authorization: Bearer {token}
+
+Request:
+{
+  "title": "TIL about Reddit's ranking algorithm",
+  "type": "text",           // text | link | image | video | poll
+  "body": "The hot ranking uses...",
+  "flair_id": "abc123",
+  "nsfw": false,
+  "spoiler": false
+}
+
+Response: 201 Created
+{
+  "post_id": "t3_xyz789",
+  "subreddit": "todayilearned",
+  "title": "TIL about Reddit's ranking algorithm",
+  "author": "user123",
+  "score": 1,
+  "upvote_ratio": 1.0,
+  "comment_count": 0,
+  "created_utc": 1700000000,
+  "permalink": "/r/todayilearned/comments/xyz789/til_about_reddits_ranking/"
+}
+```
+
+### Vote
+
+```
 POST /api/v1/vote
-Request: {"target": "t3_abc", "direction": 1}
-Response: {"ok": true, "new_score": 1543}
+Authorization: Bearer {token}
 
-POST /api/v1/r/{subreddit}/submit
-Request: {"title": "...", "body": "...", "type": "text", "flair": "Discussion"}
-Response: {"post": {"id": "t3_new", "url": "/r/subreddit/comments/new/..."}}
+Request:
+{
+  "id": "t3_xyz789",       // t3_ = post, t1_ = comment
+  "direction": 1            // 1 = upvote, -1 = downvote, 0 = unvote
+}
 
-POST /api/v1/comment
-Request: {"parent": "t3_abc", "body": "Great post!"}
-Response: {"comment": {"id": "t1_xyz", ...}}
+Response: 200 OK
+{
+  "success": true,
+  "new_score": 42,
+  "upvote_ratio": 0.89
+}
 ```
 
-## 8. Optimization
-
+**Vote Processing Flow:**
 ```
-Caching:
-- Hot page per subreddit: Redis sorted set, recomputed every 30s
-- Top 200 comments per viral post: Redis hash
-- Vote counts: Redis counter, flush to DB every 5 minutes
-- User karma: computed async, cached in Redis
-
-Vote Processing:
-- Immediate: Redis INCR for real-time score display
-- Async: Kafka event → update hot_score → rerank page
-- Anti-gaming: shadow-ban suspected bot votes
-- Rate limit: max 100 votes/minute per user
-
-Home Feed:
-- User subscribes to 50 subreddits on average
-- Feed = merge top posts from each subscribed subreddit
-- Weighted by subreddit size and user engagement history
-- Cache home feed per user (TTL 5 min)
+1. Check user hasn't already voted same direction (Redis HGET)
+2. If changing vote: subtract old, add new (atomic)
+3. Write to Kafka topic "votes"
+4. Ranking Worker consumes → recalculates hot/rising scores
+5. Karma Worker consumes → updates author's karma
+6. Update Redis sorted sets for affected feeds
 ```
 
-## 9. Observability & Considerations
+### Comment
 
-```yaml
-Metrics: vote_processing_latency, hot_page_cache_hit_rate, comment_tree_load_time
-Alerts: vote_lag > 60s, cache_miss > 20%, page_load > 2s
+```
+POST /api/v1/posts/{post_id}/comments
+Authorization: Bearer {token}
+
+Request:
+{
+  "parent_id": "t1_abc123",  // null for top-level comment
+  "body": "Great explanation! Here's more detail..."
+}
+
+Response: 201 Created
+{
+  "comment_id": "t1_def456",
+  "parent_id": "t1_abc123",
+  "author": "commenter99",
+  "body": "Great explanation! Here's more detail...",
+  "score": 1,
+  "depth": 2,
+  "created_utc": 1700001000,
+  "replies": []
+}
 ```
 
-### Key Trade-offs
-| Choice | Benefit | Cost |
+### Get Subreddit Feed
+
+```
+GET /api/v1/subreddits/{name}/posts?sort=hot&after=t3_abc&limit=25
+Authorization: Bearer {token} (optional)
+
+Response: 200 OK
+{
+  "subreddit": "programming",
+  "sort": "hot",
+  "posts": [
+    {
+      "post_id": "t3_xyz789",
+      "title": "New Rust release...",
+      "author": "rustfan",
+      "score": 4521,
+      "upvote_ratio": 0.94,
+      "comment_count": 312,
+      "created_utc": 1699990000,
+      "thumbnail": "https://cdn.reddit.com/...",
+      "flair": { "text": "Discussion", "color": "#0079d3" },
+      "awards": [{"name": "Gold", "count": 2}],
+      "is_stickied": false
+    }
+    // ... 24 more
+  ],
+  "after": "t3_lastid",
+  "before": null
+}
+```
+
+**Feed Assembly (sort=hot):**
+```
+1. ZREVRANGEBYSCORE subreddit:{id}:hot +inf -inf LIMIT offset 25
+2. MGET post:{id1}, post:{id2}, ... (cached post objects)
+3. If cache miss → batch read from Cassandra
+4. Annotate with user's votes: HMGET user:{uid}:post_votes id1 id2 ...
+5. Return assembled feed
+```
+
+### Get Comment Tree
+
+```
+GET /api/v1/posts/{post_id}/comments?sort=best&depth=5&limit=200
+Authorization: Bearer {token} (optional)
+
+Response: 200 OK
+{
+  "post_id": "t3_xyz789",
+  "comments": [
+    {
+      "comment_id": "t1_aaa",
+      "author": "user1",
+      "body": "Top-level comment",
+      "score": 500,
+      "depth": 0,
+      "created_utc": 1699991000,
+      "replies": [
+        {
+          "comment_id": "t1_bbb",
+          "author": "user2",
+          "body": "Reply to top-level",
+          "score": 120,
+          "depth": 1,
+          "replies": [
+            // nested further...
+          ]
+        }
+      ],
+      "more_replies": { "count": 15, "ids": ["t1_ccc", "t1_ddd"] }
+    }
+  ],
+  "total_comments": 312
+}
+```
+
+---
+
+## 7. Deep Dive: Ranking Algorithms
+
+### Hot Algorithm (Reddit's actual formula)
+
+The hot ranking determines the order of posts in the "Hot" sort. It balances recency with popularity.
+
+```python
+import math
+from datetime import datetime
+
+EPOCH = datetime(2005, 12, 8, 7, 46, 43)  # Reddit's epoch
+
+def hot_score(ups, downs, created_at):
+    """
+    Reddit's Hot Ranking Algorithm
+    
+    Score = sign(votes) * log10(max(|votes|, 1)) + age_bonus
+    
+    Where age_bonus = (created_seconds - epoch_seconds) / 45000
+    
+    Key properties:
+    - 10 votes in first hour ≈ 100 votes in second hour ≈ 1000 votes in third hour
+    - Each order of magnitude of votes = ~12.5 hours of age
+    - New posts get a boost, old posts decay naturally
+    """
+    score = ups - downs
+    order = math.log10(max(abs(score), 1))
+    sign = 1 if score > 0 else -1 if score < 0 else 0
+    
+    # Seconds since Reddit epoch
+    epoch_seconds = (created_at - EPOCH).total_seconds()
+    
+    # 45000 seconds = 12.5 hours
+    # Every 12.5 hours, a post needs 10x more votes to stay in same position
+    hot = sign * order + epoch_seconds / 45000.0
+    
+    return round(hot, 7)
+```
+
+**Key insight:** The time component is absolute (not relative), meaning newer posts always have higher base scores. A post with 10 points now scores higher than a post with 10 points from yesterday.
+
+### Wilson Score (Best Comment Sorting)
+
+For comments, Reddit uses the Wilson score confidence interval lower bound. This produces better results than simple upvote-downvote because it accounts for sample size.
+
+```python
+import math
+
+def wilson_score_interval(ups, downs, confidence=0.95):
+    """
+    Wilson Score Confidence Interval (Lower Bound)
+    
+    Used for "Best" comment sorting.
+    
+    Formula:
+    lower_bound = (p̂ + z²/2n - z√(p̂(1-p̂)/n + z²/4n²)) / (1 + z²/n)
+    
+    Where:
+    - p̂ = observed fraction of positive ratings = ups / (ups + downs)
+    - n = total ratings = ups + downs
+    - z = z-score for confidence level (1.96 for 95%)
+    
+    Properties:
+    - Balances proportion of upvotes with total sample size
+    - A comment with 1 up / 0 down ranks LOWER than 100 up / 10 down
+    - Handles new comments fairly (uncertainty pushes score down)
+    """
+    n = ups + downs
+    if n == 0:
+        return 0.0
+    
+    z = 1.96 if confidence == 0.95 else 1.281  # Reddit uses z=1.281 (80%)
+    p_hat = float(ups) / n
+    
+    numerator = (p_hat + z*z/(2*n) - 
+                 z * math.sqrt((p_hat*(1-p_hat) + z*z/(4*n)) / n))
+    denominator = 1 + z*z/n
+    
+    return numerator / denominator
+```
+
+### Controversial Score
+
+```python
+def controversial_score(ups, downs):
+    """
+    Controversial Ranking
+    
+    A post/comment is controversial when it has many votes split nearly evenly.
+    
+    Formula: (ups + downs) ^ (min(ups,downs) / max(ups,downs))
+    
+    Properties:
+    - Maximized when ups ≈ downs (ratio → 1.0)
+    - Higher total votes = more controversial
+    - 50 up / 50 down scores higher than 5 up / 5 down
+    """
+    if ups <= 0 or downs <= 0:
+        return 0
+    
+    magnitude = ups + downs
+    balance = float(min(ups, downs)) / max(ups, downs)
+    
+    return magnitude ** balance
+```
+
+### Rising Score
+
+```python
+def rising_score(ups, downs, age_hours):
+    """
+    Rising: identifies posts gaining traction quickly.
+    
+    Simple approach: vote velocity (votes per hour) weighted by recency.
+    Only considers posts < 24 hours old.
+    """
+    if age_hours > 24 or age_hours == 0:
+        return 0
+    
+    net_votes = ups - downs
+    velocity = net_votes / age_hours
+    recency_boost = max(0, 1.0 - age_hours / 24.0)
+    
+    return velocity * recency_boost
+```
+
+### Score Computation Pipeline
+
+```
+Vote Event → Kafka "votes" topic
+    │
+    ▼
+Flink Streaming Job:
+    1. Aggregate votes in 1-second tumbling windows
+    2. For each post with new votes:
+       a. Fetch current ups/downs from Redis
+       b. Compute hot_score(ups, downs, created_at)
+       c. Compute controversial_score(ups, downs)
+       d. Compute rising_score(ups, downs, age)
+    3. Update Redis sorted sets:
+       - ZADD subreddit:{id}:hot {hot_score} {post_id}
+       - ZADD subreddit:{id}:controversial {controversial_score} {post_id}
+       - ZADD subreddit:{id}:rising {rising_score} {post_id}
+    4. Update r/all sorted sets if score > threshold
+```
+
+---
+
+## 8. Deep Dive: Comment Tree Structure
+
+### Approach Comparison
+
+| Approach | Read | Write | Move | Storage | Pagination |
+|---|---|---|---|---|---|
+| **Adjacency List** | O(n) recursive | O(1) | O(1) | Minimal | Hard |
+| **Materialized Path** | O(n) prefix scan | O(1) | O(subtree) | Path strings | Easy |
+| **Nested Sets** | O(1) range query | O(n) update | O(n) | Two integers | Easy |
+| **Closure Table** | O(depth) | O(depth) | O(subtree²) | Ancestor pairs | Medium |
+
+### Reddit's Approach: Materialized Path (Chosen)
+
+Reddit uses materialized paths because:
+1. Comments are append-heavy (never moved)
+2. Tree reads need subtree pagination (prefix scan is natural)
+3. Write cost is O(1) — just compute parent path + "/" + new_id
+4. Depth-limited loading is trivial
+
+```
+Path encoding example:
+  Top-level:  "00001"
+  Reply:      "00001/00001"
+  Deep reply: "00001/00001/00003"
+
+Each segment is zero-padded to allow lexicographic sorting.
+Segment = position among siblings (by sort order, not insertion order).
+```
+
+### Tree Loading Algorithm
+
+```python
+def load_comment_tree(post_id, sort="best", depth_limit=5, limit=200):
+    """
+    Efficient comment tree loading with depth-limited pagination.
+    
+    Strategy:
+    1. Load all comments for the post (or top N by sort)
+    2. Build tree in memory
+    3. Truncate at depth_limit, create "more" stubs
+    """
+    
+    # Step 1: Fetch sorted top-level comments
+    if sort == "best":
+        # Get top-level comments sorted by Wilson score
+        top_level = query("""
+            SELECT * FROM comments 
+            WHERE post_id = ? AND depth = 0
+            ORDER BY wilson_score DESC
+            LIMIT ?
+        """, post_id, limit)
+    elif sort == "new":
+        top_level = query("""
+            SELECT * FROM comments 
+            WHERE post_id = ? AND depth = 0
+            ORDER BY created_at DESC
+            LIMIT ?
+        """, post_id, limit)
+    elif sort == "top":
+        top_level = query("""
+            SELECT * FROM comments 
+            WHERE post_id = ? AND depth = 0
+            ORDER BY score DESC
+            LIMIT ?
+        """, post_id, limit)
+    
+    # Step 2: For each top-level comment, load subtree to depth_limit
+    tree = []
+    for comment in top_level:
+        subtree = load_subtree(post_id, comment.path, depth_limit, sort)
+        comment.replies = subtree
+        tree.append(comment)
+    
+    return tree
+
+
+def load_subtree(post_id, parent_path, depth_limit, sort, max_children=10):
+    """
+    Load replies under a comment using materialized path prefix scan.
+    
+    Cassandra query: path LIKE 'parent_path/%' AND depth <= parent_depth + depth_limit
+    """
+    
+    # Fetch all descendants within depth limit
+    descendants = query("""
+        SELECT * FROM comments
+        WHERE post_id = ? 
+          AND path > ? AND path < ?
+          AND depth <= ?
+    """, post_id, 
+         parent_path,           # start (exclusive parent itself)
+         parent_path + "\xff",  # end (lexicographic upper bound)
+         get_depth(parent_path) + depth_limit)
+    
+    # Build in-memory tree from flat list
+    tree = build_tree_from_flat(descendants, parent_path, sort, max_children)
+    return tree
+
+
+def build_tree_from_flat(comments, root_path, sort, max_children):
+    """
+    Convert flat list of comments into nested tree structure.
+    
+    Algorithm:
+    1. Group comments by parent path
+    2. Sort each group by ranking function
+    3. Recursively assemble tree
+    4. Truncate siblings at max_children, add "more" stubs
+    """
+    # Group by parent
+    children_map = defaultdict(list)
+    for c in comments:
+        parent = c.path.rsplit("/", 1)[0] if "/" in c.path else ""
+        children_map[parent].append(c)
+    
+    # Sort each group
+    sort_fn = {
+        "best": lambda c: -wilson_score_interval(c.ups, c.downs),
+        "top": lambda c: -c.score,
+        "new": lambda c: -c.created_at.timestamp(),
+        "controversial": lambda c: -controversial_score(c.ups, c.downs),
+    }[sort]
+    
+    for parent in children_map:
+        children_map[parent].sort(key=sort_fn)
+    
+    # Recursive tree assembly
+    def assemble(path):
+        children = children_map.get(path, [])
+        visible = children[:max_children]
+        hidden = children[max_children:]
+        
+        result = []
+        for child in visible:
+            child.replies = assemble(child.path)
+            result.append(child)
+        
+        if hidden:
+            result.append(MoreReplies(
+                count=len(hidden),
+                ids=[h.comment_id for h in hidden[:100]]
+            ))
+        
+        return result
+    
+    return assemble(root_path)
+```
+
+### "Load More Comments" API
+
+```
+GET /api/v1/morechildren?post_id=t3_xyz&children=t1_a,t1_b,t1_c&sort=best
+
+Response:
+{
+  "comments": [
+    { "comment_id": "t1_a", "body": "...", "depth": 3, "replies": [...] },
+    { "comment_id": "t1_b", "body": "...", "depth": 3, "replies": [...] }
+  ]
+}
+```
+
+### Optimizations for Hot Posts
+
+For posts with 10K+ comments (viral threads):
+1. **Pre-computed top tree**: Background job pre-builds the top 200 comments tree, cached in Redis
+2. **Lazy loading**: Only top 3 depth levels loaded initially
+3. **Comment count threshold**: Beyond 500 replies to a single comment, only show top 10 with "load more"
+
+---
+
+## 9. Component Optimization
+
+### Kafka: Vote Propagation Pipeline
+
+```
+Topics:
+  - votes (partitioned by item_id for ordering per item)
+  - score-updates (ranking worker output)
+  - karma-updates (karma worker output)
+  - notifications (fan-out to notification service)
+  - moderation-events (automod triggers)
+
+Partitioning Strategy:
+  - votes: partition by hash(item_id) — ensures all votes for a post are sequential
+  - score-updates: partition by subreddit_id — locality for feed updates
+  
+Configuration:
+  - Partitions: 256 per topic
+  - Replication factor: 3
+  - Retention: 7 days for votes, 30 days for others
+  - Compression: lz4 (low latency)
+  - Consumer groups: ranking-workers, karma-workers, search-indexers, notifiers
+```
+
+### Redis Sorted Sets: Feed Rankings
+
+```
+Memory estimation for sorted sets:
+  - Average subreddit: 1000 hot posts in sorted set
+  - Entry size: ~80 bytes (16-byte member + 8-byte score + overhead)
+  - 3M subreddits × 1000 posts × 80 bytes = 240GB Redis
+  - Use Redis Cluster with 50 shards × 5GB each + replication
+
+TTL Strategy:
+  - Hot/Rising feeds: Recomputed continuously, TTL on individual entries (48h)
+  - Top/day: Rebuilt daily at midnight UTC, TTL 25h
+  - Top/week: Rebuilt weekly, TTL 8 days
+  - New: No TTL needed (natural time ordering, just trim at 1000 entries)
+
+Pipeline optimization for feed reads:
+  PIPELINE {
+    ZREVRANGE subreddit:123:hot 0 24        # Get 25 post IDs
+    HMGET post:id1 title score author ...    # Batch fetch post data
+    HMGET user:uid:post_votes id1 id2 ...   # Batch fetch user's votes
+  }
+```
+
+### Pre-computed Scores
+
+```
+For hot posts (>100 upvotes), scores are pre-computed and stored:
+
+1. Real-time tier (< 100 posts/sec):
+   - Recompute on every vote in Flink streaming
+   - < 1 second staleness
+
+2. Warm tier (100-1000 posts/sec):  
+   - Batch recompute every 30 seconds
+   - Aggregate votes in window, update scores
+
+3. Cold tier (old posts):
+   - Score frozen after 6 months (archived posts)
+   - No recomputation needed
+```
+
+### Database Sharding
+
+```
+PostgreSQL Sharding (Citus):
+  - Users: hash(user_id) → 64 shards
+  - Subreddits: hash(subreddit_id) → 32 shards
+  - Subscriptions: colocated with users (hash user_id)
+
+Cassandra Sharding (native):
+  - Posts: partition key = subreddit_id
+    - Hot subreddits (r/askreddit, r/pics) get their own nodes
+    - Virtual nodes (vnodes) handle distribution
+  - Comments: partition key = post_id
+    - Viral posts (100K+ comments) may hotspot
+    - Mitigation: bucket by (post_id, depth_bucket) for very large threads
+  - Votes: partition key = item_id (post_id or comment_id)
+
+Cassandra cluster sizing:
+  - 100 nodes, RF=3
+  - 10TB per node
+  - Total: 1PB raw capacity → 333TB effective
+```
+
+### Apache Flink: Real-Time Karma Computation
+
+```java
+// Flink streaming job for karma aggregation
+DataStream<VoteEvent> votes = env
+    .addSource(new FlinkKafkaConsumer<>("votes", schema, props));
+
+// Keyed by author_id, tumbling window of 10 seconds
+votes
+    .keyBy(VoteEvent::getAuthorId)
+    .window(TumblingProcessingTimeWindows.of(Time.seconds(10)))
+    .aggregate(new KarmaAggregator())
+    .addSink(new RedisSink<>(redisConfig, new KarmaRedisMapper()));
+
+// KarmaAggregator accumulates: sum of (direction) per author
+// Writes delta to Redis: HINCRBY user:{uid}:karma post {delta}
+// Periodic flush to PostgreSQL every 5 minutes for durability
+```
+
+### Home Feed Generation
+
+```
+Strategy: Hybrid push-pull
+
+For users subscribed to < 50 subreddits:
+  - PULL: At read time, merge top posts from each subscribed subreddit
+  - ZUNIONSTORE user:{uid}:home_feed subreddit:1:hot subreddit:2:hot ...
+  - Cache result for 5 minutes
+  - Complexity: O(N × M) where N=subreddits, M=posts per sub
+
+For users subscribed to > 50 subreddits:
+  - PRE-COMPUTED: Background job builds home feed every 5 minutes
+  - Sample from subscriptions (weighted by subreddit activity)
+  - Store top 500 posts in Redis sorted set
+
+r/all generation:
+  - Global sorted set updated by ranking worker
+  - Posts qualify if score > dynamic threshold (based on subreddit size)
+  - Filtered by user's blocked subreddits at read time
+```
+
+---
+
+## 10. Observability, Anti-Manipulation & Considerations
+
+### Observability
+
+```
+Metrics (Prometheus + Grafana):
+  - vote_processing_latency_p99
+  - feed_generation_latency_p99
+  - comment_tree_load_latency_p99
+  - kafka_consumer_lag (per topic, per partition)
+  - redis_memory_usage_percent
+  - cassandra_read_latency_p99
+  - hot_score_staleness_seconds
+  - active_users_realtime (gauge)
+
+Distributed Tracing (Jaeger):
+  - Trace: vote → kafka → ranking_worker → redis_update → feed_served
+  - Trace: comment_post → tree_rebuild → cache_invalidation
+
+Logging (ELK Stack):
+  - Structured JSON logs with request_id, user_id, subreddit_id
+  - Moderation action audit log (immutable)
+  - Vote audit trail (for anti-manipulation forensics)
+
+Alerting:
+  - Vote processing lag > 30 seconds
+  - Feed cache hit rate < 80%
+  - Error rate > 0.1% on any service
+  - Cassandra hotspot detection (partition size > 100MB)
+```
+
+### Anti-Manipulation: Vote Fuzzing
+
+```python
+def fuzz_vote_display(actual_ups, actual_downs):
+    """
+    Reddit fuzzes displayed vote counts to prevent manipulation detection.
+    
+    The SCORE (ups - downs) is accurate, but individual ups/downs are fuzzed.
+    This prevents bots from knowing if their votes are being counted.
+    """
+    import random
+    
+    # Fuzz amount scales with total votes (more votes = more fuzz)
+    total = actual_ups + actual_downs
+    fuzz_range = max(1, int(total * 0.05))  # ±5% fuzz
+    
+    fuzz = random.randint(-fuzz_range, fuzz_range)
+    
+    displayed_ups = actual_ups + fuzz
+    displayed_downs = actual_downs + fuzz  # Same fuzz to preserve score
+    
+    return displayed_ups, displayed_downs
+
+
+def detect_vote_manipulation(user_id, target_id, request_context):
+    """
+    Multi-signal vote manipulation detection.
+    """
+    signals = {
+        "same_ip_cluster": check_ip_cluster(request_context.ip),
+        "timing_pattern": check_burst_votes(user_id, window=60),
+        "user_age": get_account_age(user_id),
+        "vote_diversity": check_vote_target_diversity(user_id),
+        "device_fingerprint": check_fingerprint_reuse(request_context),
+        "network_graph": check_coordinated_voting(target_id, window=300),
+    }
+    
+    risk_score = calculate_risk(signals)
+    
+    if risk_score > 0.9:
+        shadow_nullify_vote(user_id, target_id)  # Vote appears to count but doesn't
+    elif risk_score > 0.7:
+        flag_for_review(user_id, target_id, signals)
+    
+    return risk_score
+```
+
+### Rate Limiting
+
+```
+Tiered rate limiting:
+  - Anonymous:     10 requests/minute
+  - Authenticated: 60 requests/minute  
+  - Posts:         1 post per 10 minutes per subreddit
+  - Comments:      1 comment per 3 seconds
+  - Votes:         30 votes per minute (prevent rapid-fire)
+  - API clients:   60 requests/minute (OAuth)
+
+Implementation: Token bucket in Redis
+  Key: ratelimit:{user_id}:{action}
+  MULTI
+    INCR key
+    EXPIRE key {window_seconds}
+  EXEC
+  
+  If count > limit: return 429 Too Many Requests
+```
+
+### Additional Considerations
+
+**Content Delivery:**
+- Images/videos served via CloudFront CDN
+- Transcoding pipeline: video uploaded → S3 → MediaConvert → HLS adaptive streaming
+- Image processing: thumbnail generation, EXIF stripping, NSFW detection (ML model)
+
+**Spam Detection:**
+- ML model scoring new posts/comments (features: account age, karma, content similarity, link reputation)
+- AutoMod rules (regex-based per-subreddit, maintained by moderators)
+- Shadowban: user sees their content, but nobody else does
+
+**Data Retention:**
+- Posts/comments: indefinite (archived after 6 months, no new votes/comments)
+- Vote records: 2 years (for anti-manipulation), then aggregated
+- Deleted content: soft delete (body replaced with "[deleted]"), metadata retained
+- GDPR: full user data export, hard delete after 30-day grace period
+
+**Disaster Recovery:**
+- Multi-region active-passive for PostgreSQL (us-east primary, us-west standby)
+- Cassandra multi-DC with LOCAL_QUORUM reads, EACH_QUORUM for critical writes
+- Redis: sentinel-managed failover, AOF persistence, hourly RDB snapshots to S3
+- RPO: < 1 minute, RTO: < 5 minutes
+
+**Scaling Challenges:**
+- Thundering herd on viral posts: use request coalescing (singleflight pattern)
+- r/all computation: dedicated cluster with 1-minute staleness acceptable
+- AMA events: pre-provision capacity for known celebrity AMAs
+- Subreddit creation spam: require minimum karma + account age
+
+---
+
+## Summary
+
+| Component | Technology | Purpose |
 |---|---|---|
-| Pre-computed hot scores | Fast page loads | Async update (30s staleness) |
-| Materialized path for comments | Efficient tree loading | Path string storage overhead |
-| Vote fuzzing (Reddit feature) | Anti-bot/gaming | Users see approximate scores |
-| Cached vote counts | Fast reads at scale | Eventually consistent (acceptable) |
+| User/Subreddit store | PostgreSQL (Citus) | Strong consistency, relational queries |
+| Posts/Comments store | Cassandra | High write throughput, partition by subreddit/post |
+| Feed rankings | Redis Sorted Sets | Sub-millisecond feed reads |
+| Vote processing | Kafka + Flink | Async, exactly-once score computation |
+| Search | Elasticsearch | Full-text search with relevance scoring |
+| Media | S3 + CloudFront + MediaConvert | Storage, CDN, transcoding |
+| API Gateway | Kong | Rate limiting, auth, routing |
+| Monitoring | Prometheus + Grafana + Jaeger | Metrics, tracing, alerting |
