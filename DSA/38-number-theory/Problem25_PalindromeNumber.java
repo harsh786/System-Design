@@ -1,0 +1,25 @@
+package numbertheory;
+
+/**
+ * Problem 25: Palindrome Number (LeetCode 9)
+ * 
+ * Approach: Reverse half the number and compare.
+ * 
+ * Time Complexity: O(log n)
+ * Space Complexity: O(1)
+ */
+public class Problem25_PalindromeNumber {
+    
+    public boolean isPalindrome(int x) {
+        if (x < 0 || (x != 0 && x % 10 == 0)) return false;
+        int rev = 0;
+        while (x > rev) { rev = rev * 10 + x % 10; x /= 10; }
+        return x == rev || x == rev / 10;
+    }
+    
+    public static void main(String[] args) {
+        Problem25_PalindromeNumber sol = new Problem25_PalindromeNumber();
+        System.out.println(sol.isPalindrome(121));  // true
+        System.out.println(sol.isPalindrome(-121)); // false
+    }
+}
