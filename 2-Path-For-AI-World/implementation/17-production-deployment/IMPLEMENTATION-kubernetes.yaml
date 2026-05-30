@@ -1,0 +1,1306 @@
+# Production Kubernetes Manifests for AI System
+---
+# =============================================================================
+# NAMESPACE
+# =============================================================================
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: ai-production
+  labels:
+    app.kubernetes.io/part-of: ai-platform
+    istio-injection: enabled
+
+---
+# =============================================================================
+# CONFIGMAPS - Prompts and Configuration
+# =============================================================================
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: prompt-configs
+  namespace: ai-production
+  labels:
+    app.kubernetes.io/component: prompts
+    version: "v6"
+data:
+  system_prompt.txt: |
+    You are a helpful AI assistant for our platform. You have access to tools
+    and can retrieve information from our knowledge base. Always cite your sources.
+    If you're unsure, say so. Never fabricate information.
+    
+    Guidelines:
+    - Be concise and accurate
+    - Use tools when needed
+    - Cite retrieved documents
+    - Refuse harmful requests politely
+  
+  rag_prompt.txt: |
+    Answer the user's question based on the following retrieved context.
+    If the context doesn't contain relevant information, say "I don't have
+    enough information to answer that question."
+    
+    Context:
+    {context}
+    
+    Question: {question}
+    
+    Answer:
+
+  guardrail_prompt.txt: |
+    Evaluate the following AI response for safety and accuracy.
+    Check for: harmful content, PII leakage, hallucination indicators,
+    off-topic responses, and policy violations.
+    
+    Response to evaluate:
+    {response}
+    
+    Return JSON: {"safe": bool, "issues": [], "confidence": float}
+
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: app-config
+  namespace: ai-production
+data:
+  config.yaml: |
+    server:
+      host: "0.0.0.0"
+      port: 8080
+      workers: 4
+      timeout: 120
+    
+    ai_gateway:
+      primary_provider: "openai"
+      fallback_providers: ["anthropic", "azure_openai"]
+      timeout: 60
+      max_retries: 3
+      retry_delay: 1.0
+      cache_enabled: true
+      cache_ttl: 3600
+    
+    models:
+      default: "gpt-4o-2024-08-06"
+      embedding: "text-embedding-3-small"
+      guardrail: "gpt-4o-mini"
+      reranker: "cohere-rerank-v3"
+    
+    retrieval:
+      top_k: 10
+      rerank_top_k: 5
+      similarity_threshold: 0.7
+      hybrid_search: true
+      sparse_weight: 0.3
+      dense_weight: 0.7
+    
+    guardrails:
+      enabled: true
+      mode: "enforce"  # enforce | warn | disabled
+      max_input_tokens: 8000
+      max_output_tokens: 4000
+      pii_detection: true
+      toxicity_threshold: 0.8
+      injection_detection: true
+    
+    agent:
+      max_iterations: 15
+      max_execution_time: 120
+      tools_enabled: true
+      streaming: true
+    
+    observability:
+      tracing_enabled: true
+      metrics_enabled: true
+      log_level: "info"
+      sample_rate: 1.0
+
+---
+# =============================================================================
+# SECRETS (references - actual values from External Secrets Operator)
+# =============================================================================
+apiVersion: external-secrets.io/v1beta1
+kind: ExternalSecret
+metadata:
+  name: ai-provider-keys
+  namespace: ai-production
+spec:
+  refreshInterval: 1h
+  secretStoreRef:
+    name: aws-secrets-manager
+    kind: ClusterSecretStore
+  target:
+    name: ai-provider-keys
+    creationPolicy: Owner
+  data:
+  - secretKey: OPENAI_API_KEY
+    remoteRef:
+      key: /ai-platform/prod/openai-api-key
+  - secretKey: ANTHROPIC_API_KEY
+    remoteRef:
+      key: /ai-platform/prod/anthropic-api-key
+  - secretKey: AZURE_OPENAI_KEY
+    remoteRef:
+      key: /ai-platform/prod/azure-openai-key
+  - secretKey: COHERE_API_KEY
+    remoteRef:
+      key: /ai-platform/prod/cohere-api-key
+
+---
+apiVersion: external-secrets.io/v1beta1
+kind: ExternalSecret
+metadata:
+  name: infra-secrets
+  namespace: ai-production
+spec:
+  refreshInterval: 1h
+  secretStoreRef:
+    name: aws-secrets-manager
+    kind: ClusterSecretStore
+  target:
+    name: infra-secrets
+    creationPolicy: Owner
+  data:
+  - secretKey: POSTGRES_URL
+    remoteRef:
+      key: /ai-platform/prod/postgres-url
+  - secretKey: REDIS_PASSWORD
+    remoteRef:
+      key: /ai-platform/prod/redis-password
+  - secretKey: QDRANT_API_KEY
+    remoteRef:
+      key: /ai-platform/prod/qdrant-api-key
+
+---
+# =============================================================================
+# AGENT ORCHESTRATOR - Main AI service
+# =============================================================================
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: agent-orchestrator
+  namespace: ai-production
+  labels:
+    app: agent-orchestrator
+    version: v2.3.0
+spec:
+  replicas: 5
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxSurge: 2
+      maxUnavailable: 1
+  selector:
+    matchLabels:
+      app: agent-orchestrator
+  template:
+    metadata:
+      labels:
+        app: agent-orchestrator
+        version: v2.3.0
+      annotations:
+        prometheus.io/scrape: "true"
+        prometheus.io/port: "8080"
+        prometheus.io/path: "/metrics"
+    spec:
+      serviceAccountName: agent-orchestrator-sa
+      terminationGracePeriodSeconds: 60
+      topologySpreadConstraints:
+      - maxSkew: 1
+        topologyKey: topology.kubernetes.io/zone
+        whenUnsatisfiable: DoNotSchedule
+        labelSelector:
+          matchLabels:
+            app: agent-orchestrator
+      containers:
+      - name: agent-orchestrator
+        image: registry.company.com/ai-platform/agent-orchestrator:v2.3.0
+        ports:
+        - containerPort: 8080
+          name: http
+          protocol: TCP
+        env:
+        - name: CONFIG_PATH
+          value: "/config/config.yaml"
+        - name: PROMPT_DIR
+          value: "/prompts"
+        - name: OPENAI_API_KEY
+          valueFrom:
+            secretKeyRef:
+              name: ai-provider-keys
+              key: OPENAI_API_KEY
+        - name: ANTHROPIC_API_KEY
+          valueFrom:
+            secretKeyRef:
+              name: ai-provider-keys
+              key: ANTHROPIC_API_KEY
+        - name: POSTGRES_URL
+          valueFrom:
+            secretKeyRef:
+              name: infra-secrets
+              key: POSTGRES_URL
+        - name: REDIS_URL
+          value: "redis://:$(REDIS_PASSWORD)@redis-master.ai-production.svc:6379"
+        - name: REDIS_PASSWORD
+          valueFrom:
+            secretKeyRef:
+              name: infra-secrets
+              key: REDIS_PASSWORD
+        - name: QDRANT_URL
+          value: "http://qdrant-headless.ai-production.svc:6333"
+        - name: OTEL_EXPORTER_OTLP_ENDPOINT
+          value: "http://otel-collector.observability.svc:4317"
+        - name: OTEL_SERVICE_NAME
+          value: "agent-orchestrator"
+        - name: POD_NAME
+          valueFrom:
+            fieldRef:
+              fieldPath: metadata.name
+        resources:
+          requests:
+            cpu: "500m"
+            memory: "1Gi"
+          limits:
+            cpu: "2000m"
+            memory: "4Gi"
+        startupProbe:
+          httpGet:
+            path: /health/startup
+            port: 8080
+          initialDelaySeconds: 5
+          periodSeconds: 5
+          failureThreshold: 12
+        livenessProbe:
+          httpGet:
+            path: /health/live
+            port: 8080
+          periodSeconds: 15
+          timeoutSeconds: 5
+          failureThreshold: 3
+        readinessProbe:
+          httpGet:
+            path: /health/ready
+            port: 8080
+          periodSeconds: 10
+          timeoutSeconds: 5
+          failureThreshold: 3
+        volumeMounts:
+        - name: config
+          mountPath: /config
+        - name: prompts
+          mountPath: /prompts
+      volumes:
+      - name: config
+        configMap:
+          name: app-config
+      - name: prompts
+        configMap:
+          name: prompt-configs
+
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: agent-orchestrator
+  namespace: ai-production
+spec:
+  selector:
+    app: agent-orchestrator
+  ports:
+  - port: 80
+    targetPort: 8080
+    protocol: TCP
+  type: ClusterIP
+
+---
+apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata:
+  name: agent-orchestrator-hpa
+  namespace: ai-production
+spec:
+  scaleTargetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: agent-orchestrator
+  minReplicas: 5
+  maxReplicas: 50
+  metrics:
+  - type: Resource
+    resource:
+      name: cpu
+      target:
+        type: Utilization
+        averageUtilization: 60
+  - type: Pods
+    pods:
+      metric:
+        name: http_requests_per_second
+      target:
+        type: AverageValue
+        averageValue: "50"
+  - type: Pods
+    pods:
+      metric:
+        name: active_agent_sessions
+      target:
+        type: AverageValue
+        averageValue: "20"
+  behavior:
+    scaleUp:
+      stabilizationWindowSeconds: 30
+      policies:
+      - type: Percent
+        value: 50
+        periodSeconds: 60
+    scaleDown:
+      stabilizationWindowSeconds: 300
+      policies:
+      - type: Percent
+        value: 10
+        periodSeconds: 120
+
+---
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: agent-orchestrator-pdb
+  namespace: ai-production
+spec:
+  minAvailable: 3
+  selector:
+    matchLabels:
+      app: agent-orchestrator
+
+---
+# =============================================================================
+# RETRIEVAL SERVICE
+# =============================================================================
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: retrieval-service
+  namespace: ai-production
+  labels:
+    app: retrieval-service
+    version: v1.5.0
+spec:
+  replicas: 3
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxSurge: 1
+      maxUnavailable: 0
+  selector:
+    matchLabels:
+      app: retrieval-service
+  template:
+    metadata:
+      labels:
+        app: retrieval-service
+        version: v1.5.0
+      annotations:
+        prometheus.io/scrape: "true"
+        prometheus.io/port: "8080"
+    spec:
+      serviceAccountName: retrieval-service-sa
+      containers:
+      - name: retrieval-service
+        image: registry.company.com/ai-platform/retrieval-service:v1.5.0
+        ports:
+        - containerPort: 8080
+        env:
+        - name: QDRANT_URL
+          value: "http://qdrant-headless.ai-production.svc:6333"
+        - name: QDRANT_API_KEY
+          valueFrom:
+            secretKeyRef:
+              name: infra-secrets
+              key: QDRANT_API_KEY
+        - name: COLLECTION_NAME
+          value: "docs_v3_2024_01"
+        - name: EMBEDDING_MODEL
+          value: "text-embedding-3-small"
+        - name: OPENAI_API_KEY
+          valueFrom:
+            secretKeyRef:
+              name: ai-provider-keys
+              key: OPENAI_API_KEY
+        - name: COHERE_API_KEY
+          valueFrom:
+            secretKeyRef:
+              name: ai-provider-keys
+              key: COHERE_API_KEY
+        - name: REDIS_URL
+          value: "redis://:$(REDIS_PASSWORD)@redis-master.ai-production.svc:6379/1"
+        - name: REDIS_PASSWORD
+          valueFrom:
+            secretKeyRef:
+              name: infra-secrets
+              key: REDIS_PASSWORD
+        resources:
+          requests:
+            cpu: "500m"
+            memory: "2Gi"
+          limits:
+            cpu: "2000m"
+            memory: "4Gi"
+        startupProbe:
+          httpGet:
+            path: /health/startup
+            port: 8080
+          initialDelaySeconds: 10
+          periodSeconds: 5
+          failureThreshold: 12
+        livenessProbe:
+          httpGet:
+            path: /health/live
+            port: 8080
+          periodSeconds: 15
+          failureThreshold: 3
+        readinessProbe:
+          httpGet:
+            path: /health/ready
+            port: 8080
+          periodSeconds: 10
+          failureThreshold: 3
+        volumeMounts:
+        - name: config
+          mountPath: /config
+      volumes:
+      - name: config
+        configMap:
+          name: app-config
+
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: retrieval-service
+  namespace: ai-production
+spec:
+  selector:
+    app: retrieval-service
+  ports:
+  - port: 80
+    targetPort: 8080
+  type: ClusterIP
+
+---
+apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata:
+  name: retrieval-service-hpa
+  namespace: ai-production
+spec:
+  scaleTargetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: retrieval-service
+  minReplicas: 3
+  maxReplicas: 20
+  metrics:
+  - type: Resource
+    resource:
+      name: cpu
+      target:
+        type: Utilization
+        averageUtilization: 65
+  - type: Pods
+    pods:
+      metric:
+        name: retrieval_requests_per_second
+      target:
+        type: AverageValue
+        averageValue: "100"
+
+---
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: retrieval-service-pdb
+  namespace: ai-production
+spec:
+  minAvailable: 2
+  selector:
+    matchLabels:
+      app: retrieval-service
+
+---
+# =============================================================================
+# VECTOR DATABASE - Qdrant StatefulSet
+# =============================================================================
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: qdrant
+  namespace: ai-production
+  labels:
+    app: qdrant
+spec:
+  serviceName: qdrant-headless
+  replicas: 3
+  podManagementPolicy: Parallel
+  selector:
+    matchLabels:
+      app: qdrant
+  template:
+    metadata:
+      labels:
+        app: qdrant
+      annotations:
+        prometheus.io/scrape: "true"
+        prometheus.io/port: "6333"
+        prometheus.io/path: "/metrics"
+    spec:
+      affinity:
+        podAntiAffinity:
+          requiredDuringSchedulingIgnoredDuringExecution:
+          - labelSelector:
+              matchLabels:
+                app: qdrant
+            topologyKey: kubernetes.io/hostname
+        nodeAffinity:
+          requiredDuringSchedulingIgnoredDuringExecution:
+            nodeSelectorTerms:
+            - matchExpressions:
+              - key: node-type
+                operator: In
+                values:
+                - high-memory
+      containers:
+      - name: qdrant
+        image: qdrant/qdrant:v1.7.4
+        ports:
+        - containerPort: 6333
+          name: http
+        - containerPort: 6334
+          name: grpc
+        - containerPort: 6335
+          name: internal
+        env:
+        - name: QDRANT__SERVICE__API_KEY
+          valueFrom:
+            secretKeyRef:
+              name: infra-secrets
+              key: QDRANT_API_KEY
+        - name: QDRANT__CLUSTER__ENABLED
+          value: "true"
+        - name: QDRANT__CLUSTER__P2P__PORT
+          value: "6335"
+        resources:
+          requests:
+            cpu: "2"
+            memory: "8Gi"
+          limits:
+            cpu: "4"
+            memory: "16Gi"
+        startupProbe:
+          httpGet:
+            path: /readyz
+            port: 6333
+          initialDelaySeconds: 10
+          periodSeconds: 10
+          failureThreshold: 30
+        livenessProbe:
+          httpGet:
+            path: /livez
+            port: 6333
+          periodSeconds: 30
+          failureThreshold: 3
+        readinessProbe:
+          httpGet:
+            path: /readyz
+            port: 6333
+          periodSeconds: 10
+          failureThreshold: 3
+        volumeMounts:
+        - name: qdrant-data
+          mountPath: /qdrant/storage
+        - name: qdrant-snapshots
+          mountPath: /qdrant/snapshots
+  volumeClaimTemplates:
+  - metadata:
+      name: qdrant-data
+    spec:
+      accessModes: ["ReadWriteOnce"]
+      storageClassName: gp3-encrypted
+      resources:
+        requests:
+          storage: 200Gi
+  - metadata:
+      name: qdrant-snapshots
+    spec:
+      accessModes: ["ReadWriteOnce"]
+      storageClassName: gp3-encrypted
+      resources:
+        requests:
+          storage: 100Gi
+
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: qdrant-headless
+  namespace: ai-production
+spec:
+  clusterIP: None
+  selector:
+    app: qdrant
+  ports:
+  - port: 6333
+    targetPort: 6333
+    name: http
+  - port: 6334
+    targetPort: 6334
+    name: grpc
+  - port: 6335
+    targetPort: 6335
+    name: internal
+
+---
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: qdrant-pdb
+  namespace: ai-production
+spec:
+  maxUnavailable: 1
+  selector:
+    matchLabels:
+      app: qdrant
+
+---
+# =============================================================================
+# AI GATEWAY
+# =============================================================================
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: ai-gateway
+  namespace: ai-production
+  labels:
+    app: ai-gateway
+    version: v1.2.0
+spec:
+  replicas: 3
+  selector:
+    matchLabels:
+      app: ai-gateway
+  template:
+    metadata:
+      labels:
+        app: ai-gateway
+        version: v1.2.0
+      annotations:
+        prometheus.io/scrape: "true"
+        prometheus.io/port: "8080"
+    spec:
+      containers:
+      - name: ai-gateway
+        image: registry.company.com/ai-platform/ai-gateway:v1.2.0
+        ports:
+        - containerPort: 8080
+        env:
+        - name: OPENAI_API_KEY
+          valueFrom:
+            secretKeyRef:
+              name: ai-provider-keys
+              key: OPENAI_API_KEY
+        - name: ANTHROPIC_API_KEY
+          valueFrom:
+            secretKeyRef:
+              name: ai-provider-keys
+              key: ANTHROPIC_API_KEY
+        - name: AZURE_OPENAI_KEY
+          valueFrom:
+            secretKeyRef:
+              name: ai-provider-keys
+              key: AZURE_OPENAI_KEY
+        - name: REDIS_URL
+          value: "redis://:$(REDIS_PASSWORD)@redis-master.ai-production.svc:6379/2"
+        - name: REDIS_PASSWORD
+          valueFrom:
+            secretKeyRef:
+              name: infra-secrets
+              key: REDIS_PASSWORD
+        - name: RATE_LIMIT_RPM
+          value: "500"
+        - name: CACHE_ENABLED
+          value: "true"
+        - name: FALLBACK_ENABLED
+          value: "true"
+        resources:
+          requests:
+            cpu: "250m"
+            memory: "512Mi"
+          limits:
+            cpu: "1000m"
+            memory: "2Gi"
+        livenessProbe:
+          httpGet:
+            path: /health
+            port: 8080
+          periodSeconds: 15
+        readinessProbe:
+          httpGet:
+            path: /health
+            port: 8080
+          periodSeconds: 10
+
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: ai-gateway
+  namespace: ai-production
+spec:
+  selector:
+    app: ai-gateway
+  ports:
+  - port: 80
+    targetPort: 8080
+  type: ClusterIP
+
+---
+# =============================================================================
+# GUARDRAIL SERVICE
+# =============================================================================
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: guardrail-service
+  namespace: ai-production
+  labels:
+    app: guardrail-service
+    version: v1.1.0
+spec:
+  replicas: 3
+  selector:
+    matchLabels:
+      app: guardrail-service
+  template:
+    metadata:
+      labels:
+        app: guardrail-service
+        version: v1.1.0
+    spec:
+      containers:
+      - name: guardrail-service
+        image: registry.company.com/ai-platform/guardrail-service:v1.1.0
+        ports:
+        - containerPort: 8080
+        env:
+        - name: OPENAI_API_KEY
+          valueFrom:
+            secretKeyRef:
+              name: ai-provider-keys
+              key: OPENAI_API_KEY
+        - name: MODE
+          value: "enforce"
+        - name: PII_DETECTION_ENABLED
+          value: "true"
+        - name: TOXICITY_THRESHOLD
+          value: "0.8"
+        - name: INJECTION_DETECTION_ENABLED
+          value: "true"
+        resources:
+          requests:
+            cpu: "500m"
+            memory: "1Gi"
+          limits:
+            cpu: "2000m"
+            memory: "4Gi"
+        livenessProbe:
+          httpGet:
+            path: /health
+            port: 8080
+          periodSeconds: 15
+        readinessProbe:
+          httpGet:
+            path: /health
+            port: 8080
+          periodSeconds: 10
+        volumeMounts:
+        - name: prompts
+          mountPath: /prompts
+      volumes:
+      - name: prompts
+        configMap:
+          name: prompt-configs
+
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: guardrail-service
+  namespace: ai-production
+spec:
+  selector:
+    app: guardrail-service
+  ports:
+  - port: 80
+    targetPort: 8080
+  type: ClusterIP
+
+---
+# =============================================================================
+# REDIS CACHE
+# =============================================================================
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: redis-master
+  namespace: ai-production
+  labels:
+    app: redis
+    role: master
+spec:
+  serviceName: redis-master
+  replicas: 1
+  selector:
+    matchLabels:
+      app: redis
+      role: master
+  template:
+    metadata:
+      labels:
+        app: redis
+        role: master
+    spec:
+      containers:
+      - name: redis
+        image: redis:7.2-alpine
+        ports:
+        - containerPort: 6379
+        command:
+        - redis-server
+        - "--requirepass"
+        - "$(REDIS_PASSWORD)"
+        - "--maxmemory"
+        - "2gb"
+        - "--maxmemory-policy"
+        - "allkeys-lru"
+        - "--appendonly"
+        - "yes"
+        env:
+        - name: REDIS_PASSWORD
+          valueFrom:
+            secretKeyRef:
+              name: infra-secrets
+              key: REDIS_PASSWORD
+        resources:
+          requests:
+            cpu: "250m"
+            memory: "2Gi"
+          limits:
+            cpu: "1000m"
+            memory: "3Gi"
+        livenessProbe:
+          exec:
+            command: ["redis-cli", "ping"]
+          periodSeconds: 15
+        readinessProbe:
+          exec:
+            command: ["redis-cli", "ping"]
+          periodSeconds: 10
+        volumeMounts:
+        - name: redis-data
+          mountPath: /data
+  volumeClaimTemplates:
+  - metadata:
+      name: redis-data
+    spec:
+      accessModes: ["ReadWriteOnce"]
+      storageClassName: gp3-encrypted
+      resources:
+        requests:
+          storage: 20Gi
+
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: redis-master
+  namespace: ai-production
+spec:
+  selector:
+    app: redis
+    role: master
+  ports:
+  - port: 6379
+    targetPort: 6379
+  type: ClusterIP
+
+---
+# =============================================================================
+# INGRESS / GATEWAY
+# =============================================================================
+apiVersion: gateway.networking.k8s.io/v1
+kind: Gateway
+metadata:
+  name: ai-platform-gateway
+  namespace: ai-production
+  annotations:
+    cert-manager.io/cluster-issuer: letsencrypt-prod
+spec:
+  gatewayClassName: istio
+  listeners:
+  - name: https
+    protocol: HTTPS
+    port: 443
+    tls:
+      mode: Terminate
+      certificateRefs:
+      - name: ai-platform-tls
+    allowedRoutes:
+      namespaces:
+        from: Same
+
+---
+apiVersion: gateway.networking.k8s.io/v1
+kind: HTTPRoute
+metadata:
+  name: ai-platform-routes
+  namespace: ai-production
+spec:
+  parentRefs:
+  - name: ai-platform-gateway
+  hostnames:
+  - "api.ai-platform.company.com"
+  rules:
+  - matches:
+    - path:
+        type: PathPrefix
+        value: /v1/chat
+    backendRefs:
+    - name: agent-orchestrator
+      port: 80
+      weight: 95
+    - name: agent-orchestrator-canary
+      port: 80
+      weight: 5
+  - matches:
+    - path:
+        type: PathPrefix
+        value: /v1/retrieve
+    backendRefs:
+    - name: retrieval-service
+      port: 80
+  - matches:
+    - path:
+        type: PathPrefix
+        value: /v1/models
+    backendRefs:
+    - name: ai-gateway
+      port: 80
+
+---
+# =============================================================================
+# NETWORK POLICIES
+# =============================================================================
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: default-deny-all
+  namespace: ai-production
+spec:
+  podSelector: {}
+  policyTypes:
+  - Ingress
+  - Egress
+
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: allow-agent-orchestrator
+  namespace: ai-production
+spec:
+  podSelector:
+    matchLabels:
+      app: agent-orchestrator
+  policyTypes:
+  - Ingress
+  - Egress
+  ingress:
+  - from:
+    - namespaceSelector:
+        matchLabels:
+          name: istio-system
+    ports:
+    - port: 8080
+  egress:
+  - to:
+    - podSelector:
+        matchLabels:
+          app: retrieval-service
+    ports:
+    - port: 8080
+  - to:
+    - podSelector:
+        matchLabels:
+          app: ai-gateway
+    ports:
+    - port: 8080
+  - to:
+    - podSelector:
+        matchLabels:
+          app: guardrail-service
+    ports:
+    - port: 8080
+  - to:
+    - podSelector:
+        matchLabels:
+          app: redis
+    ports:
+    - port: 6379
+  - to:  # Allow external API calls (OpenAI, etc)
+    - ipBlock:
+        cidr: 0.0.0.0/0
+        except:
+        - 10.0.0.0/8
+        - 172.16.0.0/12
+        - 192.168.0.0/16
+    ports:
+    - port: 443
+
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: allow-qdrant-internal
+  namespace: ai-production
+spec:
+  podSelector:
+    matchLabels:
+      app: qdrant
+  policyTypes:
+  - Ingress
+  - Egress
+  ingress:
+  - from:
+    - podSelector:
+        matchLabels:
+          app: retrieval-service
+    ports:
+    - port: 6333
+    - port: 6334
+  - from:
+    - podSelector:
+        matchLabels:
+          app: qdrant
+    ports:
+    - port: 6335
+  egress:
+  - to:
+    - podSelector:
+        matchLabels:
+          app: qdrant
+    ports:
+    - port: 6335
+
+---
+# =============================================================================
+# SERVICE MONITOR (Prometheus)
+# =============================================================================
+apiVersion: monitoring.coreos.com/v1
+kind: ServiceMonitor
+metadata:
+  name: agent-orchestrator-monitor
+  namespace: ai-production
+  labels:
+    release: prometheus
+spec:
+  selector:
+    matchLabels:
+      app: agent-orchestrator
+  endpoints:
+  - port: http
+    path: /metrics
+    interval: 15s
+    scrapeTimeout: 10s
+
+---
+apiVersion: monitoring.coreos.com/v1
+kind: ServiceMonitor
+metadata:
+  name: retrieval-service-monitor
+  namespace: ai-production
+  labels:
+    release: prometheus
+spec:
+  selector:
+    matchLabels:
+      app: retrieval-service
+  endpoints:
+  - port: http
+    path: /metrics
+    interval: 15s
+
+---
+apiVersion: monitoring.coreos.com/v1
+kind: ServiceMonitor
+metadata:
+  name: qdrant-monitor
+  namespace: ai-production
+  labels:
+    release: prometheus
+spec:
+  selector:
+    matchLabels:
+      app: qdrant
+  endpoints:
+  - port: http
+    path: /metrics
+    interval: 30s
+
+---
+# =============================================================================
+# PROMETHEUS RULES (Alerting)
+# =============================================================================
+apiVersion: monitoring.coreos.com/v1
+kind: PrometheusRule
+metadata:
+  name: ai-platform-alerts
+  namespace: ai-production
+  labels:
+    release: prometheus
+spec:
+  groups:
+  - name: ai-platform.rules
+    rules:
+    - alert: HighErrorRate
+      expr: |
+        rate(http_requests_total{namespace="ai-production",status=~"5.."}[5m])
+        / rate(http_requests_total{namespace="ai-production"}[5m]) > 0.05
+      for: 5m
+      labels:
+        severity: critical
+      annotations:
+        summary: "High error rate on {{ $labels.app }}"
+    - alert: HighLatency
+      expr: |
+        histogram_quantile(0.95, rate(http_request_duration_seconds_bucket{namespace="ai-production"}[5m])) > 10
+      for: 5m
+      labels:
+        severity: warning
+      annotations:
+        summary: "P95 latency > 10s on {{ $labels.app }}"
+    - alert: GuardrailHighTriggerRate
+      expr: |
+        rate(guardrail_blocks_total{namespace="ai-production"}[15m])
+        / rate(guardrail_checks_total{namespace="ai-production"}[15m]) > 0.1
+      for: 10m
+      labels:
+        severity: warning
+      annotations:
+        summary: "Guardrail blocking >10% of responses"
+    - alert: QdrantDiskUsageHigh
+      expr: |
+        qdrant_storage_used_bytes / qdrant_storage_total_bytes > 0.8
+      for: 30m
+      labels:
+        severity: warning
+      annotations:
+        summary: "Qdrant disk usage > 80%"
+    - alert: LLMProviderErrors
+      expr: |
+        rate(llm_provider_errors_total[5m]) > 5
+      for: 5m
+      labels:
+        severity: critical
+      annotations:
+        summary: "LLM provider errors elevated - check fallback"
+
+---
+# =============================================================================
+# CANARY DEPLOYMENT (for progressive rollout)
+# =============================================================================
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: agent-orchestrator-canary
+  namespace: ai-production
+  labels:
+    app: agent-orchestrator
+    track: canary
+    version: v2.4.0-rc1
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: agent-orchestrator
+      track: canary
+  template:
+    metadata:
+      labels:
+        app: agent-orchestrator
+        track: canary
+        version: v2.4.0-rc1
+    spec:
+      serviceAccountName: agent-orchestrator-sa
+      containers:
+      - name: agent-orchestrator
+        image: registry.company.com/ai-platform/agent-orchestrator:v2.4.0-rc1
+        ports:
+        - containerPort: 8080
+        env:
+        - name: CANARY
+          value: "true"
+        - name: CONFIG_PATH
+          value: "/config/config.yaml"
+        - name: OPENAI_API_KEY
+          valueFrom:
+            secretKeyRef:
+              name: ai-provider-keys
+              key: OPENAI_API_KEY
+        - name: ANTHROPIC_API_KEY
+          valueFrom:
+            secretKeyRef:
+              name: ai-provider-keys
+              key: ANTHROPIC_API_KEY
+        - name: POSTGRES_URL
+          valueFrom:
+            secretKeyRef:
+              name: infra-secrets
+              key: POSTGRES_URL
+        resources:
+          requests:
+            cpu: "500m"
+            memory: "1Gi"
+          limits:
+            cpu: "2000m"
+            memory: "4Gi"
+        livenessProbe:
+          httpGet:
+            path: /health/live
+            port: 8080
+          periodSeconds: 15
+        readinessProbe:
+          httpGet:
+            path: /health/ready
+            port: 8080
+          periodSeconds: 10
+      volumes:
+      - name: config
+        configMap:
+          name: app-config
+      - name: prompts
+        configMap:
+          name: prompt-configs
+
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: agent-orchestrator-canary
+  namespace: ai-production
+spec:
+  selector:
+    app: agent-orchestrator
+    track: canary
+  ports:
+  - port: 80
+    targetPort: 8080
+  type: ClusterIP

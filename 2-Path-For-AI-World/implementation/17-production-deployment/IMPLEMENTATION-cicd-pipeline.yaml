@@ -1,0 +1,565 @@
+# CI/CD Pipeline for AI Platform
+# GitHub Actions workflow for build, eval, and deploy
+name: AI Platform CI/CD
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+    inputs:
+      deploy_target:
+        description: 'Deploy target environment'
+        required: true
+        default: 'staging'
+        type: choice
+        options:
+        - staging
+        - production
+
+env:
+  REGISTRY: registry.company.com/ai-platform
+  CLUSTER_NAME: ai-platform-prod
+  CLUSTER_REGION: us-east-1
+
+jobs:
+  # ===========================================================================
+  # STAGE 1: Build and Test
+  # ===========================================================================
+  build-and-test:
+    name: Build & Unit Tests
+    runs-on: ubuntu-latest
+    outputs:
+      image_tag: ${{ steps.meta.outputs.version }}
+    steps:
+    - uses: actions/checkout@v4
+
+    - name: Set up Python
+      uses: actions/setup-python@v5
+      with:
+        python-version: '3.11'
+        cache: 'pip'
+
+    - name: Install dependencies
+      run: |
+        pip install -r requirements.txt
+        pip install -r requirements-dev.txt
+
+    - name: Lint
+      run: |
+        ruff check src/
+        mypy src/ --ignore-missing-imports
+
+    - name: Unit tests
+      run: |
+        pytest tests/unit/ -v --cov=src --cov-report=xml --junitxml=test-results.xml
+      env:
+        OPENAI_API_KEY: "sk-test-mock-key"
+
+    - name: Upload test results
+      uses: actions/upload-artifact@v4
+      if: always()
+      with:
+        name: test-results
+        path: test-results.xml
+
+    - name: Upload coverage
+      uses: actions/upload-artifact@v4
+      with:
+        name: coverage
+        path: coverage.xml
+
+    - name: Generate image metadata
+      id: meta
+      run: |
+        SHA_SHORT=$(git rev-parse --short HEAD)
+        echo "version=${SHA_SHORT}" >> $GITHUB_OUTPUT
+        echo "full_sha=$(git rev-parse HEAD)" >> $GITHUB_OUTPUT
+
+  # ===========================================================================
+  # STAGE 2: AI Evaluation (Golden Dataset)
+  # ===========================================================================
+  eval-golden-dataset:
+    name: AI Eval - Golden Dataset
+    runs-on: ubuntu-latest
+    needs: build-and-test
+    if: github.event_name == 'push' || github.event_name == 'workflow_dispatch'
+    steps:
+    - uses: actions/checkout@v4
+
+    - name: Set up Python
+      uses: actions/setup-python@v5
+      with:
+        python-version: '3.11'
+        cache: 'pip'
+
+    - name: Install dependencies
+      run: pip install -r requirements.txt -r requirements-dev.txt
+
+    - name: Run golden dataset evaluation
+      run: |
+        python -m eval.run_eval \
+          --dataset eval/golden_dataset.jsonl \
+          --config eval/eval_config.yaml \
+          --output eval-results/golden.json \
+          --threshold-file eval/thresholds.yaml \
+          --parallel 5
+      env:
+        OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY_EVAL }}
+        ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY_EVAL }}
+        QDRANT_URL: ${{ secrets.STAGING_QDRANT_URL }}
+
+    - name: Check eval thresholds
+      run: |
+        python -m eval.check_thresholds \
+          --results eval-results/golden.json \
+          --thresholds eval/thresholds.yaml
+      # thresholds.yaml defines:
+      # answer_relevancy: >= 0.85
+      # faithfulness: >= 0.90
+      # context_precision: >= 0.80
+      # tool_call_accuracy: >= 0.95
+
+    - name: Upload eval results
+      uses: actions/upload-artifact@v4
+      with:
+        name: eval-results-golden
+        path: eval-results/
+
+    - name: Post eval summary to PR
+      if: github.event_name == 'pull_request'
+      uses: actions/github-script@v7
+      with:
+        script: |
+          const fs = require('fs');
+          const results = JSON.parse(fs.readFileSync('eval-results/golden.json'));
+          const body = `## AI Eval Results 🧪
+          
+          | Metric | Score | Threshold | Status |
+          |--------|-------|-----------|--------|
+          | Answer Relevancy | ${results.answer_relevancy.toFixed(3)} | ≥ 0.85 | ${results.answer_relevancy >= 0.85 ? '✅' : '❌'} |
+          | Faithfulness | ${results.faithfulness.toFixed(3)} | ≥ 0.90 | ${results.faithfulness >= 0.90 ? '✅' : '❌'} |
+          | Context Precision | ${results.context_precision.toFixed(3)} | ≥ 0.80 | ${results.context_precision >= 0.80 ? '✅' : '❌'} |
+          | Tool Call Accuracy | ${results.tool_accuracy.toFixed(3)} | ≥ 0.95 | ${results.tool_accuracy >= 0.95 ? '✅' : '❌'} |
+          
+          **Total test cases**: ${results.total_cases}
+          **Pass rate**: ${(results.pass_rate * 100).toFixed(1)}%
+          `;
+          github.rest.issues.createComment({
+            issue_number: context.issue.number,
+            owner: context.repo.owner,
+            repo: context.repo.repo,
+            body: body
+          });
+
+  # ===========================================================================
+  # STAGE 3: Safety Evaluation
+  # ===========================================================================
+  eval-safety:
+    name: AI Eval - Safety & Guardrails
+    runs-on: ubuntu-latest
+    needs: build-and-test
+    if: github.event_name == 'push' || github.event_name == 'workflow_dispatch'
+    steps:
+    - uses: actions/checkout@v4
+
+    - name: Set up Python
+      uses: actions/setup-python@v5
+      with:
+        python-version: '3.11'
+        cache: 'pip'
+
+    - name: Install dependencies
+      run: pip install -r requirements.txt -r requirements-dev.txt
+
+    - name: Run safety evaluation
+      run: |
+        python -m eval.run_safety_eval \
+          --dataset eval/safety_dataset.jsonl \
+          --config eval/safety_config.yaml \
+          --output eval-results/safety.json
+      env:
+        OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY_EVAL }}
+
+    - name: Check safety thresholds
+      run: |
+        python -m eval.check_safety \
+          --results eval-results/safety.json \
+          --max-harmful-rate 0.0 \
+          --max-pii-leak-rate 0.0 \
+          --injection-block-rate 0.99 \
+          --refusal-rate-min 0.95
+
+    - name: Upload safety results
+      uses: actions/upload-artifact@v4
+      with:
+        name: eval-results-safety
+        path: eval-results/safety.json
+
+  # ===========================================================================
+  # STAGE 4: Security Scanning
+  # ===========================================================================
+  security-scan:
+    name: Security Scan
+    runs-on: ubuntu-latest
+    needs: build-and-test
+    steps:
+    - uses: actions/checkout@v4
+
+    - name: Run Trivy vulnerability scan
+      uses: aquasecurity/trivy-action@master
+      with:
+        scan-type: 'fs'
+        scan-ref: '.'
+        severity: 'CRITICAL,HIGH'
+        exit-code: '1'
+
+    - name: Secret scanning
+      uses: trufflesecurity/trufflehog@main
+      with:
+        path: ./
+        extra_args: --only-verified
+
+    - name: SAST scan
+      uses: github/codeql-action/analyze@v3
+      with:
+        languages: python
+
+    - name: Dependency audit
+      run: |
+        pip-audit -r requirements.txt --severity critical
+
+    - name: Check for hardcoded prompts with PII
+      run: |
+        python -m security.prompt_scan \
+          --dir prompts/ \
+          --check pii,secrets,injection_vectors
+
+  # ===========================================================================
+  # STAGE 5: Container Build
+  # ===========================================================================
+  container-build:
+    name: Build Container Images
+    runs-on: ubuntu-latest
+    needs: [eval-golden-dataset, eval-safety, security-scan]
+    strategy:
+      matrix:
+        service:
+        - agent-orchestrator
+        - retrieval-service
+        - ai-gateway
+        - guardrail-service
+    steps:
+    - uses: actions/checkout@v4
+
+    - name: Set up Docker Buildx
+      uses: docker/setup-buildx-action@v3
+
+    - name: Login to registry
+      uses: docker/login-action@v3
+      with:
+        registry: registry.company.com
+        username: ${{ secrets.REGISTRY_USERNAME }}
+        password: ${{ secrets.REGISTRY_PASSWORD }}
+
+    - name: Build and push
+      uses: docker/build-push-action@v5
+      with:
+        context: ./services/${{ matrix.service }}
+        push: true
+        tags: |
+          ${{ env.REGISTRY }}/${{ matrix.service }}:${{ needs.build-and-test.outputs.image_tag }}
+          ${{ env.REGISTRY }}/${{ matrix.service }}:latest
+        cache-from: type=gha
+        cache-to: type=gha,mode=max
+        platforms: linux/amd64
+
+    - name: Scan container image
+      uses: aquasecurity/trivy-action@master
+      with:
+        image-ref: '${{ env.REGISTRY }}/${{ matrix.service }}:${{ needs.build-and-test.outputs.image_tag }}'
+        severity: 'CRITICAL,HIGH'
+        exit-code: '1'
+
+  # ===========================================================================
+  # STAGE 6: Deploy to Staging
+  # ===========================================================================
+  deploy-staging:
+    name: Deploy to Staging
+    runs-on: ubuntu-latest
+    needs: container-build
+    environment: staging
+    steps:
+    - uses: actions/checkout@v4
+
+    - name: Configure kubectl
+      uses: aws-actions/configure-aws-credentials@v4
+      with:
+        role-to-assume: ${{ secrets.AWS_ROLE_STAGING }}
+        aws-region: ${{ env.CLUSTER_REGION }}
+
+    - name: Update kubeconfig
+      run: aws eks update-kubeconfig --name ai-platform-staging --region ${{ env.CLUSTER_REGION }}
+
+    - name: Deploy to staging
+      run: |
+        TAG=${{ needs.build-and-test.outputs.image_tag }}
+        
+        # Update image tags
+        for service in agent-orchestrator retrieval-service ai-gateway guardrail-service; do
+          kubectl set image deployment/${service} \
+            ${service}=${{ env.REGISTRY }}/${service}:${TAG} \
+            -n ai-staging
+        done
+        
+        # Wait for rollout
+        for service in agent-orchestrator retrieval-service ai-gateway guardrail-service; do
+          kubectl rollout status deployment/${service} -n ai-staging --timeout=300s
+        done
+
+    - name: Verify staging health
+      run: |
+        sleep 30
+        curl -sf https://api.staging.ai-platform.company.com/health || exit 1
+        curl -sf https://api.staging.ai-platform.company.com/health/deep || exit 1
+
+  # ===========================================================================
+  # STAGE 7: Integration Tests on Staging
+  # ===========================================================================
+  integration-tests:
+    name: Integration Tests (Staging)
+    runs-on: ubuntu-latest
+    needs: deploy-staging
+    steps:
+    - uses: actions/checkout@v4
+
+    - name: Set up Python
+      uses: actions/setup-python@v5
+      with:
+        python-version: '3.11'
+        cache: 'pip'
+
+    - name: Install dependencies
+      run: pip install -r requirements-dev.txt
+
+    - name: Run integration tests
+      run: |
+        pytest tests/integration/ -v \
+          --base-url=https://api.staging.ai-platform.company.com \
+          --junitxml=integration-results.xml \
+          --timeout=120
+      env:
+        API_KEY: ${{ secrets.STAGING_API_KEY }}
+        TEST_USER_TOKEN: ${{ secrets.STAGING_TEST_TOKEN }}
+
+    - name: Run end-to-end scenarios
+      run: |
+        python -m tests.e2e.run_scenarios \
+          --base-url=https://api.staging.ai-platform.company.com \
+          --scenarios tests/e2e/scenarios/ \
+          --output e2e-results.json
+      env:
+        API_KEY: ${{ secrets.STAGING_API_KEY }}
+
+    - name: Upload integration results
+      uses: actions/upload-artifact@v4
+      if: always()
+      with:
+        name: integration-results
+        path: |
+          integration-results.xml
+          e2e-results.json
+
+  # ===========================================================================
+  # STAGE 8: Canary Deployment to Production
+  # ===========================================================================
+  canary-deploy:
+    name: Canary Deploy (Production)
+    runs-on: ubuntu-latest
+    needs: integration-tests
+    if: github.ref == 'refs/heads/main'
+    environment: production-canary
+    steps:
+    - uses: actions/checkout@v4
+
+    - name: Configure kubectl (Production)
+      uses: aws-actions/configure-aws-credentials@v4
+      with:
+        role-to-assume: ${{ secrets.AWS_ROLE_PROD }}
+        aws-region: ${{ env.CLUSTER_REGION }}
+
+    - name: Update kubeconfig
+      run: aws eks update-kubeconfig --name ${{ env.CLUSTER_NAME }} --region ${{ env.CLUSTER_REGION }}
+
+    - name: Deploy canary (5% traffic)
+      run: |
+        TAG=${{ needs.build-and-test.outputs.image_tag }}
+        
+        # Update canary deployment image
+        kubectl set image deployment/agent-orchestrator-canary \
+          agent-orchestrator=${{ env.REGISTRY }}/agent-orchestrator:${TAG} \
+          -n ai-production
+        
+        # Wait for canary to be ready
+        kubectl rollout status deployment/agent-orchestrator-canary \
+          -n ai-production --timeout=300s
+        
+        # Set traffic split: 95% stable, 5% canary
+        kubectl patch httproute ai-platform-routes -n ai-production --type=json \
+          -p='[{"op":"replace","path":"/spec/rules/0/backendRefs/0/weight","value":95},
+               {"op":"replace","path":"/spec/rules/0/backendRefs/1/weight","value":5}]'
+
+    - name: Monitor canary (15 minutes)
+      run: |
+        python -m deployment.monitor_canary \
+          --duration 900 \
+          --metrics-url ${{ secrets.PROMETHEUS_URL }} \
+          --canary-label "track=canary" \
+          --stable-label "track=stable" \
+          --error-threshold 0.05 \
+          --latency-threshold 10.0 \
+          --quality-threshold 0.80
+
+    - name: Canary decision
+      id: canary_decision
+      run: |
+        RESULT=$(python -m deployment.canary_decision \
+          --metrics-url ${{ secrets.PROMETHEUS_URL }} \
+          --window 900)
+        echo "decision=${RESULT}" >> $GITHUB_OUTPUT
+
+  # ===========================================================================
+  # STAGE 9: Promote or Rollback
+  # ===========================================================================
+  promote-production:
+    name: Promote to Full Production
+    runs-on: ubuntu-latest
+    needs: canary-deploy
+    if: needs.canary-deploy.outputs.decision == 'promote'
+    environment: production
+    steps:
+    - uses: actions/checkout@v4
+
+    - name: Configure kubectl
+      uses: aws-actions/configure-aws-credentials@v4
+      with:
+        role-to-assume: ${{ secrets.AWS_ROLE_PROD }}
+        aws-region: ${{ env.CLUSTER_REGION }}
+
+    - name: Update kubeconfig
+      run: aws eks update-kubeconfig --name ${{ env.CLUSTER_NAME }} --region ${{ env.CLUSTER_REGION }}
+
+    - name: Progressive rollout
+      run: |
+        TAG=${{ needs.build-and-test.outputs.image_tag }}
+        
+        # Update stable deployment
+        for service in agent-orchestrator retrieval-service ai-gateway guardrail-service; do
+          kubectl set image deployment/${service} \
+            ${service}=${{ env.REGISTRY }}/${service}:${TAG} \
+            -n ai-production
+        done
+        
+        # Wait for rollout
+        for service in agent-orchestrator retrieval-service ai-gateway guardrail-service; do
+          kubectl rollout status deployment/${service} -n ai-production --timeout=600s
+        done
+        
+        # Remove canary traffic split (100% to stable)
+        kubectl patch httproute ai-platform-routes -n ai-production --type=json \
+          -p='[{"op":"replace","path":"/spec/rules/0/backendRefs/0/weight","value":100},
+               {"op":"replace","path":"/spec/rules/0/backendRefs/1/weight","value":0}]'
+
+    - name: Verify production
+      run: |
+        sleep 30
+        curl -sf https://api.ai-platform.company.com/health/deep || exit 1
+
+    - name: Tag release
+      run: |
+        git tag "v${{ needs.build-and-test.outputs.image_tag }}-prod"
+        git push origin "v${{ needs.build-and-test.outputs.image_tag }}-prod"
+
+  rollback-production:
+    name: Rollback Canary
+    runs-on: ubuntu-latest
+    needs: canary-deploy
+    if: needs.canary-deploy.outputs.decision == 'rollback'
+    steps:
+    - uses: actions/checkout@v4
+
+    - name: Configure kubectl
+      uses: aws-actions/configure-aws-credentials@v4
+      with:
+        role-to-assume: ${{ secrets.AWS_ROLE_PROD }}
+        aws-region: ${{ env.CLUSTER_REGION }}
+
+    - name: Update kubeconfig
+      run: aws eks update-kubeconfig --name ${{ env.CLUSTER_NAME }} --region ${{ env.CLUSTER_REGION }}
+
+    - name: Rollback canary
+      run: |
+        # Remove all canary traffic
+        kubectl patch httproute ai-platform-routes -n ai-production --type=json \
+          -p='[{"op":"replace","path":"/spec/rules/0/backendRefs/0/weight","value":100},
+               {"op":"replace","path":"/spec/rules/0/backendRefs/1/weight","value":0}]'
+        
+        # Scale down canary
+        kubectl scale deployment/agent-orchestrator-canary --replicas=0 -n ai-production
+
+    - name: Create rollback issue
+      uses: actions/github-script@v7
+      with:
+        script: |
+          github.rest.issues.create({
+            owner: context.repo.owner,
+            repo: context.repo.repo,
+            title: `🚨 Canary rollback: ${context.sha.substring(0,7)}`,
+            body: `Canary deployment was automatically rolled back.\n\nCommit: ${context.sha}\nReason: Metrics degradation detected during canary phase.\n\nPlease investigate before re-deploying.`,
+            labels: ['rollback', 'production', 'urgent']
+          });
+
+  # ===========================================================================
+  # NOTIFICATIONS
+  # ===========================================================================
+  notify-failure:
+    name: Notify on Failure
+    runs-on: ubuntu-latest
+    needs: [build-and-test, eval-golden-dataset, eval-safety, security-scan, container-build, deploy-staging, integration-tests, canary-deploy]
+    if: failure()
+    steps:
+    - name: Notify Slack
+      uses: slackapi/slack-github-action@v1
+      with:
+        payload: |
+          {
+            "channel": "#ai-platform-alerts",
+            "text": "🚨 AI Platform CI/CD Failed",
+            "blocks": [
+              {
+                "type": "section",
+                "text": {
+                  "type": "mrkdwn",
+                  "text": "🚨 *AI Platform CI/CD Pipeline Failed*\n\n*Branch:* `${{ github.ref_name }}`\n*Commit:* `${{ github.sha }}`\n*Author:* ${{ github.actor }}\n*Run:* <${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}|View>"
+                }
+              }
+            ]
+          }
+      env:
+        SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
+
+    - name: Notify PagerDuty (production failures only)
+      if: github.ref == 'refs/heads/main'
+      run: |
+        curl -X POST https://events.pagerduty.com/v2/enqueue \
+          -H "Content-Type: application/json" \
+          -d '{
+            "routing_key": "${{ secrets.PAGERDUTY_KEY }}",
+            "event_action": "trigger",
+            "payload": {
+              "summary": "AI Platform deployment pipeline failed",
+              "severity": "critical",
+              "source": "github-actions"
+            }
+          }'
