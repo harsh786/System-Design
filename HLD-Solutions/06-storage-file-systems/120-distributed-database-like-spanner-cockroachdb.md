@@ -73,6 +73,34 @@ Raft groups per node: ~4000
 
 ## 4. Data Modeling
 
+### Entity-Relationship Diagram
+
+```mermaid
+erDiagram
+    USERS {
+        uuid user_id PK
+        string email
+        string name
+        string region
+    }
+    ORDERS {
+        uuid order_id PK
+        uuid user_id FK
+        decimal total
+        string status
+        timestamptz created_at
+    }
+    ORDER_ITEMS {
+        uuid order_id PK
+        uuid item_id PK
+        uuid product_id FK
+        int quantity
+        decimal unit_price
+    }
+    USERS ||--o{ ORDERS : places
+    ORDERS ||--|{ ORDER_ITEMS : contains
+```
+
 ### Range Descriptor
 ```protobuf
 message RangeDescriptor {
@@ -1271,4 +1299,427 @@ cluster_settings:
       constraints: ["+region=us-east", "+region=eu-west", "+region=ap-tokyo"]
       num_replicas: 5
       lease_preferences: [["+region=us-east"]]
+```
+
+---
+
+## Sequence Diagrams
+
+### Distributed Transaction - Two-Phase Commit (2PC)
+
+```mermaid
+sequenceDiagram
+    participant C as Client
+    participant GW as Gateway/Coordinator
+    participant TM as Transaction Manager
+    participant R1 as Range-1 (Leaseholder, accounts)
+    participant R2 as Range-2 (Leaseholder, orders)
+    participant R1F as Range-1 Followers
+    participant R2F as Range-2 Followers
+
+    C->>GW: BEGIN; UPDATE accounts SET balance-=100 WHERE id=1; INSERT INTO orders(...); COMMIT;
+    GW->>TM: StartTransaction(txn_id=T1, timestamp=HLC_now)
+    
+    GW->>R1: Write Intent(key=account:1, value=balance-100, txn=T1)
+    R1->>R1: Acquire write lock, write intent record
+    R1->>R1F: Replicate intent via Raft
+    R1F-->>R1: Majority ACK
+    R1-->>GW: Intent written
+
+    GW->>R2: Write Intent(key=order:new, value={...}, txn=T1)
+    R2->>R2: Acquire write lock, write intent record
+    R2->>R2F: Replicate intent via Raft
+    R2F-->>R2: Majority ACK
+    R2-->>GW: Intent written
+
+    Note over GW: Phase 1 complete: all intents written
+
+    GW->>TM: CommitTransaction(T1)
+    TM->>TM: Write transaction record: COMMITTED (single Raft write)
+    TM-->>GW: Committed at timestamp T1
+
+    Note over GW: Phase 2: resolve intents (async, best-effort)
+    par Resolve intents
+        GW->>R1: ResolveIntent(account:1, T1, COMMITTED)
+        R1->>R1: Convert intent → committed value, release lock
+    and
+        GW->>R2: ResolveIntent(order:new, T1, COMMITTED)
+        R2->>R2: Convert intent → committed value, release lock
+    end
+
+    GW-->>C: COMMIT OK (timestamp: T1)
+```
+
+### Range Split + Rebalancing
+
+```mermaid
+sequenceDiagram
+    participant LH as Leaseholder (Range R1: keys a-z)
+    participant Store as Store Manager
+    participant Meta as Meta Range (system.ranges)
+    participant NewR as New Range R2 (split-off)
+    participant Raft as Raft Group
+    participant Bal as Rebalancer
+
+    Note over LH: Range R1 exceeds 512MB threshold
+    LH->>LH: Find split key (middle key by size: "m")
+    LH->>Raft: Propose split: R1[a-z] → R1[a-m) + R2[m-z]
+    Raft->>Raft: Replicate split command to followers
+    Raft-->>LH: Committed (majority)
+
+    LH->>LH: Freeze writes momentarily
+    LH->>LH: Create new Range R2 with keys [m-z]
+    LH->>NewR: Initialize R2 (same replicas initially)
+    LH->>Meta: Update range descriptors:<br/>R1: [a-m), R2: [m-z]
+    Meta-->>LH: Registered
+    LH->>LH: Unfreeze writes
+
+    Note over LH,NewR: Both ranges now serving from same nodes
+
+    Bal->>Bal: Periodic check: node load distribution
+    Bal->>Bal: Node-3 has 40% less load → move R2 there
+    
+    Bal->>NewR: AddReplica(Node-3) via Raft learner
+    NewR->>NewR: Snapshot transfer to Node-3 (SSTable streaming)
+    NewR-->>Bal: Node-3 caught up
+    Bal->>NewR: PromoteToVoter(Node-3)
+    Bal->>NewR: RemoveReplica(Node-1) [original over-loaded node]
+    Bal->>NewR: TransferLease(Node-3)
+    
+    Note over Bal: R2 now balanced to less-loaded node
+```
+
+### Cross-Region Replication
+
+```mermaid
+sequenceDiagram
+    participant C as Client (US-East)
+    participant LH as Leaseholder (US-East)
+    participant F1 as Follower (EU-West)
+    participant F2 as Follower (AP-Tokyo)
+    participant Raft as Raft Log
+
+    C->>LH: INSERT INTO users VALUES (...)
+    LH->>LH: Assign HLC timestamp, acquire latches
+    LH->>Raft: Propose entry (append to Raft log)
+    
+    par Replicate to followers
+        LH->>F1: AppendEntries(log entry) [~80ms RTT to EU]
+        LH->>F2: AppendEntries(log entry) [~150ms RTT to Tokyo]
+    end
+
+    F1-->>LH: ACK (80ms later)
+    Note over LH: Majority achieved (LH + F1 = 2 of 3)
+    LH->>LH: Apply to state machine, release latches
+    LH-->>C: COMMIT OK (~85ms total)
+
+    F2-->>LH: ACK (150ms later, after commit already returned)
+    
+    Note over F1: Follower read (stale, no round-trip to leaseholder)
+    Note over F2: Follower reads use closed_timestamp protocol:<br/>Leaseholder publishes "no writes below T" periodically<br/>Followers can serve reads at T without checking leaseholder
+
+    Note over LH: For global tables (non-voting replicas):
+    LH->>F1: Raft learner replication (async, no quorum needed)
+    LH->>F2: Raft learner replication
+    Note over F1,F2: Can serve timeline-consistent reads locally
+```
+
+## Caching Strategy
+
+| Layer | Technology | What's Cached | TTL | Invalidation |
+|-------|-----------|---------------|-----|--------------|
+| SQL plan cache | In-process LRU | Prepared statement plans | 5 min | Schema change DDL |
+| Range cache | In-process | Range descriptor → node mapping | Until lease transfer | Gossip update |
+| Timestamp cache | Per-range in-memory | Recent read timestamps (for write conflicts) | Lease duration | Lease transfer clears |
+| Block cache | RocksDB block cache | SSTable data + index blocks | LRU | Compaction |
+| Table statistics | System tables | Row counts, histograms for optimizer | 1 hour | ANALYZE TABLE |
+| Lease cache (client) | Connection-level | Which node holds lease for range | Until redirect | RPC returns NotLeaseholder |
+
+## Async Processing
+
+| Operation | Mechanism | SLA | Impact |
+|-----------|-----------|-----|--------|
+| Intent resolution | Async after commit | < 100ms typical | Stale intents slow concurrent readers |
+| Garbage collection | Per-range GC queue | Hours | Old MVCC versions accumulate |
+| Compaction | RocksDB background | Continuous | Write amplification, space reclaim |
+| Stats collection | Background job | Every 5 min | Optimizer accuracy |
+| Changefeed emission | Rangefeed protocol | < 1s lag | CDC consumers |
+| Schema changes | Online DDL (backfill) | Minutes to hours | Non-blocking, uses temporary indexes |
+
+## Infrastructure Components
+
+```
+┌─────────────────────────────────────────────────────────────────┐
+│         Distributed Database (CockroachDB-style) Infra          │
+├─────────────────────────────────────────────────────────────────┤
+│ Regions: US-East, EU-West, AP-Tokyo                             │
+│                                                                  │
+│ Per-Region:                                                      │
+│   3 nodes (minimum for Raft quorum within region)               │
+│   Each: 32 cores, 128GB RAM, 4× 2TB NVMe SSD                  │
+│   RocksDB: 32GB block cache, 4GB memtable budget               │
+│                                                                  │
+│ Global:                                                          │
+│   9 nodes total (3 regions × 3 nodes)                           │
+│   Meta ranges: 5 replicas across all 3 regions                  │
+│   Default: 3 replicas (one per region for survival tables)      │
+│   Regional tables: 3 replicas within single region (lower lat.) │
+│                                                                  │
+│ Network:                                                         │
+│   Intra-region: < 1ms RTT                                       │
+│   Cross-region: 80-150ms RTT (determines commit latency)        │
+│   Dedicated inter-region links (10 Gbps)                        │
+│                                                                  │
+│ Time Synchronization:                                            │
+│   NTP with multiple sources (Google, Amazon, internal)          │
+│   Max clock skew tolerance: 500ms (default)                     │
+│   HLC ensures causality despite skew                            │
+│                                                                  │
+│ Monitoring:                                                      │
+│   p50/p99 SQL latency, range count per node, LSM health        │
+│   Replication lag, intent age, GC queue depth                   │
+│   Alerting: leaseholder imbalance, clock skew > 300ms           │
+└─────────────────────────────────────────────────────────────────┘
+```
+
+## Algorithm Deep Dive: Raft Consensus
+
+### What Raft Solves
+
+Raft ensures that a group of nodes (typically 3 or 5) agree on a sequence of operations (replicated log) even if some nodes crash. It provides **linearizable** consistency.
+
+### Key Roles
+
+```
+LEADER:    Accepts client writes, replicates to followers, decides commit
+FOLLOWER:  Receives replicated entries, votes in elections
+CANDIDATE: Temporarily during election (follower that timed out)
+```
+
+### Leader Election Step-by-Step
+
+```
+Initial state: 3 nodes [A, B, C], all FOLLOWER, term=1, leader=A
+
+Step 1: Leader A crashes (stops sending heartbeats)
+
+Step 2: Node B's election timeout fires (randomized 150-300ms)
+  B transitions: FOLLOWER → CANDIDATE
+  B increments term: term=2
+  B votes for itself: votes={B}
+  B sends RequestVote(term=2, lastLogIndex=10, lastLogTerm=1) to [A, C]
+
+Step 3: Node C receives RequestVote
+  C checks: term=2 > my_term=1? YES → update term
+  C checks: B's log at least as up-to-date as mine? 
+    B: (lastLogIndex=10, lastLogTerm=1)
+    C: (lastLogIndex=10, lastLogTerm=1)
+    → Yes (equal is sufficient)
+  C grants vote to B
+  C resets election timer (won't start own election)
+
+Step 4: B receives vote from C
+  votes = {B, C} = 2/3 = MAJORITY
+  B transitions: CANDIDATE → LEADER (term=2)
+  B immediately sends heartbeats to all nodes
+
+Step 5: Node A recovers (comes back online)
+  A receives heartbeat from B with term=2
+  A's term=1 < 2 → A accepts B as leader
+  A transitions to FOLLOWER, updates term=2
+
+Election safety: 
+  - Only ONE leader per term (each node votes once per term)
+  - Randomized timeouts prevent split votes (150-300ms range)
+  - Log completeness: candidate must have all committed entries
+```
+
+### Log Replication Step-by-Step
+
+```
+Leader B, term=2, followers: [A, C]
+Log state: [1:SET x=1 | 2:SET y=2 | 3:SET x=3 | ...]
+             ↑ committed up to index 3
+
+Step 1: Client sends: SET z=5
+  Leader B appends to local log: index=4, term=2, cmd="SET z=5"
+  Log: [1:SET x=1 | 2:SET y=2 | 3:SET x=3 | 4:SET z=5]
+                                               ↑ uncommitted
+
+Step 2: Leader sends AppendEntries to followers
+  AppendEntries(
+    term=2,
+    prevLogIndex=3, prevLogTerm=1,  ← for consistency check
+    entries=[{index:4, term:2, cmd:"SET z=5"}],
+    leaderCommit=3
+  )
+
+Step 3: Follower A receives AppendEntries
+  A checks: do I have entry at prevLogIndex=3 with term=1? YES
+  A appends entry 4 to local log
+  A responds: success=true, matchIndex=4
+
+Step 4: Follower C receives and appends similarly
+  C responds: success=true, matchIndex=4
+
+Step 5: Leader B receives ACKs
+  matchIndex: {B:4, A:4, C:4}
+  Majority (2/3) have index 4 → COMMIT index 4
+  Leader updates commitIndex=4
+  Leader applies "SET z=5" to state machine
+  Leader responds to client: OK
+
+Step 6: Next AppendEntries (or heartbeat) includes leaderCommit=4
+  Followers update their commitIndex=4
+  Followers apply "SET z=5" to their state machines
+```
+
+### Commit Rule
+
+```
+An entry at index I is committed when:
+  1. It's stored on majority of nodes, AND
+  2. At least one entry from the CURRENT term is committed at index >= I
+     (This prevents the "figure 8" problem from the Raft paper)
+
+Example of safety:
+  Term 2 leader replicates entry but crashes before majority
+  Term 3 leader CANNOT commit term-2 entries by counting replicas alone
+  Term 3 leader must first commit a term-3 entry → then all prior entries 
+  are implicitly committed
+```
+
+### Log Compaction (Snapshots)
+
+```
+Problem: Log grows forever → new nodes take forever to catch up
+
+Solution: Periodic snapshots
+  1. State machine serializes current state at commitIndex=1000
+  2. Write snapshot to disk: {lastIncludedIndex:1000, lastIncludedTerm:5, state_data}
+  3. Discard log entries [1..1000]
+  4. Keep log from 1001 onwards
+
+For slow followers:
+  If follower is too far behind (needs entries already discarded):
+  Leader sends InstallSnapshot RPC with full state
+  Follower loads snapshot, discards its entire log, continues from there
+```
+
+### Complexity Analysis
+
+| Operation | Messages | Latency | Disk I/O |
+|-----------|----------|---------|----------|
+| Leader election | O(N) RPCs | 150-300ms (timeout) + 1 RTT | 1 (persist vote) |
+| Log replication | O(N) RPCs per entry | 1 RTT (parallel sends) | 1 (WAL append) |
+| Commit | 0 (piggyback) | Same as replication | 0 |
+| Read (leader lease) | 0 RPCs | Local | Local read |
+| Read (linearizable) | O(N) RPCs (heartbeat round) | 1 RTT | 0 |
+
+## Algorithm Deep Dive: TrueTime and Hybrid Logical Clocks (HLC)
+
+### The Clock Problem in Distributed Systems
+
+```
+Problem: Two nodes assign timestamps to transactions
+  Node A: T1 happens at physical_clock = 100
+  Node B: T2 happens at physical_clock = 99
+  
+  But causally: T1 happened BEFORE T2 (T1 → T2)
+  Physical clocks say: T2 < T1 (WRONG ORDER!)
+  
+  Result: Violations of external consistency (real-time ordering)
+```
+
+### Google TrueTime (Spanner's approach)
+
+```
+TrueTime API:
+  TT.now() → returns interval [earliest, latest]
+  TT.after(t) → true if t is definitely in the past
+  TT.before(t) → true if t is definitely in the future
+
+Uncertainty bound (ε): typically 1-7ms
+  Sources: GPS receivers + atomic clocks in every datacenter
+  
+Commit protocol (commit-wait):
+  1. Transaction acquires locks, does writes
+  2. Assign commit timestamp s = TT.now().latest
+  3. WAIT until TT.after(s) is true (wait out uncertainty)
+     Wait time: ~2ε ≈ 2-14ms
+  4. Release locks, make writes visible at timestamp s
+  
+  Guarantee: If T1 committed before T2 started (real time),
+             then s1 < s2 (timestamp order matches real-time order)
+  
+  Cost: Every commit pays ~7ms latency (the wait)
+  Benefit: Globally consistent snapshots, lock-free reads at any timestamp
+```
+
+### Hybrid Logical Clocks (HLC) - CockroachDB's approach
+
+```
+HLC = (physical_time, logical_counter)
+  physical_time: wall clock (with bounded skew)
+  logical_counter: breaks ties when physical clocks are equal
+
+Rules:
+  Send/local event:
+    hlc.physical = max(hlc.physical, wall_clock)
+    hlc.logical = 0 (if physical advanced) or hlc.logical + 1
+
+  Receive message with timestamp msg_hlc:
+    hlc.physical = max(hlc.physical, msg_hlc.physical, wall_clock)
+    if hlc.physical == old_physical and == msg_hlc.physical:
+      hlc.logical = max(hlc.logical, msg_hlc.logical) + 1
+    elif hlc.physical == old_physical:
+      hlc.logical = hlc.logical + 1
+    elif hlc.physical == msg_hlc.physical:
+      hlc.logical = msg_hlc.logical + 1
+    else:
+      hlc.logical = 0
+
+Example:
+  Node A: wall=100, HLC=(100, 0)
+  Node A event: HLC=(100, 1)
+  Node A sends message to B
+  
+  Node B: wall=98 (clock behind!), receives msg with (100, 1)
+  Node B: HLC = (max(98, 100), ...) = (100, 2)
+  
+  Causality preserved: A's event (100,1) < B's event (100,2)
+```
+
+### HLC vs TrueTime Comparison
+
+| Aspect | TrueTime (Spanner) | HLC (CockroachDB) |
+|--------|-------------------|---------------------|
+| Hardware | GPS + atomic clocks required | Standard NTP |
+| Uncertainty | Known, bounded (1-7ms) | Unknown (assumed < 500ms) |
+| Commit latency | +2ε (commit-wait) | No wait (optimistic) |
+| Correctness | Always correct | Correct if clock skew < max_offset |
+| Read staleness | Can read any past timestamp | Closed timestamp protocol (~2s lag for follower reads) |
+| Cost | Expensive hardware | Standard servers |
+| Failure mode | Graceful (ε grows if GPS lost) | Possible linearizability violation if skew exceeds bound |
+
+### CockroachDB's Clock Skew Handling
+
+```
+Max offset: 500ms (configurable)
+If detected skew > 80% of max_offset → node self-quarantines
+
+Read uncertainty interval:
+  When Node A reads key at timestamp T:
+  If key has version in range [T, T + max_offset]:
+    → "uncertain" — could be concurrent
+    → Retry read at higher timestamp (push the read forward)
+    → At most one retry per node in the read's uncertainty window
+
+Write serialization:
+  Writes acquire latches (locks) on key ranges
+  Timestamp cache tracks: "key X was read at timestamp T"
+  If write at T' < T → write pushed forward to T+1 (write-write conflict)
+  
+  This guarantees single-key linearizability without TrueTime
+  Cross-key (serializable) relies on 2PC + locking
 ```

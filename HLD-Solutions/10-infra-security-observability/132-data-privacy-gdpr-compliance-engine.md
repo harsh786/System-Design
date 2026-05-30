@@ -60,6 +60,76 @@ Storage:
 
 ## 4. Data Modeling
 
+### Entity-Relationship Diagram
+
+```mermaid
+erDiagram
+    CONSENT_RECORDS {
+        uuid consent_id PK
+        uuid user_id
+        string purpose
+        string legal_basis
+        string status
+        string collection_method
+    }
+    CONSENT_AUDIT_LOG {
+        bigint log_id PK
+        uuid consent_id FK
+        uuid user_id
+        string action
+        string new_status
+    }
+    DATA_STORES {
+        uuid store_id PK
+        string store_name
+        string store_type
+        string owner_team
+        string classification
+    }
+    PII_FINDINGS {
+        uuid finding_id PK
+        uuid store_id FK
+        string table_or_collection
+        string pii_type
+        string sensitivity_level
+        decimal confidence_score
+    }
+    DSAR_REQUESTS {
+        uuid request_id PK
+        uuid user_id
+        string request_type
+        string status
+        timestamp deadline_at
+    }
+    DSAR_SYSTEM_TASKS {
+        uuid task_id PK
+        uuid request_id FK
+        uuid store_id FK
+        string task_type
+        string status
+    }
+    RETENTION_POLICIES {
+        uuid policy_id PK
+        string policy_name
+        string data_category
+        int retention_days
+        string purge_method
+    }
+    RETENTION_EXECUTIONS {
+        uuid execution_id PK
+        uuid policy_id FK
+        uuid store_id
+        bigint records_purged
+        string status
+    }
+
+    CONSENT_RECORDS ||--o{ CONSENT_AUDIT_LOG : "audited by"
+    DATA_STORES ||--o{ PII_FINDINGS : "scanned for"
+    DSAR_REQUESTS ||--o{ DSAR_SYSTEM_TASKS : "executed via"
+    DATA_STORES ||--o{ DSAR_SYSTEM_TASKS : "targeted by"
+    RETENTION_POLICIES ||--o{ RETENTION_EXECUTIONS : "enforced by"
+```
+
 ### 4.1 Consent Records
 
 ```sql
@@ -1048,3 +1118,103 @@ Submit → Verify Identity → Create Tasks (fan-out to 47 systems)
 - ISO 27701 (Privacy Information Management)
 - NIST Privacy Framework
 - WP29 Guidelines on Consent, Transparency, DSAR
+
+---
+
+## Sequence Diagrams
+
+### DSAR Request Fulfillment (Data Subject Access Request)
+
+```mermaid
+sequenceDiagram
+    participant User as Data Subject
+    participant Portal as Privacy Portal
+    participant API as DSAR API
+    participant Auth as Identity Verification
+    participant Orchestrator as DSAR Orchestrator
+    participant Catalog as Data Catalog
+    participant Svc1 as User Service
+    participant Svc2 as Orders Service
+    participant Svc3 as Analytics Service
+    participant Store as DSAR Store
+    participant Notify as Notification Service
+
+    User->>Portal: Submit access request ("I want my data")
+    Portal->>API: POST /dsar {type: access, subject_email}
+    API->>Auth: Verify identity (email verification + ID match)
+    Auth-->>API: Identity confirmed
+
+    API->>Store: Create DSAR record {id, type: access, status: in_progress, deadline: 30 days}
+    API->>Orchestrator: Begin data collection
+    API-->>User: 202 Accepted (reference: DSAR-2024-0042)
+
+    Orchestrator->>Catalog: Lookup all systems containing PII for user
+    Catalog-->>Orchestrator: Systems: [user-svc, orders-svc, analytics-svc]
+
+    par Parallel data collection
+        Orchestrator->>Svc1: GET /privacy/export?subject_id=123
+        Svc1-->>Orchestrator: User profile data (JSON)
+    and
+        Orchestrator->>Svc2: GET /privacy/export?subject_id=123
+        Svc2-->>Orchestrator: Order history (JSON)
+    and
+        Orchestrator->>Svc3: GET /privacy/export?subject_id=123
+        Svc3-->>Orchestrator: Analytics data (JSON)
+    end
+
+    Orchestrator->>Orchestrator: Compile data package (structured, machine-readable)
+    Orchestrator->>Store: Store compiled report (encrypted, 90-day expiry)
+    Orchestrator->>Store: Update DSAR: status=completed
+    Orchestrator->>Notify: Email user: "Your data is ready for download"
+    Notify->>User: Secure download link (expires in 7 days)
+```
+
+### Right to Erasure Cascade Across Services
+
+```mermaid
+sequenceDiagram
+    participant User as Data Subject
+    participant API as DSAR API
+    participant Orchestrator as Erasure Orchestrator
+    participant Catalog as Data Catalog
+    participant Legal as Legal Hold Check
+    participant Svc1 as User Service
+    participant Svc2 as Orders Service
+    participant Svc3 as Analytics Service
+    participant Backup as Backup Service
+    participant Audit as Compliance Audit Log
+    participant DLQ as Dead Letter Queue
+
+    User->>API: POST /dsar {type: erasure, subject_id: 123}
+    API->>Legal: Check legal holds / retention obligations
+    Legal-->>API: No holds (or: partial hold on financial records for 7 years)
+
+    API->>Orchestrator: Begin erasure (with exemptions: financial records)
+    Orchestrator->>Catalog: Get all data locations for subject_id=123
+    Catalog-->>Orchestrator: Data map with retention policies per system
+
+    Orchestrator->>Svc1: DELETE /privacy/erase?subject_id=123 [idempotency_key]
+    Svc1->>Svc1: Delete PII, pseudonymize audit trails
+    Svc1-->>Orchestrator: {status: completed, records_deleted: 15}
+
+    Orchestrator->>Svc2: DELETE /privacy/erase?subject_id=123&exempt=financial
+    Svc2->>Svc2: Delete PII from orders, RETAIN anonymized financial records
+    Svc2-->>Orchestrator: {status: partial, deleted: 42, retained: 3 (legal hold)}
+
+    Orchestrator->>Svc3: DELETE /privacy/erase?subject_id=123
+    Svc3->>Svc3: Delete raw events, anonymize aggregates
+    alt Service unavailable
+        Svc3-->>Orchestrator: TIMEOUT
+        Orchestrator->>DLQ: Queue for retry {service: analytics, attempt: 1}
+        Note over DLQ: Retry with exponential backoff (max 72h before escalation)
+    else Success
+        Svc3-->>Orchestrator: {status: completed}
+    end
+
+    Orchestrator->>Backup: Schedule backup erasure (next backup rotation)
+    Backup-->>Orchestrator: Scheduled (will be purged in next cycle)
+
+    Orchestrator->>Audit: Log erasure certificate {what_deleted, what_retained, justification}
+    Orchestrator->>API: Erasure complete (with exceptions noted)
+    API->>User: Confirmation: "Your data has been erased" + retained items explanation
+```

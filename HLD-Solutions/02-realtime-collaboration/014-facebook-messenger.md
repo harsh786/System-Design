@@ -90,6 +90,65 @@
 
 ## 4. Data Modeling
 
+### Entity-Relationship Diagram
+
+```mermaid
+erDiagram
+    USERS {
+        bigint user_id PK
+        varchar name
+        varchar phone
+        bytea e2e_identity_key
+    }
+    CONVERSATIONS {
+        bigint conversation_id PK
+        enum type
+        bigint creator_id FK
+        boolean encryption_enabled
+    }
+    CONVERSATION_PARTICIPANTS {
+        bigint conversation_id PK
+        bigint user_id PK
+        enum role
+        bigint last_read_message_id
+    }
+    MESSAGES {
+        bigint conversation_id PK
+        bigint message_id PK
+        bigint sender_id FK
+        enum type
+        blob content
+    }
+    MEDIA_ATTACHMENTS {
+        bigint media_id PK
+        bigint message_id FK
+        bigint conversation_id FK
+        enum type
+        varchar blob_key
+    }
+    KEY_BUNDLES {
+        bigint user_id PK
+        int device_id PK
+        bytea identity_key
+        bytea signed_prekey
+    }
+    DELIVERY_RECEIPTS {
+        bigint conversation_id PK
+        bigint message_id PK
+        bigint user_id PK
+        enum status
+    }
+
+    USERS ||--o{ CONVERSATION_PARTICIPANTS : "joins"
+    CONVERSATIONS ||--o{ CONVERSATION_PARTICIPANTS : "has"
+    USERS ||--o{ CONVERSATIONS : "creates"
+    CONVERSATIONS ||--o{ MESSAGES : "contains"
+    USERS ||--o{ MESSAGES : "sends"
+    MESSAGES ||--o{ MEDIA_ATTACHMENTS : "has"
+    MESSAGES ||--o{ DELIVERY_RECEIPTS : "tracked by"
+    USERS ||--o{ KEY_BUNDLES : "registers"
+```
+
 ### Database Technology Selection
 
 | Workload | Technology | Rationale |
@@ -900,3 +959,157 @@ Total: ~15ms sender to recipient (both online, same region)
 - Spam detection ML models on metadata (not content for E2E)
 - Child safety: hash-matching on non-E2E media (PhotoDNA)
 - Account takeover protection: challenge on new device
+
+---
+
+## Sequence Diagrams
+
+### 1. Message Send + Delivery Receipt
+
+```mermaid
+sequenceDiagram
+    participant A as Sender (Alice)
+    participant MQTT as MQTT Broker
+    participant RS as Routing Service
+    participant MS as Message Service
+    participant DB as HBase (Messages)
+    participant Cache as TAO Cache
+    participant Q as Message Queue
+    participant MQTT2 as Recipient MQTT Broker
+    participant B as Recipient (Bob)
+
+    A->>MQTT: PUBLISH /messages {to: Bob, content, msg_id}
+    MQTT->>RS: Route message
+    RS->>MS: Process message
+    MS->>MS: Generate server timestamp + ordering ID
+    MS->>DB: Write message (partition: conversation_id)
+    MS->>Cache: Update conversation last_message
+    MS-->>MQTT: PUBACK to sender
+    MQTT-->>A: Sent confirmation (circle icon)
+
+    MS->>Q: Enqueue for delivery
+
+    alt Bob is online (MQTT session active)
+        Q->>RS: Resolve Bob's MQTT broker
+        RS->>MQTT2: Route to Bob's broker
+        MQTT2->>B: PUBLISH /inbox {message}
+        B->>MQTT2: PUBACK
+        MQTT2->>MS: Delivery confirmed
+        MS->>DB: Update status = delivered
+        MS->>MQTT: Notify sender
+        MQTT-->>A: Delivered (filled circle icon)
+    else Bob is offline
+        Q->>Q: Retain in offline queue
+        MS->>Q: Trigger push notification (FCM/APNs)
+        Note over Q: Message retained until Bob reconnects<br/>TTL: 30 days
+    end
+```
+
+### 2. Group Creation + First Message
+
+```mermaid
+sequenceDiagram
+    participant C as Creator
+    participant API as API Gateway
+    participant GS as Group Service
+    participant DB as HBase
+    participant Cache as TAO Cache
+    participant MS as Message Service
+    participant Q as Queue
+    participant NS as Notification Service
+    participant M as Members
+
+    C->>API: POST /threads {participants: [B, C, D], name: "Trip Planning"}
+    API->>GS: Create group thread
+    GS->>GS: Validate all participants are friends/connected
+    GS->>DB: Create thread {thread_id, type: GROUP, participants, admin: creator}
+    GS->>Cache: Cache thread metadata
+    GS->>Q: Publish thread.created event
+
+    par Notify all members
+        Q->>NS: Send group creation notifications
+        NS->>M: Push "You were added to Trip Planning"
+    and Create system message
+        Q->>MS: Create system message "Alice created the group"
+        MS->>DB: Persist system message
+    end
+
+    GS-->>API: {thread_id, metadata}
+    API-->>C: 201 Created {thread_id}
+
+    C->>API: POST /messages {thread_id, content: "Hey everyone!"}
+    API->>MS: Process group message
+    MS->>DB: Write message
+    MS->>Q: Fanout to all group members
+    Q->>M: Deliver via respective MQTT brokers
+```
+
+### 3. Read Receipt Sync (Multi-Device)
+
+```mermaid
+sequenceDiagram
+    participant P as Phone
+    participant W as Web Client
+    participant MQTT_P as MQTT Broker (Phone)
+    participant MQTT_W as MQTT Broker (Web)
+    participant SS as Sync Service
+    participant DB as HBase
+    participant Cache as TAO Cache
+    participant Q as Queue
+    participant B as Other Participant
+
+    P->>P: User reads message (viewport trigger)
+    P->>MQTT_P: PUBLISH /read_receipts {thread_id, watermark_ts}
+    MQTT_P->>SS: Process read receipt
+    SS->>DB: UPDATE read_watermark (user_id, thread_id, timestamp)
+    SS->>Cache: Update cached watermark
+
+    par Sync to user's other devices
+        SS->>Q: Publish sync.read_receipt
+        Q->>MQTT_W: Route to web session
+        MQTT_W->>W: PUBLISH /sync {thread_id, read_watermark}
+        W->>W: Update UI (clear unread badge)
+    and Notify other participant
+        SS->>Q: Publish receipt.read
+        Q->>B: Deliver read receipt
+        B->>B: Show "Seen" indicator
+    end
+
+    Note over SS: Read receipts are batched (debounce 1s)<br/>Only latest watermark sent (not per-message)
+```
+
+### Caching Strategy
+
+| Layer | Store | Content | TTL | Eviction |
+|-------|-------|---------|-----|----------|
+| Conversation List | TAO (Graph Cache) | User's active threads, sorted by last_message_ts | Indefinite | Write-through on new message |
+| Recent Messages | Memcached | Last 20 messages per thread | 6h | Invalidate on new message |
+| Presence/Online Status | Redis | User online state + last_active | 60s (heartbeat) | Expire on timeout |
+| Thread Metadata | TAO | Group name, participants, settings | Indefinite | Write-through on update |
+| Read Watermarks | Redis | Per-user per-thread read position | 7d | Update on read event |
+| MQTT Session State | Redis | Active connections, subscriptions | Session | Cleanup on disconnect |
+
+**Cache Invalidation Patterns:**
+- **TAO write-through**: All graph mutations (new message, thread update) update TAO synchronously
+- **Lease-based invalidation**: Prevents thundering herd on popular threads
+- **Version stamps**: Each cache entry has a version; stale reads trigger async refresh
+- **Negative caching**: Cache "does not exist" for deleted messages (30s TTL)
+
+### Infrastructure Components
+
+| Component | Technology | Configuration | Purpose |
+|-----------|-----------|---------------|---------|
+| MQTT Broker Cluster | Custom (Iris) | Millions of persistent connections per host | Bi-directional real-time messaging |
+| Load Balancer | L4 (Proxygen) | Connection-aware, consistent hashing | Route MQTT connections to brokers |
+| API Gateway | GraphQL (Relay) | Rate limiting, auth, request batching | REST/GraphQL endpoints |
+| CDN | Facebook CDN (PoPs) | Global edge, image/video optimization | Media delivery, attachment thumbnails |
+| WebSocket Fallback | HTTP long-poll | For restricted networks | Fallback when MQTT blocked |
+| Service Mesh | Thrift RPC | Circuit breakers, retries, timeouts | Inter-service communication |
+| DNS | Internal service discovery | Health-check aware | Route to healthy MQTT brokers |
+
+**WebSocket/MQTT Gateway Details:**
+- **Connection draining**: 30s graceful shutdown; clients reconnect to new broker
+- **Sticky sessions**: Consistent hashing by user_id ensures same broker for all user devices
+- **Connection limits**: 2M+ connections per broker host (custom epoll-based I/O)
+- **Health checks**: Broker reports load metrics; overloaded brokers stop accepting new connections
+

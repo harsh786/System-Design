@@ -43,6 +43,62 @@
 
 ## 3. Data Modeling
 
+### Entity-Relationship Diagram
+
+```mermaid
+erDiagram
+    CONFIG_NAMESPACES {
+        uuid namespace_id PK
+        string path
+        string parent_path
+        uuid schema_id FK
+        string owner_team
+    }
+    CONFIG_ENTRIES {
+        uuid entry_id PK
+        uuid namespace_id FK
+        string key
+        string value_type
+        bigint version
+    }
+    CONFIG_VERSIONS {
+        uuid version_id PK
+        uuid entry_id FK
+        uuid namespace_id
+        bigint version
+        string change_type
+    }
+    CONFIG_WATCHES {
+        uuid watch_id PK
+        uuid namespace_id FK
+        string client_id
+        string key_pattern
+    }
+    CONFIG_ACL {
+        uuid acl_id PK
+        string namespace_pattern
+        string principal_type
+        string principal_id
+    }
+    CONFIG_AUDIT_LOG {
+        uuid audit_id
+        string namespace_path
+        string action
+        string actor
+    }
+    CONFIG_SCHEMAS {
+        uuid schema_id PK
+        string name
+        jsonb json_schema
+        int version
+    }
+
+    CONFIG_NAMESPACES ||--o{ CONFIG_ENTRIES : "contains"
+    CONFIG_NAMESPACES ||--o{ CONFIG_WATCHES : "watched by"
+    CONFIG_NAMESPACES }o--o| CONFIG_SCHEMAS : "validated by"
+    CONFIG_ENTRIES ||--o{ CONFIG_VERSIONS : "versioned"
+```
+
 ### Database Schemas
 
 ```sql
@@ -1002,3 +1058,87 @@ alerts:
 - **Canary rollout**: Apply to subset first, monitor, then promote
 - **Emergency override**: Break-glass with enhanced audit + auto-ticket
 - **Rollback**: Instant (new version pointing to old value), no destructive operation
+
+---
+
+## Sequence Diagrams
+
+### Config Update + Watch Notification
+
+```mermaid
+sequenceDiagram
+    participant Admin as Admin/CI
+    participant API as Config API
+    participant DB as Config Store (etcd/DB)
+    participant Watcher as Watch Service
+    participant App1 as App Instance 1
+    participant App2 as App Instance 2
+    participant Audit as Audit Log
+
+    Admin->>API: PUT /config/payment-service/timeout {value: 5000, env: prod}
+    API->>API: Validate schema, check permissions
+    API->>DB: Compare-and-swap (old_version → new_version)
+    DB-->>API: Success (revision: 1042)
+    API->>Audit: Log change {who, what, when, old_value, new_value}
+    API-->>Admin: 200 OK {revision: 1042}
+
+    DB->>Watcher: Watch triggered (key prefix: payment-service/*)
+    par Notify App1
+        Watcher->>App1: gRPC stream push {key, value, revision}
+        App1->>App1: Hot-reload config (no restart)
+    and Notify App2
+        Watcher->>App2: gRPC stream push {key, value, revision}
+        App2->>App2: Hot-reload config (no restart)
+    end
+    Note over App1,App2: All instances consistent within ~200ms
+```
+
+### SDK Bootstrap + Cache Warm
+
+```mermaid
+sequenceDiagram
+    participant App as Application (startup)
+    participant SDK as Config SDK
+    participant LocalFile as Local File Cache
+    participant API as Config Service
+    participant DB as Config Store
+
+    App->>SDK: init(service: "payment-service", env: "prod")
+    SDK->>LocalFile: Check local cache file (last known good)
+    alt Local cache exists and fresh (< 5min)
+        LocalFile-->>SDK: Cached config bundle
+        SDK-->>App: Config ready (from cache)
+        SDK->>API: Background: GET /config/payment-service?since=revision
+        API->>DB: Fetch changes since revision
+        DB-->>API: Delta updates (or empty)
+        API-->>SDK: Updates (if any)
+        SDK->>LocalFile: Update local cache
+    else No local cache or stale
+        SDK->>API: GET /config/payment-service (full fetch)
+        API->>DB: Fetch all config for service
+        DB-->>API: Config bundle
+        API-->>SDK: Full config payload
+        SDK->>LocalFile: Write local cache
+        SDK-->>App: Config ready
+    end
+    SDK->>API: Establish watch (gRPC stream / long-poll)
+    Note over SDK,API: SDK now receives real-time updates
+```
+
+## Infrastructure Components
+
+| Component | Technology | Sizing | HA Strategy |
+|-----------|-----------|--------|-------------|
+| Config API | Go microservice | 4 pods, 1 vCPU/2GB | Multi-AZ, stateless |
+| Config Store | etcd cluster (or PostgreSQL) | 3-node (Raft) | Quorum writes, leader election |
+| Watch Service | gRPC streaming | 4 pods | Connection draining on deploy |
+| Local Cache | File on disk per app | - | Survives service outage |
+| Schema Registry | JSON Schema store | Co-located with API | Validates all writes |
+| Audit Log | Kafka → S3 | Append-only | Replication factor 3 |
+| Admin UI | React SPA | Static hosting | CDN-backed |
+
+### Consistency Guarantees
+- etcd provides linearizable reads and writes (Raft consensus)
+- Watch notifications are ordered (no out-of-order delivery)
+- SDK uses revision numbers to detect missed updates (gap detection → full re-fetch)
+- Local file cache provides last-known-good fallback (availability over freshness)

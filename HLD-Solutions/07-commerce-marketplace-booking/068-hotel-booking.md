@@ -54,6 +54,68 @@ Review submissions: 5K/min
 
 ## 4. Data Modeling
 
+### Entity-Relationship Diagram
+
+```mermaid
+erDiagram
+    hotels {
+        UUID hotel_id PK
+        VARCHAR name
+        UUID chain_id FK
+        DECIMAL star_rating
+        VARCHAR city
+        INTEGER total_rooms
+        VARCHAR status
+    }
+    room_types {
+        UUID room_type_id PK
+        UUID hotel_id FK
+        VARCHAR name
+        INTEGER max_occupancy
+        INTEGER total_inventory
+    }
+    rate_plans {
+        UUID rate_plan_id PK
+        UUID room_type_id FK
+        UUID hotel_id FK
+        VARCHAR rate_type
+        VARCHAR meal_plan
+    }
+    daily_rates {
+        UUID room_type_id FK
+        UUID rate_plan_id FK
+        DATE date
+        INTEGER rate_cents
+        BOOLEAN closed
+    }
+    room_inventory {
+        UUID room_type_id FK
+        DATE date
+        INTEGER total_rooms
+        INTEGER sold_rooms
+        BOOLEAN stop_sell
+    }
+    bookings {
+        UUID booking_id PK
+        UUID hotel_id FK
+        UUID room_type_id FK
+        UUID rate_plan_id FK
+        UUID guest_id FK
+        DATE check_in
+        DATE check_out
+        INTEGER total_cents
+        VARCHAR status
+    }
+
+    hotels ||--o{ room_types : "has"
+    room_types ||--o{ rate_plans : "priced by"
+    rate_plans ||--o{ daily_rates : "daily pricing"
+    room_types ||--o{ room_inventory : "availability"
+    hotels ||--o{ bookings : "receives"
+    room_types ||--o{ bookings : "booked"
+    rate_plans ||--o{ bookings : "at rate"
+```
+
 ### Full Database Schemas
 
 ```sql
@@ -1099,4 +1161,86 @@ Master Rate (€220/night)
 ├── Genius Member: €220 × 0.95 = €209
 ├── Mobile-Only: €220 × 0.92 = €202
 └── Breakfast Package: €220 + €20 = €240
+```
+
+---
+
+## 12. Sequence Diagrams
+
+### 12.1 Rate Shopping + Comparison
+
+```mermaid
+sequenceDiagram
+    participant Traveler
+    participant API Gateway
+    participant SearchService
+    participant RateAggregator
+    participant HotelSupplier1
+    participant HotelSupplier2
+    participant OwnInventory
+    participant Cache(Redis)
+
+    Traveler->>API Gateway: GET /hotels?city=NYC&checkin=Jan10&checkout=Jan12&rooms=1
+    API Gateway->>SearchService: search(params)
+    SearchService->>Cache(Redis): GET rates:NYC:Jan10-12 (hot cache)
+    Cache(Redis)-->>SearchService: MISS
+
+    par Parallel rate fetch
+        SearchService->>RateAggregator: fetchRates(Expedia API)
+        RateAggregator->>HotelSupplier1: GET /availability
+        HotelSupplier1-->>RateAggregator: 45 hotels with rates
+
+        SearchService->>RateAggregator: fetchRates(Booking.com API)
+        RateAggregator->>HotelSupplier2: GET /availability
+        HotelSupplier2-->>RateAggregator: 52 hotels with rates
+
+        SearchService->>OwnInventory: getDirectRates(NYC, dates)
+        OwnInventory-->>SearchService: 20 hotels (direct contracts)
+    end
+
+    RateAggregator-->>SearchService: merged results (82 unique hotels)
+
+    Note over SearchService: De-duplicate hotels<br/>Show best rate per hotel<br/>Apply member discounts<br/>Rank by: relevance + price + rating
+
+    SearchService->>Cache(Redis): SET rates:NYC:Jan10-12 (TTL=5min)
+    SearchService-->>API Gateway: Top 25 hotels with rates
+    API Gateway-->>Traveler: Hotel comparison results
+```
+
+### 12.2 Booking with Allotment Decrement
+
+```mermaid
+sequenceDiagram
+    participant Traveler
+    participant BookingService
+    participant AllotmentService
+    participant Redis
+    participant PostgreSQL
+    participant PaymentService
+    participant HotelPMS
+    participant ConfirmationService
+
+    Traveler->>BookingService: POST /bookings {hotel_id, room_type, dates, guest_info}
+    BookingService->>AllotmentService: reserveRoom(hotel_id, room_type, Jan10-12)
+
+    AllotmentService->>Redis: WATCH allotment:{hotel}:{room_type}:Jan10
+    AllotmentService->>Redis: GET allotment:{hotel}:{room_type}:Jan10
+    Redis-->>AllotmentService: available = 5
+
+    Note over AllotmentService: available(5) > 0 ✓
+    AllotmentService->>Redis: MULTI → DECR for Jan10, Jan11
+    Redis-->>AllotmentService: [4, 3] (decremented)
+    AllotmentService->>PostgreSQL: INSERT reservation(TENTATIVE, ttl=10min)
+    AllotmentService-->>BookingService: reserved
+
+    BookingService->>PaymentService: charge(traveler, $450)
+    PaymentService-->>BookingService: payment_confirmed
+
+    BookingService->>PostgreSQL: UPDATE reservation status=CONFIRMED
+    BookingService->>HotelPMS: POST /reservations (push booking to hotel)
+    HotelPMS-->>BookingService: hotel_confirmation_number = HC-789
+
+    BookingService->>ConfirmationService: sendConfirmation(booking, email)
+    ConfirmationService-->>Traveler: Email with booking details + HC-789
+    BookingService-->>Traveler: "Booking confirmed! Conf# HC-789"
 ```

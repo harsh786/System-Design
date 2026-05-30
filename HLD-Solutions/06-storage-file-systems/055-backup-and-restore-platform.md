@@ -43,6 +43,67 @@
 
 ## 3. Data Modeling
 
+### Entity-Relationship Diagram
+
+```mermaid
+erDiagram
+    BACKUP_POLICIES {
+        uuid policy_id PK
+        uuid org_id FK
+        string name
+        string source_type
+        string backup_type
+        string schedule_cron
+    }
+    BACKUP_JOBS {
+        uuid job_id PK
+        uuid policy_id FK
+        uuid parent_job_id FK
+        string job_type
+        string status
+        bigint stored_bytes
+    }
+    SNAPSHOTS {
+        uuid snapshot_id PK
+        uuid job_id FK
+        uuid policy_id FK
+        string snapshot_type
+        timestamptz point_in_time
+        bigint total_size
+    }
+    RESTORE_JOBS {
+        uuid restore_id PK
+        uuid snapshot_id FK
+        string restore_type
+        string status
+        decimal progress_pct
+    }
+    CHUNK_INDEX {
+        smallint hash_prefix PK
+        blob chunk_hash PK
+        int chunk_size
+        string storage_ref
+    }
+    RETENTION_RULES {
+        uuid rule_id PK
+        uuid policy_id FK
+        string tier
+        int keep_count
+    }
+    COMPLIANCE_HOLDS {
+        uuid hold_id PK
+        uuid org_id FK
+        string hold_type
+        timestamptz started_at
+    }
+    BACKUP_POLICIES ||--o{ BACKUP_JOBS : triggers
+    BACKUP_POLICIES ||--o{ RETENTION_RULES : governs
+    BACKUP_JOBS ||--o{ SNAPSHOTS : produces
+    BACKUP_JOBS ||--o| BACKUP_JOBS : "chains to parent"
+    SNAPSHOTS ||--o{ RESTORE_JOBS : "restored via"
+    BACKUP_JOBS }o--o{ CHUNK_INDEX : "references chunks"
+```
+
 ### Backup Jobs (PostgreSQL)
 ```sql
 CREATE TABLE backup_policies (
@@ -858,3 +919,103 @@ class BackupVerifier:
 | Chunk index storage | ScyllaDB + Bloom + Redis | 3-tier gives sub-ms hot lookups but complex to maintain consistency |
 | Replication strategy | Async cross-region | Low impact on backup speed but RPO for secondary region is higher |
 | Retention enforcement | Lazy deletion with grace period | Prevents accidental permanent deletion but uses more storage short-term |
+
+---
+
+## Sequence Diagrams
+
+### Incremental Backup with Deduplication
+
+```mermaid
+sequenceDiagram
+    participant Agent as Backup Agent
+    participant Sched as Scheduler
+    participant CDC as Chunking Engine
+    participant Idx as Dedup Index (Bloom + Redis)
+    participant BS as Backup Store (Cold)
+    participant Cat as Catalog DB
+
+    Sched->>Agent: Trigger incremental backup (job_id=42)
+    Agent->>Agent: Scan filesystem (compare mtimes vs last backup)
+    Agent-->>Agent: Changed files: [f1, f2, f3]
+
+    loop For each changed file
+        Agent->>CDC: Chunk file (variable-size CDC, avg 64KB)
+        CDC-->>Agent: chunks = [c1_hash, c2_hash, c3_hash, c4_hash]
+        
+        loop For each chunk
+            Agent->>Idx: Check Bloom filter (c1_hash)
+            alt Likely exists (Bloom says yes)
+                Agent->>Idx: Verify in Redis (exact lookup)
+                Idx-->>Agent: EXISTS → skip upload (dedup hit)
+            else Definitely new (Bloom says no)
+                Agent->>BS: Upload chunk (compressed + encrypted)
+                BS-->>Agent: chunk_ref
+                Agent->>Idx: Add to Bloom + Redis index
+            end
+        end
+        
+        Agent->>Cat: Record file manifest (path, chunk_list, mtime, perms)
+    end
+
+    Agent->>Cat: Finalize backup record (job_id=42, status=SUCCESS, stats)
+    Cat-->>Sched: Backup complete (12GB logical, 800MB physical after dedup)
+```
+
+### Point-in-Time Restore
+
+```mermaid
+sequenceDiagram
+    participant U as User/Admin
+    participant API as Restore API
+    participant Cat as Catalog DB
+    participant BS as Backup Store
+    participant Dec as Decrypt + Decompress
+    participant Target as Target System
+
+    U->>API: Restore(source=/db/data, timestamp=2024-01-15T10:30:00Z)
+    API->>Cat: FindBackupChain(source, timestamp)
+    Cat->>Cat: Walk chain: Full(Jan-1) + Incr(Jan-8) + Incr(Jan-15_10:00)
+    Cat-->>API: Chain: [full_id=100, incr_id=105, incr_id=108]
+    
+    API->>Cat: Build merged file manifest at target timestamp
+    Cat-->>API: Final manifest: {file1: [c1,c2,c3], file2: [c4,c5], ...}
+
+    API->>Target: Prepare restore target (create dirs, check space)
+    Target-->>API: Ready (500GB free)
+
+    loop For each file in manifest (parallelized)
+        API->>BS: Fetch chunks [c1, c2, c3]
+        BS-->>Dec: Encrypted compressed chunks
+        Dec->>Dec: Decrypt (AES-256-GCM) → Decompress (zstd)
+        Dec-->>API: Raw data blocks
+        API->>Target: Write file (reassemble chunks in order)
+        API->>Target: Restore metadata (permissions, mtime, xattrs)
+    end
+
+    API->>Target: Verify checksums (SHA-256 per file)
+    Target-->>API: All checksums match
+    API-->>U: Restore complete (500GB, 2h elapsed, 100% verified)
+```
+
+## Database Optimization
+
+**Catalog DB Schema Optimization for Chain Walks:**
+
+```sql
+-- Covering index for backup chain traversal
+CREATE INDEX idx_backup_chain ON backups(source_path, timestamp DESC) 
+  INCLUDE (backup_type, parent_id, manifest_ref);
+
+-- Chunk reference counting for garbage collection
+CREATE INDEX idx_chunk_refcount ON chunk_refs(chunk_hash) 
+  INCLUDE (ref_count, last_referenced);
+
+-- Partition by time for efficient retention enforcement
+ALTER TABLE backups PARTITION BY RANGE (timestamp);
+```
+
+**Query patterns optimized:**
+- Chain walk: Single index scan (no joins) to find Full + all Incrementals
+- Dedup ratio: Pre-computed in backup record (avoid counting at query time)
+- Retention scan: Partition pruning drops old partitions instantly (no row-by-row delete)

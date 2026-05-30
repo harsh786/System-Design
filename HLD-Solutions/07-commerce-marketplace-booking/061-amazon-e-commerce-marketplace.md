@@ -55,6 +55,54 @@
 
 ## 4. Data Modeling
 
+### Entity-Relationship Diagram
+
+```mermaid
+erDiagram
+    categories {
+        UUID category_id PK
+        UUID parent_id FK
+        VARCHAR name
+        INTEGER level
+        TEXT path
+    }
+    sellers {
+        UUID seller_id PK
+        VARCHAR business_name
+        VARCHAR seller_type
+        DECIMAL rating
+        VARCHAR status
+    }
+    products {
+        UUID product_id PK
+        VARCHAR asin UK
+        UUID category_id FK
+        UUID brand_id FK
+        VARCHAR product_type
+        VARCHAR status
+    }
+    product_variants {
+        UUID variant_id PK
+        UUID parent_product_id FK
+        VARCHAR sku UK
+        DECIMAL base_price
+        VARCHAR variation_theme
+    }
+    category_closure {
+        UUID ancestor_id FK
+        UUID descendant_id FK
+        INTEGER depth
+    }
+
+    categories ||--o{ products : "contains"
+    categories ||--o{ category_closure : "ancestor"
+    categories ||--o{ category_closure : "descendant"
+    categories ||--o| categories : "parent"
+    sellers ||--o{ products : "sells"
+    products ||--o{ product_variants : "has variants"
+    products ||--o| products : "parent product"
+```
+
 ### Product Schema (PostgreSQL - Partitioned by category_id)
 ```sql
 CREATE TABLE products (
@@ -1071,3 +1119,102 @@ alerts:
 | User Data | DynamoDB | Key-value at scale for personalization |
 | ML Models | SageMaker | Model serving for ranking |
 | Monitoring | Prometheus + Grafana | Industry standard observability |
+
+---
+
+## 12. Sequence Diagrams
+
+### 12.1 Product Listing + Search Indexing
+
+```mermaid
+sequenceDiagram
+    participant Seller
+    participant API Gateway
+    participant CatalogService
+    participant PostgreSQL
+    participant Kafka
+    participant IndexWorker
+    participant Elasticsearch
+    participant CDN
+
+    Seller->>API Gateway: POST /products (title, desc, images, price)
+    API Gateway->>CatalogService: createProduct(payload)
+    CatalogService->>PostgreSQL: INSERT product + variants
+    PostgreSQL-->>CatalogService: product_id = P-12345
+    CatalogService->>Kafka: publish("product.created", {product_id, data})
+    CatalogService-->>API Gateway: 201 Created {product_id}
+    API Gateway-->>Seller: 201 Created
+
+    Note over Kafka,IndexWorker: Async indexing pipeline
+    Kafka->>IndexWorker: consume("product.created")
+    IndexWorker->>PostgreSQL: fetch full product + category + brand
+    IndexWorker->>Elasticsearch: PUT /products/_doc/P-12345
+    Elasticsearch-->>IndexWorker: indexed OK
+    IndexWorker->>CDN: invalidate product page cache
+
+    Note over Elasticsearch: Product now searchable within ~2s
+```
+
+### 12.2 Add to Cart + Inventory Check
+
+```mermaid
+sequenceDiagram
+    participant User
+    participant API Gateway
+    participant CartService
+    participant Redis
+    participant InventoryService
+    participant PostgreSQL
+
+    User->>API Gateway: POST /cart/items {product_id, qty: 2}
+    API Gateway->>CartService: addToCart(user_id, product_id, qty)
+    CartService->>InventoryService: checkAvailability(product_id, qty=2)
+    InventoryService->>PostgreSQL: SELECT available_qty WHERE product_id=X
+    PostgreSQL-->>InventoryService: available_qty = 15
+    InventoryService-->>CartService: {available: true, qty: 15}
+
+    CartService->>Redis: HSET cart:{user_id} product_id {qty:2, price:29.99, added_at}
+    Redis-->>CartService: OK
+    CartService->>Redis: EXPIRE cart:{user_id} 7d
+    CartService-->>API Gateway: 200 {cart_count: 3, subtotal: 89.97}
+    API Gateway-->>User: Cart updated (3 items)
+
+    Note over Redis: Cart persisted in Redis with 7-day TTL<br/>Fallback to DynamoDB for logged-in users
+```
+
+### 12.3 Checkout + Payment + Order Creation
+
+```mermaid
+sequenceDiagram
+    participant User
+    participant API Gateway
+    participant CheckoutService
+    participant InventoryService
+    participant PaymentService
+    participant Stripe
+    participant OrderService
+    participant Kafka
+    participant NotificationService
+
+    User->>API Gateway: POST /checkout {cart_id, address, payment_method}
+    API Gateway->>CheckoutService: initiateCheckout(payload)
+
+    CheckoutService->>InventoryService: reserveStock(items[], ttl=10min)
+    InventoryService-->>CheckoutService: reservation_id = R-789
+
+    CheckoutService->>PaymentService: charge(amount=89.97, method=card_xxx)
+    PaymentService->>Stripe: POST /payment_intents/confirm
+    Stripe-->>PaymentService: {status: succeeded, charge_id}
+    PaymentService-->>CheckoutService: payment_confirmed
+
+    CheckoutService->>OrderService: createOrder(items, address, payment_ref)
+    OrderService-->>CheckoutService: order_id = ORD-456
+
+    CheckoutService->>InventoryService: confirmReservation(R-789)
+    CheckoutService->>Kafka: publish("order.placed", {order_id, items})
+    CheckoutService-->>API Gateway: 200 {order_id, estimated_delivery}
+    API Gateway-->>User: Order confirmed! ORD-456
+
+    Kafka->>NotificationService: consume("order.placed")
+    NotificationService-->>User: Email + Push notification
+```

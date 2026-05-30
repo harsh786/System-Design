@@ -69,6 +69,50 @@ Design a system like Instagram Stories that supports 24-hour expiring content wi
 
 ## 5. Data Modeling
 
+### Entity-Relationship Diagram
+
+```mermaid
+erDiagram
+    STORY_ITEMS {
+        bigint user_id PK
+        bigint story_item_id PK
+        tinyint media_type
+        tinyint audience_type
+        timestamp expires_at
+        boolean is_highlighted
+    }
+    STORY_VIEWS {
+        bigint story_item_id PK
+        bigint viewer_user_id PK
+        text reaction
+    }
+    CLOSE_FRIENDS {
+        bigint user_id PK
+        bigint friend_user_id PK
+    }
+    HIGHLIGHTS {
+        bigint highlight_id PK
+        bigint user_id FK
+        varchar title
+    }
+    HIGHLIGHT_ITEMS {
+        bigint highlight_id PK
+        bigint story_item_id FK
+        int position
+    }
+    POLL_RESPONSES {
+        bigint story_item_id PK
+        uuid poll_id PK
+        bigint user_id PK
+        tinyint option_index
+    }
+
+    STORY_ITEMS ||--o{ STORY_VIEWS : "viewed by"
+    STORY_ITEMS ||--o{ HIGHLIGHT_ITEMS : "saved in"
+    HIGHLIGHTS ||--o{ HIGHLIGHT_ITEMS : contains
+    STORY_ITEMS ||--o{ POLL_RESPONSES : "responded to"
+```
+
 ### 5.1 Story Item Schema (Cassandra — TTL-based)
 
 ```sql
@@ -872,3 +916,135 @@ Trace: Story Upload Flow
 6. **Story Scheduling**: Pre-upload stories for future publication
 7. **Disappearing DMs**: Apply same TTL infrastructure to messages
 
+
+---
+
+## Sequence Diagrams
+
+### 1. Story Upload + Processing
+
+```mermaid
+sequenceDiagram
+    participant C as Client App
+    participant API as Story Upload API
+    participant S3 as Object Store
+    participant Q as Processing Queue
+    participant Proc as Media Processor
+    participant Filter as Content Filter (ML)
+    participant DB as Story DB (Cassandra)
+    participant Fan as Fanout Service
+    participant Followers as Follower Feed Service
+
+    C->>API: POST /stories/upload {media, stickers, text_overlays, music_id}
+    API->>S3: Store raw media (photo/video)
+    API->>DB: Create story record (user_id, timestamp, expiry: now+24h, status: processing)
+    API-->>C: 201 Created {story_id}
+
+    API->>Q: Publish ProcessStory event
+
+    Q->>Proc: Consume processing job
+    Proc->>S3: Download raw media
+    Proc->>Proc: Apply server-side rendering (sticker positions, text, filters)
+    Proc->>Proc: Transcode video (multiple qualities: 720p, 480p)
+    Proc->>Proc: Generate preview thumbnail
+
+    Proc->>Filter: Run content moderation check
+    alt Violates policy
+        Filter-->>Proc: REJECT
+        Proc->>DB: Update status: rejected
+        Note over Proc: User notified of policy violation
+    else Clean
+        Filter-->>Proc: PASS
+    end
+
+    Proc->>S3: Store processed media (all renditions)
+    Proc->>DB: Update status: active, set media URLs
+
+    Proc->>Fan: Trigger fanout to followers
+    Fan->>Followers: Update story ring for all followers of user
+    Note over Fan,Followers: Fanout-on-write for normal users, fanout-on-read for celebrities
+```
+
+### 2. Story View Ring Update
+
+```mermaid
+sequenceDiagram
+    participant V as Viewer
+    participant API as Feed API
+    participant Cache as Redis (Story Ring Cache)
+    participant DB as Story DB
+    participant Follow as Follow Graph
+    participant Rank as Ranking Service
+    participant CDN as CDN
+
+    V->>API: GET /feed/story-ring
+    API->>Cache: Get cached story ring for user
+    alt Cache hit (TTL: 60s)
+        Cache-->>API: Ranked list of users with active stories
+    else Cache miss
+        API->>Follow: Get followed users list
+        Follow-->>API: [user_1, user_2, ..., user_500]
+        API->>DB: Batch query: which followed users have active stories (expiry > now)
+        DB-->>API: Users with active stories + story counts
+        API->>Rank: Rank story ring (signals: closeness, recency, interaction history)
+        Rank-->>API: Ranked order
+        API->>Cache: Store ranked ring (TTL: 60s)
+    end
+
+    API-->>V: Story ring [{user_id, avatar, has_unseen, story_count}, ...]
+
+    V->>API: GET /stories/{user_id} (tap on ring)
+    API->>DB: Fetch user's active stories (ordered by timestamp)
+    API-->>V: Story list with CDN URLs
+
+    V->>CDN: GET story media
+    CDN-->>V: Rendered story media
+
+    V->>API: POST /stories/{story_id}/seen
+    API->>DB: Record view (viewer_id, story_id, timestamp)
+    API->>Cache: Mark story as seen for this viewer
+    Note over API: Owner can see viewer list; analytics updated async
+```
+
+### 3. Story Expiry Cleanup at 24 Hours
+
+```mermaid
+sequenceDiagram
+    participant TTL as TTL Scanner (Periodic Job)
+    participant DB as Story DB
+    participant S3 as Object Store
+    participant Cache as Redis Cache
+    participant Archive as Archive Service
+    participant Feed as Feed/Ring Service
+    participant Highlight as Highlights DB
+
+    loop Every 1 minute
+        TTL->>DB: Query stories WHERE expiry <= now AND status = active
+        DB-->>TTL: Expired stories batch [s1, s2, ..., s200]
+    end
+
+    loop For each expired story
+        TTL->>DB: Update status: expired
+
+        TTL->>Feed: Remove story from owner's active ring
+        Feed->>Cache: Invalidate story ring caches (owner's followers)
+
+        TTL->>Highlight: Check if story is saved to any Highlight
+        alt Saved to Highlight
+            Highlight-->>TTL: Story referenced in Highlight
+            Note over TTL: Keep media, only remove from ring/feed
+        else Not in any Highlight
+            TTL->>S3: Schedule media deletion (soft delete, 30-day grace)
+            Note over TTL: Grace period allows recovery if needed
+        end
+
+        TTL->>Archive: Move metadata to archive table (for analytics retention)
+    end
+
+    Note over TTL,S3: Hard delete from S3 after 30-day grace period (separate job)
+
+    loop Monthly cleanup
+        TTL->>S3: Permanently delete media past grace period
+        TTL->>DB: Purge archived metadata older than 90 days
+    end
+```

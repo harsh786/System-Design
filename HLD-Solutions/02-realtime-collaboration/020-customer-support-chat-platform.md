@@ -75,6 +75,56 @@
 
 ## 4. Data Modeling
 
+### Entity-Relationship Diagram
+
+```mermaid
+erDiagram
+    TENANTS {
+        uuid tenant_id PK
+        varchar name
+        varchar plan
+        jsonb widget_config
+    }
+    CONVERSATIONS {
+        uuid conversation_id PK
+        uuid tenant_id FK
+        uuid customer_id FK
+        uuid assigned_agent_id FK
+        varchar channel
+        varchar status
+        int priority
+    }
+    AGENTS {
+        uuid agent_id PK
+        uuid tenant_id FK
+        varchar name
+        varchar role
+        varchar status
+        int max_concurrent
+    }
+    QUEUE_CONFIG {
+        uuid queue_id PK
+        uuid tenant_id FK
+        varchar name
+        varchar routing_strategy
+        text_arr required_skills
+    }
+    MESSAGES {
+        uuid conversation_id PK
+        timeuuid message_id PK
+        text sender_type
+        uuid sender_id FK
+        text content_type
+        text content
+    }
+
+    TENANTS ||--o{ CONVERSATIONS : "has"
+    TENANTS ||--o{ AGENTS : "employs"
+    TENANTS ||--o{ QUEUE_CONFIG : "configures"
+    AGENTS ||--o{ CONVERSATIONS : "assigned to"
+    CONVERSATIONS ||--o{ MESSAGES : "contains"
+```
+
 ### 4.1 Database Selection
 
 | Workload | Database | Justification |
@@ -786,3 +836,184 @@ support_kafka_consumer_lag{topic}                              # Gauge
 | Data residency | Regional deployments, prevent cross-border data flow |
 | Agent authentication | SSO/SAML, MFA, session management |
 | Customer authentication | JWT tokens, anonymous with rate limits |
+
+---
+
+## Sequence Diagrams
+
+### 1. Customer Initiates Chat + Agent Routing
+
+```mermaid
+sequenceDiagram
+    participant C as Customer
+    participant W as Chat Widget (WebSocket)
+    participant GW as WebSocket Gateway
+    participant CS as Chat Service
+    participant Q as Kafka
+    participant RS as Routing Service
+    participant Cache as Redis
+    participant DB as Postgres
+    participant AG as Agent Desktop
+    participant Bot as AI Bot (Tier 0)
+
+    C->>W: Click "Start Chat" on website
+    W->>GW: WebSocket connect + session init
+    GW->>CS: Create conversation {customer_id, source: web, metadata: page_url}
+    CS->>DB: INSERT conversation (status: pending)
+    CS->>Q: Publish conversation.created
+
+    Q->>Bot: Tier 0 - AI bot handles first
+    Bot-->>GW: "Hi! How can I help you today?"
+    GW-->>C: Bot greeting
+
+    C->>GW: "I need to cancel my subscription"
+    GW->>Bot: Route message to bot
+    Bot->>Bot: Intent classification → "subscription_cancel" (needs human)
+    Bot->>Q: Publish escalate_to_human {intent, priority: normal, skill: "billing"}
+
+    Q->>RS: Route to human agent
+    RS->>Cache: GET available_agents (skill: billing, status: available)
+    RS->>RS: Score agents: (capacity - active_chats) × skill_match × load_balance
+    RS->>RS: Select best agent (round-robin among top scorers)
+    RS->>Cache: Assign conversation to agent_id, decrement capacity
+    RS->>DB: UPDATE conversation SET agent_id, status=active
+
+    RS->>Q: Publish conversation.assigned {agent_id}
+    Q->>AG: Push new conversation to agent desktop
+    AG->>AG: Show conversation with full context (bot transcript, customer info)
+    AG-->>GW: Agent joins conversation
+    GW-->>C: "You're now connected with Sarah from Billing"
+```
+
+### 2. Agent Transfer (Warm Handoff)
+
+```mermaid
+sequenceDiagram
+    participant A1 as Agent 1 (Billing)
+    participant GW as WebSocket Gateway
+    participant CS as Chat Service
+    participant RS as Routing Service
+    participant Cache as Redis
+    participant DB as Postgres
+    participant Q as Kafka
+    participant A2 as Agent 2 (Technical)
+    participant C as Customer
+
+    A1->>GW: transfer_request {conversation_id, target_skill: "technical", note: "Customer needs help with API integration"}
+    GW->>CS: Process transfer
+    CS->>RS: Find available technical agent
+
+    RS->>Cache: GET available_agents (skill: technical)
+    RS->>RS: Select best technical agent
+    
+    alt No agents available
+        RS-->>CS: No agents (queue position: 3)
+        CS-->>GW: Transfer queued (position 3)
+        GW-->>A1: "Transfer queued - no technical agents available"
+        GW-->>C: "Transferring you to a specialist, please hold..."
+        
+        Note over RS: Monitor queue, assign when available
+        RS->>Q: Publish transfer.queued
+    else Agent available
+        RS->>Cache: Assign to Agent 2
+        RS-->>CS: Agent 2 assigned
+    end
+
+    CS->>DB: UPDATE conversation SET agent_id=A2, add internal_note
+    CS->>Q: Publish conversation.transferred
+
+    par Notify new agent
+        Q->>A2: Push conversation with full history + transfer note
+        A2->>A2: Review context (bot transcript + A1 conversation + internal note)
+    and Notify customer
+        Q->>GW: Push transfer event
+        GW-->>C: "You've been connected with Mike from Technical Support"
+    and Release old agent
+        Q->>A1: Conversation removed from queue
+        A1->>Cache: Increment available capacity
+    end
+
+    A2-->>GW: "Hi! I see you need help with API integration. Let me look into that."
+    GW-->>C: Agent 2 message
+```
+
+### 3. CSAT Collection + Analytics
+
+```mermaid
+sequenceDiagram
+    participant A as Agent
+    participant GW as WebSocket Gateway
+    participant CS as Chat Service
+    participant Q as Kafka
+    participant DB as Postgres
+    participant Cache as Redis
+    participant Survey as Survey Service
+    participant Analytics as Analytics Pipeline
+    participant C as Customer
+
+    A->>GW: resolve_conversation {conversation_id, resolution: "cancelled_subscription", tags: ["billing", "churn"]}
+    GW->>CS: Close conversation
+    CS->>DB: UPDATE conversation SET status=resolved, resolved_at=now(), resolution_note
+    CS->>Q: Publish conversation.resolved
+
+    Q->>Survey: Trigger CSAT survey (delay: 30 seconds)
+    
+    Note over Survey: Wait 30s (let customer absorb resolution)
+    
+    Survey->>GW: Push survey to customer
+    GW-->>C: "How was your experience? Rate 1-5 ⭐"
+    
+    alt Customer responds
+        C->>GW: CSAT response {rating: 4, feedback: "Quick resolution!"}
+        GW->>Survey: Record response
+        Survey->>DB: INSERT csat_response {conversation_id, rating:4, feedback, ts}
+        Survey->>Q: Publish csat.submitted
+    else No response (timeout 5 minutes)
+        Survey->>Survey: Mark as no_response
+        Survey->>DB: INSERT csat_response {conversation_id, status: no_response}
+    end
+
+    Q->>Analytics: Process CSAT + conversation metrics
+    Analytics->>Analytics: Compute: avg_resolution_time, first_response_time,<br/>agent_rating, topic_sentiment
+    Analytics->>DB: Update agent scorecard + team metrics
+    Analytics->>Cache: Update real-time dashboard metrics
+
+    Note over Analytics: Aggregated metrics:<br/>- Agent CSAT average (rolling 30 days)<br/>- Queue wait time percentiles<br/>- Resolution rate by topic<br/>- Bot deflection rate
+```
+
+### Caching Strategy
+
+| Layer | Store | Content | TTL | Eviction |
+|-------|-------|---------|-----|----------|
+| Agent Availability | Redis Sorted Set | Available agents scored by capacity | Real-time | Update on assign/release |
+| Conversation State | Redis Hash | Active conversation metadata + routing info | Until resolved | Delete on resolve |
+| Customer Context | Redis | Customer history, account info, previous tickets | 1h | LRU, refresh on new conversation |
+| Canned Responses | Redis | Pre-built agent reply templates by category | 24h | Invalidate on admin update |
+| Queue Metrics | Redis | Wait times, queue depth per skill group | 10s refresh | Overwrite |
+| Bot Context | Redis | Active bot conversation state + intent history | Session | Delete on handoff or timeout |
+| Agent Typing | Redis | Typing indicators per conversation | 5s | Auto-expire |
+
+**Cache Patterns:**
+- **Write-through for agent state**: Every assignment/release immediately updates Redis
+- **Event-driven invalidation**: Kafka consumers update cache on conversation lifecycle events
+- **Read-aside with preload**: Customer context loaded from CRM on conversation start
+- **Pub/sub for real-time metrics**: Dashboard subscribes to metric updates
+
+### Infrastructure Components
+
+| Component | Technology | Configuration | Purpose |
+|-----------|-----------|---------------|---------|
+| WebSocket Gateway | Node.js (ws) + Envoy | 50K connections/node | Customer + agent real-time messaging |
+| Load Balancer | L4 (NLB) | Sticky sessions by conversation_id | Route messages to correct gateway |
+| API Gateway | Kong | Rate limiting, JWT auth | REST API for admin, integrations |
+| CDN | CloudFront | Edge-cached widget JS, static assets | Chat widget delivery |
+| Kafka | 6 brokers | Topics: conversations, messages, routing, analytics | Event backbone |
+| Routing Engine | Custom (Go) | Skill-based, priority-weighted | Agent assignment algorithm |
+| AI Bot | Python (LangChain) | GPU-backed, auto-scale on queue | Tier 0 deflection |
+
+**WebSocket Gateway Details:**
+- **Dual connection types**: Customers connect via widget (ephemeral), agents via desktop app (persistent)
+- **Connection draining**: On deploy, in-progress conversations maintain connection; new ones route to new nodes
+- **Heartbeat**: 15s interval for customers, 30s for agents
+- **Reconnection**: Customers get 5-minute grace period; conversation state preserved in Redis
+

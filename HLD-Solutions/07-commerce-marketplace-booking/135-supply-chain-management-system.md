@@ -63,6 +63,67 @@ Total Storage:
 
 ## 4. Data Modeling
 
+### Entity-Relationship Diagram
+
+```mermaid
+erDiagram
+    products {
+        VARCHAR sku_id PK
+        UUID category_id FK
+        VARCHAR product_name
+        CHAR abc_class
+        INTEGER lead_time_days
+        DECIMAL unit_cost
+    }
+    inventory_positions {
+        UUID position_id PK
+        VARCHAR sku_id FK
+        UUID location_id FK
+        VARCHAR location_type
+        INTEGER quantity_on_hand
+        INTEGER quantity_available
+        INTEGER reorder_point
+    }
+    suppliers {
+        UUID supplier_id PK
+        VARCHAR supplier_name
+        INTEGER lead_time_days
+        DECIMAL quality_score
+        VARCHAR risk_level
+    }
+    purchase_orders {
+        UUID po_id PK
+        UUID supplier_id FK
+        UUID destination_id FK
+        VARCHAR po_number UK
+        VARCHAR status
+        DATE expected_delivery
+        DECIMAL total_value
+    }
+    po_line_items {
+        UUID line_id PK
+        UUID po_id FK
+        VARCHAR sku_id FK
+        INTEGER quantity_ordered
+        INTEGER quantity_received
+        DECIMAL unit_cost
+    }
+    warehouse_locations {
+        UUID wh_location_id PK
+        UUID warehouse_id FK
+        VARCHAR location_code UK
+        VARCHAR sku_id FK
+        VARCHAR zone
+        CHAR velocity_class
+    }
+
+    products ||--o{ inventory_positions : "stocked at"
+    products ||--o{ po_line_items : "ordered"
+    suppliers ||--o{ purchase_orders : "supplies"
+    purchase_orders ||--o{ po_line_items : "line items"
+    products ||--o{ warehouse_locations : "slotted in"
+```
+
 ### 4.1 Products & Inventory
 
 ```sql
@@ -1010,3 +1071,108 @@ alerts:
 - APICS/ASCM Body of Knowledge
 - Silver-Meal & Wagner-Whitin algorithms for lot sizing
 - AWS Supply Chain solutions architecture
+
+---
+
+## 12. Sequence Diagrams
+
+### 12.1 Purchase Order Creation + Approval
+
+```mermaid
+sequenceDiagram
+    participant Planner
+    participant ProcurementService
+    participant ApprovalEngine
+    participant Manager
+    participant SupplierPortal
+    participant Kafka
+    participant InventoryService
+    participant ERP
+
+    Planner->>ProcurementService: POST /purchase-orders {supplier, items[], qty, delivery_date}
+    ProcurementService->>ProcurementService: validate(budget_check, supplier_active, lead_time)
+
+    Note over ProcurementService: PO amount = $45,000<br/>Threshold: >$10K needs manager approval
+
+    ProcurementService->>ApprovalEngine: requestApproval(PO-500, amount=$45K, approver=MGR-1)
+    ProcurementService-->>Planner: "PO-500 created, pending approval"
+
+    ApprovalEngine->>Manager: Email + notification: "Approve PO-500 ($45K)?"
+    Manager->>ApprovalEngine: APPROVE (with comments)
+
+    ApprovalEngine->>ProcurementService: approved(PO-500)
+    ProcurementService->>Kafka: publish("po.approved", {PO-500, supplier, items})
+    ProcurementService->>SupplierPortal: sendPO(supplier_id, PO-500 details)
+    SupplierPortal-->>ProcurementService: acknowledged (expected ship date)
+
+    ProcurementService->>ERP: sync PO to financial system
+    ProcurementService->>InventoryService: createInboundExpectation(PO-500, items, ETA)
+    ProcurementService-->>Planner: "PO-500 approved & sent to supplier"
+```
+
+### 12.2 Inventory Replenishment Trigger
+
+```mermaid
+sequenceDiagram
+    participant Cron(hourly)
+    participant ReplenishmentEngine
+    participant InventoryService
+    participant PostgreSQL
+    participant ForecastService
+    participant ProcurementService
+    participant AlertService
+
+    Cron(hourly)->>ReplenishmentEngine: checkReplenishmentNeeds()
+
+    loop For each SKU in active catalog
+        ReplenishmentEngine->>InventoryService: getStockLevel(SKU-200)
+        InventoryService->>PostgreSQL: SELECT on_hand, reserved, in_transit
+        PostgreSQL-->>ReplenishmentEngine: {on_hand: 150, reserved: 80, in_transit: 0}
+
+        ReplenishmentEngine->>ForecastService: getDemandForecast(SKU-200, next_30_days)
+        ForecastService-->>ReplenishmentEngine: predicted_demand = 200 units
+
+        Note over ReplenishmentEngine: Available = on_hand - reserved = 70<br/>Reorder point = lead_time_demand + safety_stock<br/>= (10 days × 7/day) + 20 = 90<br/>Available(70) < Reorder Point(90) → REORDER
+
+        ReplenishmentEngine->>ReplenishmentEngine: calculateOrderQty(EOQ model)
+        Note over ReplenishmentEngine: EOQ = √(2×D×S/H) = √(2×2400×50/2) = 245 units
+    end
+
+    ReplenishmentEngine->>ProcurementService: auto-createPO(SKU-200, qty=245, supplier=best_match)
+    ProcurementService-->>ReplenishmentEngine: PO-501 created
+
+    ReplenishmentEngine->>AlertService: notify(planner, "Auto-PO created for SKU-200")
+    AlertService-->>Planner: "Low stock alert: SKU-200. PO-501 auto-generated (245 units)"
+```
+
+## 13. Caching Strategy
+
+### 13.1 Cache Layers
+| Data | Cache | TTL | Rationale |
+|------|-------|-----|-----------|
+| SKU master data | Redis | 1h | Rarely changes, high read volume |
+| Current stock levels | Redis | 30s | Near-real-time, high read from all services |
+| Supplier catalog | Redis | 6h | Changes infrequently |
+| Demand forecasts | Redis | 1h | Recomputed hourly |
+| PO status | Redis | 5min | Frequently polled by planners |
+| Warehouse locations | Local (in-memory) | 24h | Static reference data |
+| Shipping rates | Redis | 15min | API call to carriers is expensive |
+
+### 13.2 Write-Through for Stock Levels
+```python
+def update_stock(sku, delta):
+    # Write to DB first (source of truth)
+    db.execute("UPDATE inventory SET on_hand = on_hand + %s WHERE sku = %s", (delta, sku))
+    
+    # Update cache immediately (write-through)
+    new_level = db.fetchone("SELECT on_hand FROM inventory WHERE sku = %s", (sku,))
+    redis.setex(f"stock:{sku}", 30, json.dumps({"on_hand": new_level, "updated_at": now()}))
+    
+    # Publish for downstream consumers
+    kafka.publish("inventory.updated", {"sku": sku, "on_hand": new_level})
+```
+
+### 13.3 Cache Warming
+- **On deploy**: Pre-warm top 1000 SKUs stock levels
+- **On forecast job**: Cache all forecasts after batch computation
+- **On supplier sync**: Refresh supplier catalog cache

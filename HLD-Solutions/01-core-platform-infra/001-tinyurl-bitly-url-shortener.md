@@ -117,6 +117,68 @@ Collision probability:  Negligible with range allocation
 
 ## 4. Data Modeling
 
+### Entity-Relationship Diagram
+
+```mermaid
+erDiagram
+    TENANTS {
+        uuid id PK
+        string name
+        string plan
+        int rate_limit_qps
+    }
+    USERS {
+        uuid id PK
+        uuid tenant_id FK
+        string email
+        string role
+    }
+    CUSTOM_DOMAINS {
+        uuid id PK
+        uuid tenant_id FK
+        string hostname
+        string tls_status
+    }
+    LINK_MAPPINGS {
+        string domain_id PK
+        string code PK
+        string long_url
+        string owner_id FK
+        string status
+    }
+    ABUSE_REPORTS {
+        uuid id PK
+        string link_id FK
+        string reason
+        string state
+    }
+    CLICK_EVENTS {
+        string event_id PK
+        string domain_id FK
+        string code FK
+        string link_id
+    }
+    CODE_ALLOCATIONS {
+        string allocator_id PK
+        string domain_id PK
+        bigint range_start
+        bigint range_end
+    }
+    AUDIT_LOG {
+        uuid event_id PK
+        string actor_id
+        string action
+        string resource_id
+    }
+
+    TENANTS ||--o{ USERS : has
+    TENANTS ||--o{ CUSTOM_DOMAINS : owns
+    CUSTOM_DOMAINS ||--o{ LINK_MAPPINGS : "hosts"
+    USERS ||--o{ LINK_MAPPINGS : creates
+    LINK_MAPPINGS ||--o{ ABUSE_REPORTS : reported_in
+    LINK_MAPPINGS ||--o{ CLICK_EVENTS : generates
+```
+
 ### Database Choice Justification
 
 | Store | Technology | Justification |
@@ -1404,6 +1466,101 @@ Cost per link created: $70,350 / 60M creates = $0.0012
 8. **Cloud-native deployment**: AWS as primary cloud provider
 9. **No real-time collaboration**: Link editing is single-user at a time
 10. **English-only codes**: Base62 alphabet only (no unicode in short codes)
+
+---
+
+## Sequence Diagrams
+
+### 1. Create Short URL
+
+```mermaid
+sequenceDiagram
+    participant Client
+    participant GW as API Gateway
+    participant LMS as Link Mgmt Service
+    participant CA as Code Allocator
+    participant Redis
+    participant DDB as DynamoDB
+
+    Client->>GW: POST /api/v1/shorten {long_url, custom_alias?}
+    GW->>GW: Authenticate (JWT) + Rate Limit
+    GW->>LMS: Forward request
+
+    alt Custom alias requested
+        LMS->>DDB: ConditionalPut (alias not exists)
+        DDB-->>LMS: Success or ConditionalCheckFailed
+    else Auto-generate code
+        LMS->>CA: Get next code from range
+        Note over CA: Local range buffer (1000 codes)<br/>Fetches new range from DB when exhausted
+        CA-->>LMS: Base62 code
+        LMS->>DDB: PutItem {short_code, long_url, created_at, ttl}
+    end
+
+    LMS->>Redis: SET short_code -> long_url (TTL 24h)
+    LMS-->>Client: 201 {short_url, analytics_url}
+```
+
+### 2. Redirect Flow
+
+```mermaid
+sequenceDiagram
+    participant Browser
+    participant CDN as CDN (CloudFront)
+    participant ALB
+    participant RS as Redirect Service
+    participant Redis
+    participant DDB as DynamoDB
+    participant Kafka
+
+    Browser->>CDN: GET /abc123
+    alt CDN cache hit
+        CDN-->>Browser: 302 Location: long_url
+    else CDN cache miss
+        CDN->>ALB: Forward request
+        ALB->>RS: Route to healthy instance
+        RS->>Redis: GET short:abc123
+        alt Redis hit
+            Redis-->>RS: long_url
+        else Redis miss
+            RS->>DDB: GetItem(abc123)
+            DDB-->>RS: {long_url, status}
+            RS->>Redis: SET short:abc123 long_url EX 86400
+        end
+
+        Note over RS: Check link status (active/expired/banned)
+        RS-->>Browser: 302 Location: long_url
+
+        RS--)Kafka: Async emit click event {code, ts, geo, ua}
+    end
+```
+
+### 3. Analytics Pipeline
+
+```mermaid
+sequenceDiagram
+    participant RS as Redirect Service
+    participant Kafka
+    participant Flink as Flink Consumer
+    participant CH as ClickHouse
+    participant Agg as Aggregation Worker
+    participant Redis
+
+    RS--)Kafka: click_events topic (partitioned by short_code)
+
+    loop Every micro-batch (5s)
+        Kafka->>Flink: Poll batch of click events
+        Flink->>Flink: Enrich (GeoIP, device parsing)
+        Flink->>CH: Bulk INSERT into clicks table
+    end
+
+    loop Every 1 minute
+        Agg->>CH: SELECT count(*) GROUP BY code, hour
+        CH-->>Agg: Aggregated counts
+        Agg->>Redis: Update real-time counters
+    end
+
+    Note over CH: Partitioned by date, TTL 2 years<br/>MergeTree engine for fast aggregations
+```
 
 ---
 

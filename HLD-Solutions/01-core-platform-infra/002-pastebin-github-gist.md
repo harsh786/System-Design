@@ -120,6 +120,59 @@ Redis cluster: 3 nodes x 32 GB = 96 GB total (comfortable)
 
 ## 4. Data Modeling
 
+### Entity-Relationship Diagram
+
+```mermaid
+erDiagram
+    USERS {
+        uuid id PK
+        string username
+        string email
+        string plan
+    }
+    PASTES {
+        uuid id PK
+        string short_code
+        uuid owner_id FK
+        string visibility
+        string state
+        uuid fork_of FK
+    }
+    PASTE_VERSIONS {
+        uuid id PK
+        uuid paste_id FK
+        int version
+        string content_ref
+    }
+    SHARE_TOKENS {
+        uuid id PK
+        uuid paste_id FK
+        uuid created_by FK
+        string scope
+        timestamp expires_at
+    }
+    ABUSE_REPORTS {
+        uuid id PK
+        uuid paste_id FK
+        uuid reporter_id FK
+        string reason
+        string state
+    }
+    OUTBOX_EVENTS {
+        bigint id PK
+        uuid aggregate_id
+        string event_type
+        boolean published
+    }
+
+    USERS ||--o{ PASTES : creates
+    PASTES ||--o{ PASTE_VERSIONS : has
+    PASTES ||--o{ SHARE_TOKENS : shared_via
+    USERS ||--o{ SHARE_TOKENS : creates
+    PASTES ||--o{ ABUSE_REPORTS : reported_in
+    PASTES |o--o| PASTES : fork_of
+```
+
 ### Database Choice Justification
 
 | Data Type | Store | Justification |
@@ -1619,3 +1672,26 @@ sequenceDiagram
     PS->>R: INCR view count (local buffer)
     R->>K: Flush to Kafka every 10s
 ```
+
+---
+
+## Additional Sections
+
+### Caching Strategy
+
+#### Multi-Tier Caching
+- **L1 (Local/In-Process)**: LRU cache (256MB) for hot paste metadata; TTL 60s
+- **L2 (Redis Cluster)**: Full paste metadata + access counts; TTL 24h for active pastes
+- **L3 (CDN)**: Public pastes cached at edge with `Cache-Control: public, max-age=300`; private pastes use `Cache-Control: private, no-store`
+
+#### Eviction & Invalidation
+- **Policy**: LFU for L1 (hot pastes accessed repeatedly), LRU for L2
+- **Invalidation**: Write-through on paste edit/delete; event-driven via Kafka `paste.updated` topic
+- **Cache Warming**: On deploy, pre-warm L1 with top-1000 pastes by access frequency
+- **Thundering Herd**: Single-flight pattern at L2 — first request fetches from DB, concurrent requests wait on same promise
+
+### Infrastructure Components
+
+- **Load Balancer**: AWS ALB (L7) with least-connections algorithm; health checks every 10s on `/healthz`
+- **API Gateway**: Kong/AWS API Gateway for auth (JWT validation), rate limiting (per-user + per-IP), request routing by path prefix
+- **CDN**: CloudFront for public paste content; signed URLs for private pastes with 1h expiry

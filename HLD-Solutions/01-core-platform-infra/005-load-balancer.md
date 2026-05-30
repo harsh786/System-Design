@@ -90,6 +90,49 @@ Log pipeline: Kafka (6 brokers) → ClickHouse (4 nodes)
 
 ## 4. Data Modeling
 
+### Entity-Relationship Diagram
+
+```mermaid
+erDiagram
+    BACKEND_POOLS {
+        uuid id PK
+        string name
+        string algorithm
+        jsonb health_check_config
+    }
+    BACKENDS {
+        uuid id PK
+        uuid pool_id FK
+        string address
+        int weight
+        string health_status
+    }
+    LISTENERS {
+        uuid id PK
+        string name
+        int port
+        string protocol
+    }
+    ROUTING_RULES {
+        uuid id PK
+        uuid listener_id FK
+        int priority
+        jsonb match_config
+        jsonb action_config
+    }
+    SSL_CERTIFICATES {
+        uuid id PK
+        string domain
+        string issuer
+        timestamp not_after
+    }
+
+    BACKEND_POOLS ||--o{ BACKENDS : contains
+    LISTENERS ||--o{ ROUTING_RULES : defines
+    ROUTING_RULES }o--|| BACKEND_POOLS : forwards_to
+    LISTENERS }o--o| SSL_CERTIFICATES : uses
+```
+
 ### Database Choice
 | Data | Store | Why |
 |------|-------|-----|
@@ -1286,3 +1329,100 @@ Growth formula:
 - Rate limiting at LB prevents single client from exhausting backend capacity
 - Audit log for all configuration changes
 - Periodic penetration testing of LB infrastructure
+
+---
+
+## Sequence Diagrams
+
+### 1. L7 Request Routing Flow
+
+```mermaid
+sequenceDiagram
+    participant Client
+    participant L4 as L4 LB (ECMP/DSR)
+    participant L7 as L7 LB (Envoy)
+    participant HC as Health Checker
+    participant B1 as Backend-1
+    participant B2 as Backend-2
+
+    Client->>L4: TCP SYN (VIP:443)
+    L4->>L7: Route via consistent hashing (by src IP)
+    L7->>L7: TLS termination (cert from SDS)
+    L7->>L7: Parse HTTP headers, match route
+
+    Note over L7: Routing decision:<br/>- Path: /api/v2/* → backend-pool-A<br/>- Header: x-canary=true → canary pool<br/>- Weight: 95% stable, 5% canary
+
+    L7->>L7: Select backend (least-requests algorithm)
+    L7->>B1: Forward request (with x-forwarded-for, x-request-id)
+    B1-->>L7: 200 OK (latency: 45ms)
+    L7-->>Client: 200 OK
+
+    Note over HC,B2: Concurrent health checking
+    loop Every 5 seconds
+        HC->>B1: GET /healthz
+        B1-->>HC: 200 OK
+        HC->>B2: GET /healthz
+        B2-->>HC: 503 (unhealthy)
+        HC->>L7: Remove B2 from pool
+    end
+```
+
+### 2. Health Check Failover Flow
+
+```mermaid
+sequenceDiagram
+    participant Client
+    participant LB as L7 Load Balancer
+    participant B1 as Backend-1 (Healthy)
+    participant B2 as Backend-2 (Degraded)
+    participant B3 as Backend-3 (New)
+    participant CP as Control Plane
+
+    Note over B2: Memory pressure → slow responses
+
+    Client->>LB: Request
+    LB->>B2: Forward (selected by round-robin)
+    B2-->>LB: 200 OK (latency: 2100ms > threshold 2000ms)
+
+    LB->>LB: Mark B2 as degraded (outlier detection)<br/>3 consecutive slow responses
+
+    Client->>LB: Next request
+    LB->>B1: Forward (B2 ejected from pool)
+    B1-->>LB: 200 OK (45ms)
+
+    Note over LB: Ejection: 30s base, doubles each consecutive ejection<br/>Max 300s ejection time
+
+    loop Passive health check during ejection
+        LB->>B2: Probe every 10s
+        B2-->>LB: 200 OK (50ms — recovered)
+    end
+
+    LB->>LB: Return B2 to pool (half-weight initially)
+
+    Note over CP: Auto-scaling triggered
+    CP->>B3: Launch new instance
+    B3->>LB: Register via service discovery
+    LB->>B3: Health check passes
+    LB->>LB: Add B3 to pool (slow-start: ramp weight over 60s)
+```
+
+### Caching Strategy
+
+#### Multi-Tier Caching
+- **L1 (Connection-level)**: TCP connection pooling to backends; keep-alive reduces handshake overhead
+- **L2 (Route cache)**: LRU cache of route matching results (path→backend mapping); 10K entries, TTL 30s
+- **L3 (Response cache)**: Optional HTTP response caching at LB for idempotent GETs; keyed by {method, path, vary-headers}
+
+#### Cache Eviction Policies
+- **Route cache**: LRU with 30s TTL; invalidated immediately on config push from control plane
+- **Response cache**: TTL from backend `Cache-Control` headers; max 60s for API responses; LRU eviction at 80% capacity
+- **Connection pool**: Idle connections evicted after 90s; max 128 connections per backend
+
+#### Cache Invalidation Patterns
+- **Config-driven**: Control plane pushes new route config via xDS (Envoy) or API; LB drains old config gracefully
+- **Event-driven**: Backend de-registration events immediately purge cached routes
+- **TTL-based**: Response cache respects origin `Cache-Control`; never caches `no-store` or `private`
+
+#### Thundering Herd Prevention
+- **Request coalescing**: Multiple identical in-flight requests to same backend collapsed into single upstream request
+- **Connection pooling**: Prevents thundering herd on backend TCP accept queue during traffic spikes

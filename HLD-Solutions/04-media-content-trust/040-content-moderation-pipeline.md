@@ -60,6 +60,58 @@
 
 ## 3. Data Modeling
 
+### Entity-Relationship Diagram
+
+```mermaid
+erDiagram
+    MODERATION_DECISIONS {
+        uuid decision_id PK
+        varchar content_id
+        varchar content_type
+        varchar auto_decision
+        varchar final_decision
+        varchar decision_source
+        uuid policy_id FK
+    }
+    REVIEW_QUEUE {
+        uuid queue_item_id PK
+        uuid decision_id FK
+        varchar content_id
+        decimal priority_score
+        varchar severity
+        varchar status
+        uuid assigned_to FK
+    }
+    APPEALS {
+        uuid appeal_id PK
+        uuid decision_id FK
+        uuid appellant_id FK
+        varchar status
+        smallint tier
+        varchar decision
+    }
+    POLICIES {
+        uuid policy_id PK
+        varchar name
+        int version
+        varchar status
+        jsonb rules
+        jsonb thresholds
+    }
+    REVIEWER_METRICS {
+        uuid reviewer_id PK
+        date date PK
+        varchar category PK
+        int items_reviewed
+        decimal accuracy_score
+    }
+
+    POLICIES ||--o{ MODERATION_DECISIONS : enforces
+    MODERATION_DECISIONS ||--o| REVIEW_QUEUE : "escalated to"
+    MODERATION_DECISIONS ||--o{ APPEALS : "appealed via"
+    REVIEW_QUEUE }o--|| REVIEWER_METRICS : "reviewed by"
+```
+
 ### 3.1 PostgreSQL - Core Decisions & Configuration
 
 ```sql
@@ -1635,3 +1687,232 @@ alerts:
 - NetzDG (Germany): 7-day removal for most violations, 24h for "obviously illegal"
 - Audit trail: All decisions retained for 5+ years for legal discovery
 - Reviewer welfare: Mandatory counseling access, limited exposure hours
+
+---
+
+## Sequence Diagrams
+
+### 1. ML Auto-Moderation Pipeline
+
+```mermaid
+sequenceDiagram
+    participant Src as Content Source (Upload/Post)
+    participant Q as Ingestion Queue (Kafka)
+    participant Router as Content Router
+    participant Img as Image Classifier
+    participant Vid as Video Analyzer
+    participant Text as Text/NLP Classifier
+    participant Hash as Hash Matching (PhotoDNA/CSAM)
+    participant Ensemble as Ensemble Scorer
+    participant Policy as Policy Engine
+    participant DB as Decision DB
+    participant Action as Action Service
+
+    Src->>Q: Content submitted {content_id, type, media_url, text}
+    Q->>Router: Consume content event
+    Router->>Router: Determine content type + required classifiers
+
+    par Parallel ML classification
+        Router->>Img: Classify image (nudity, violence, hate symbols)
+        Img->>Img: Multi-label CNN (confidence per category)
+        Img-->>Ensemble: {nudity: 0.92, violence: 0.03, hate: 0.01}
+
+        Router->>Hash: Check perceptual hash against known-bad DB
+        Hash->>Hash: PhotoDNA match + internal blocklist
+        Hash-->>Ensemble: {csam_match: false, known_terrorist: false}
+
+        Router->>Text: Classify text (hate speech, harassment, spam)
+        Text->>Text: Transformer model (multilingual)
+        Text-->>Ensemble: {hate: 0.12, harassment: 0.05, spam: 0.02}
+
+        Router->>Vid: Sample video frames + audio transcript
+        Vid->>Vid: Frame sampling (1fps) → image classifier
+        Vid->>Vid: Audio → speech-to-text → text classifier
+        Vid-->>Ensemble: {nudity_max_frame: 0.87, violence: 0.15}
+    end
+
+    Ensemble->>Ensemble: Aggregate scores (weighted by model confidence)
+    Ensemble->>Policy: Apply policy rules (per content type, per region)
+
+    alt Score > auto-remove threshold
+        Policy-->>Action: AUTO_REMOVE
+        Action->>DB: Record decision (auto, reason, scores)
+        Action->>Src: Remove content + notify user (violation)
+    else Score > review threshold
+        Policy-->>Action: QUEUE_FOR_REVIEW
+        Action->>DB: Record decision (pending_review)
+        Action->>Q: Route to human review queue (priority based on score)
+    else Score < review threshold
+        Policy-->>Action: APPROVE
+        Action->>DB: Record decision (auto_approved)
+        Note over Action: Content goes live
+    end
+```
+
+### 2. Human Review Queue Escalation
+
+```mermaid
+sequenceDiagram
+    participant Q as Review Queue
+    participant Assign as Assignment Engine
+    participant R1 as Reviewer (L1)
+    participant R2 as Senior Reviewer (L2)
+    participant QA as QA Auditor
+    participant DB as Decision DB
+    participant Policy as Policy Engine
+    participant Action as Action Service
+    participant Appeal as Appeal Queue
+    participant User as Content Creator
+
+    Q->>Assign: Content awaiting review (priority-sorted)
+    Assign->>Assign: Match to reviewer (skill tags, language, load balance)
+    Assign->>Assign: Welfare check (reviewer not over exposure limit)
+    Assign->>R1: Assign content for review (SLA: 24h)
+
+    R1->>R1: Review content against policy guidelines
+    R1->>DB: Submit decision {action: remove, policy_violated: hate_speech, confidence: medium}
+
+    alt Confidence = high (clear violation)
+        DB->>Action: Execute removal
+        Action->>User: Notify (content removed, reason, appeal link)
+    else Confidence = medium (borderline)
+        DB->>Assign: Escalate to L2 review
+        Assign->>R2: Assign escalated case
+        R2->>R2: Review with broader context (user history, cultural context)
+        R2->>DB: Final decision {action: remove, additional_context}
+        DB->>Action: Execute decision
+        Action->>User: Notify
+    else Confidence = low (needs team discussion)
+        DB->>Assign: Escalate to policy team
+        Note over Assign: Weekly policy sync for edge cases
+    end
+
+    Note over QA: Random audit (5% of all decisions)
+    QA->>DB: Pull random sample of L1 decisions
+    QA->>QA: Validate decision correctness
+    alt Incorrect decision found
+        QA->>DB: Flag reversal needed
+        QA->>Action: Reverse action (reinstate or remove)
+        QA->>Assign: Feedback to reviewer (coaching)
+    end
+
+    User->>Appeal: Submit appeal {content_id, reason: "This is satire"}
+    Appeal->>Assign: Route to different reviewer (not original)
+    Note over Appeal: Appeal flow (see Diagram 3)
+```
+
+### 3. Appeal + Reinstatement
+
+```mermaid
+sequenceDiagram
+    participant User as Content Creator
+    participant API as Appeal API
+    participant DB as Appeal DB
+    participant Assign as Assignment Engine
+    participant R as Appeal Reviewer (L2+)
+    participant Context as Context Service
+    participant Action as Action Service
+    participant Notify as Notification Service
+    participant Audit as Audit Log
+    participant ML as ML Feedback Loop
+
+    User->>API: POST /appeals {content_id, reason, evidence_text}
+    API->>DB: Check appeal eligibility (1 appeal per decision, within 30 days)
+    alt Not eligible
+        API-->>User: Appeal denied (already appealed / window expired)
+    else Eligible
+        API->>DB: Create appeal record (status: pending)
+        API-->>User: Appeal submitted (SLA: 48 hours)
+    end
+
+    DB->>Assign: Route to appeal reviewer (must be different from original)
+    Assign->>Assign: Select L2+ reviewer with relevant expertise
+    Assign->>R: Assign appeal case
+
+    R->>Context: Pull full context
+    Context-->>R: Original content, ML scores, original decision, user history, appeal reason
+    R->>R: Fresh review (de novo, not just checking original decision)
+
+    alt Uphold original decision
+        R->>DB: Decision: upheld {reasoning}
+        DB->>Notify: Inform user
+        Notify->>User: "Appeal reviewed - original decision stands" + reasoning
+        R->>Audit: Log appeal outcome
+    else Overturn - reinstate content
+        R->>DB: Decision: overturned {reasoning}
+        R->>Action: Reinstate content
+        Action->>Action: Restore content to published state
+        Action->>Action: Remove strike from user account
+        R->>Notify: Inform user
+        Notify->>User: "Appeal successful - content reinstated"
+        R->>Audit: Log reversal (for compliance)
+
+        R->>ML: Submit as false positive training signal
+        ML->>ML: Add to retraining dataset (improve model)
+        Note over ML: Batch retrain weekly with corrected labels
+    else Partial - modify enforcement
+        R->>DB: Decision: modified {reduce from removal to age-gate}
+        R->>Action: Apply modified enforcement
+        R->>Notify: Inform user of modified decision
+    end
+```
+
+---
+
+### Caching Strategy
+
+**Moderation-Specific Caching**:
+
+| Layer | What's Cached | TTL | Rationale |
+|-------|--------------|-----|-----------|
+| Hash Cache (Redis) | Known-bad perceptual hashes | Permanent (updated daily) | Instant CSAM/terrorist content blocking |
+| Model Result Cache | ML scores for identical content hash | 7 days | Avoid re-scoring reposts/duplicates |
+| Policy Rule Cache | Active policy ruleset per region | 5 min | Policies change rarely; low TTL for safety |
+| User Reputation Cache | Trust scores per user | 1 hour | Fast-path trusted users, scrutinize new accounts |
+| Decision Cache | Recent moderation decisions | 24h | De-duplicate reports on same content |
+| Blocklist Cache | Banned keywords/phrases (all languages) | 10 min | Hot-reloaded on policy updates |
+
+**Cache Invalidation**:
+- Policy update → immediate broadcast invalidation of rule cache (pub/sub)
+- New hash added to blocklist → push to all edge hash caches within 60 seconds
+- User trust score change → event-driven invalidation
+- Content re-classified → invalidate decision cache for that content_id
+
+**Performance Impact**:
+- Hash cache hit: decision in <10ms (vs. 200ms for full ML pipeline)
+- Duplicate content detection: skip ML entirely for known content (saves ~$0.003/item)
+- Trusted user fast-path: skip heavy ML for accounts with >1 year clean history
+
+---
+
+### Infrastructure Components
+
+**Compute Infrastructure**:
+- **ML Inference**: GPU cluster (NVIDIA A100/H100) for real-time classification
+  - Auto-scaling: scale on queue depth (target: <5s processing latency)
+  - Spot instances for batch retraining; on-demand for real-time inference
+  - Model serving: Triton Inference Server with dynamic batching
+- **Review Tools**: Web application on Kubernetes (EKS)
+  - Isolated network (reviewers cannot exfiltrate content)
+  - Screen recording disabled, watermarked content display
+- **Queue Processing**: Kafka cluster (multi-AZ, 7-day retention)
+  - Partitioned by content type for specialized consumer groups
+  - Separate clusters for high-priority (CSAM) vs standard moderation
+
+**Storage Infrastructure**:
+- **Content Store**: S3 with legal hold capability (compliance retention)
+- **Decision Database**: PostgreSQL (ACID for audit trail) + read replicas
+- **Vector Store**: Milvus for perceptual hash similarity search
+- **Analytics**: ClickHouse for real-time moderation dashboards
+
+**Networking & Security**:
+- Content viewing restricted to VPN + dedicated workstations (reviewers)
+- All content access logged (who viewed what, when)
+- Encryption at rest (AES-256) and in transit (TLS 1.3)
+- Separate VPC for ML inference (no internet egress except model updates)
+
+**Observability**:
+- Metrics: latency per model, queue depths, reviewer throughput, false positive rate
+- Alerts: queue backup >10 min, model accuracy drift >2%, CSAM hash miss
+- Dashboards: real-time moderation funnel (auto-approved / queued / removed)
+- SLA monitoring: time-to-decision p50/p95/p99 tracked per content type

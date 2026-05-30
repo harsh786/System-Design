@@ -53,6 +53,83 @@
 
 ## 4. Data Modeling
 
+### Entity-Relationship Diagram
+
+```mermaid
+erDiagram
+    jurisdictions ||--o{ tax_rates : "has rates"
+    jurisdictions ||--o{ nexus_registrations : "registered in"
+    jurisdictions ||--o{ exemption_certificates : "valid for"
+    jurisdictions ||--o| jurisdictions : "parent"
+    tax_calculations ||--o| exemption_certificates : "may apply"
+    tax_calculations }o--|| jurisdictions : "resolved to"
+    tax_filings }o--|| jurisdictions : "filed for"
+    product_tax_codes ||--o{ tax_rates : "rated by"
+
+    jurisdictions {
+        UUID jurisdiction_id PK
+        VARCHAR jurisdiction_code
+        VARCHAR name
+        VARCHAR level
+        VARCHAR country_code
+        JSONB boundary_geojson
+    }
+    tax_rates {
+        UUID rate_id PK
+        UUID jurisdiction_id FK
+        VARCHAR tax_type
+        VARCHAR product_tax_code FK
+        DECIMAL rate
+        DATE effective_from
+        BOOLEAN is_active
+    }
+    product_tax_codes {
+        UUID ptc_id PK
+        VARCHAR tax_code
+        VARCHAR name
+        VARCHAR category
+    }
+    nexus_registrations {
+        UUID nexus_id PK
+        UUID tenant_id
+        UUID jurisdiction_id FK
+        VARCHAR nexus_type
+        DATE effective_from
+        BOOLEAN is_active
+    }
+    exemption_certificates {
+        UUID certificate_id PK
+        UUID tenant_id
+        VARCHAR customer_id
+        VARCHAR exemption_type
+        UUID jurisdiction_id FK
+        VARCHAR status
+        DATE expiration_date
+    }
+    tax_calculations {
+        UUID calculation_id PK
+        UUID tenant_id
+        VARCHAR transaction_id
+        DECIMAL total_tax
+        DECIMAL total_taxable
+        BOOLEAN committed
+    }
+    tax_filings {
+        UUID filing_id PK
+        UUID tenant_id
+        UUID jurisdiction_id FK
+        DATE period_start
+        DECIMAL tax_collected
+        VARCHAR status
+    }
+    address_jurisdiction_cache {
+        VARCHAR address_hash PK
+        DECIMAL latitude
+        DECIMAL longitude
+        UUID[] jurisdictions
+    }
+```
+
 ### Full Database Schemas
 
 ```sql
@@ -878,3 +955,82 @@ alerts:
 | Rate source | Multi-source (state DOR + providers) | Single provider (Avalara/Vertex) | Independence + cost control |
 | Caching | 3-tier (L1/L2/L3) | Single Redis layer | Sub-10ms critical for checkout flow |
 | Calculation model | Real-time API | Pre-generated rate tables embedded in client | Accuracy vs offline capability |
+
+---
+
+## 12. Sequence Diagrams
+
+### Diagram 1: Tax Determination for Multi-Jurisdiction Order
+
+```mermaid
+sequenceDiagram
+    participant Checkout as Checkout Service
+    participant Tax as Tax Calculation API
+    participant Geo as Geocoding Service
+    participant Nexus as Nexus Engine
+    participant Rules as Tax Rules Engine
+    participant Cache as Rate Cache (Redis)
+    participant DB as Tax DB
+
+    Checkout->>Tax: POST /tax/calculate (ship_to=CA, items=[{sku:LAPTOP, price:1200}, {sku:SOFTWARE, price:200}])
+    Tax->>Geo: Resolve address → tax jurisdiction
+    Geo-->>Tax: {state: CA, county: Santa Clara, city: San Jose, district: [transit]}
+    
+    Tax->>Nexus: Check seller nexus in CA
+    Nexus-->>Tax: {has_nexus: true, nexus_type: physical_presence}
+    
+    loop For each line item
+        Tax->>Rules: Determine taxability (product=LAPTOP, jurisdiction=CA)
+        Rules->>Cache: GET rate (CA:Santa_Clara:San_Jose, category=electronics)
+        Cache-->>Rules: {state: 0.0725, county: 0.01, city: 0.0025, district: 0.005, total: 0.09}
+        Rules-->>Tax: LAPTOP: taxable, rate=9%, tax=$108.00
+        
+        Tax->>Rules: Determine taxability (product=SOFTWARE, jurisdiction=CA)
+        Rules->>Rules: Check: Is SaaS taxable in CA? → YES (since 2024)
+        Rules-->>Tax: SOFTWARE: taxable, rate=9%, tax=$18.00
+    end
+    
+    Tax->>Tax: Total tax = $126.00, effective rate = 9%
+    Tax->>DB: Store calculation (idempotency: order_id + version)
+    Tax-->>Checkout: {total_tax: 126.00, breakdown: [{item: LAPTOP, tax: 108}, {item: SOFTWARE, tax: 18}]}
+
+    Note over Checkout,DB: Multi-jurisdiction: some items exempt in some states (clothing in PA).<br/>Nexus determines if seller must collect tax at all.
+```
+
+### Diagram 2: Tax Rate Update Propagation
+
+```mermaid
+sequenceDiagram
+    participant Source as Tax Authority / Provider
+    participant Ingest as Rate Ingestion Service
+    participant Valid as Validation Engine
+    participant DB as Rate Database
+    participant Cache as Rate Cache (3-tier)
+    participant Kafka as Event Bus
+    participant Services as Dependent Services
+    participant Audit as Audit Log
+
+    Source->>Ingest: New rate file (CA sales tax: 7.25% → 7.50%, effective=2024-07-01)
+    Ingest->>Valid: Validate rate change
+    Valid->>Valid: Sanity check: delta < 2%? date in future? jurisdiction exists?
+    Valid-->>Ingest: VALID (reasonable change, future-dated)
+    
+    Ingest->>DB: INSERT tax_rate (jurisdiction=CA, rate=7.50, effective_date=2024-07-01, supersedes=rate_v1)
+    Note over DB: Old rate NOT deleted — kept for historical calculations
+    Ingest->>Audit: Log rate change (who, when, old_value, new_value, source)
+    
+    Ingest->>Kafka: Publish rate.updated {jurisdiction: CA, new_rate: 7.50, effective: 2024-07-01}
+    
+    par Cache invalidation
+        Kafka-->>Cache: Invalidate L2/L3 cache keys matching CA:*
+        Cache->>Cache: L1 (in-memory): Will expire via TTL (30s max staleness)
+        Cache->>Cache: L2 (Redis): Explicit delete + reload from DB
+        Cache->>Cache: L3 (CDN/edge): Purge + warm with new rates
+    end
+    
+    Kafka-->>Services: Notify: Tax rate changing (for pre-computation invalidation)
+    
+    Note over Source,Audit: Effective-date model: both old and new rates exist simultaneously.<br/>Query always filters WHERE effective_date <= transaction_date.<br/>No "deploy" needed — rate activates automatically on effective date.
+
+    Note over Cache,Services: Between effective date and cache refresh (max 30s),<br/>some transactions may use old rate → reconciliation catches these.
+```

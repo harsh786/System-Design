@@ -54,6 +54,91 @@ Settlement batches:
 
 ## 4. Data Modeling — Full Schemas
 
+### Entity-Relationship Diagram
+
+```mermaid
+erDiagram
+    merchants ||--o{ payment_intents : "receives payments"
+    merchants ||--o{ webhook_events : "receives events"
+    payment_intents ||--o{ charges : "generates"
+    payment_intents }o--|| payment_methods : "uses"
+    charges ||--o{ refunds : "may have"
+    charges ||--o{ disputes : "may have"
+    ledger_accounts ||--o{ ledger_entries : "contains"
+    card_tokens ||--o| payment_methods : "tokenizes"
+    psp_configurations ||--o{ charges : "processes"
+
+    merchants {
+        UUID merchant_id PK
+        VARCHAR business_name
+        CHAR country_code
+        VARCHAR kyb_status
+        VARCHAR risk_tier
+        VARCHAR settlement_schedule
+    }
+    payment_intents {
+        UUID payment_intent_id PK
+        UUID merchant_id FK
+        BIGINT amount
+        CHAR currency
+        VARCHAR status
+        VARCHAR idempotency_key
+    }
+    charges {
+        UUID charge_id PK
+        UUID payment_intent_id FK
+        VARCHAR psp_id FK
+        BIGINT amount
+        VARCHAR status
+        BOOLEAN captured
+    }
+    refunds {
+        UUID refund_id PK
+        UUID charge_id FK
+        BIGINT amount
+        VARCHAR status
+        VARCHAR reason
+    }
+    disputes {
+        UUID dispute_id PK
+        UUID charge_id FK
+        BIGINT amount
+        VARCHAR reason
+        VARCHAR status
+    }
+    ledger_accounts {
+        UUID account_id PK
+        VARCHAR account_type
+        VARCHAR account_name
+        BIGINT balance
+    }
+    ledger_entries {
+        BIGSERIAL entry_id PK
+        UUID journal_id
+        UUID account_id FK
+        CHAR entry_type
+        BIGINT amount
+    }
+    payment_methods {
+        UUID payment_method_id PK
+        UUID customer_id
+        VARCHAR type
+        VARCHAR card_brand
+    }
+    card_tokens {
+        UUID token_id PK
+        BYTEA encrypted_pan
+        VARCHAR card_brand
+        CHAR last4
+    }
+    psp_configurations {
+        VARCHAR psp_id PK
+        VARCHAR psp_name
+        DECIMAL success_rate_30d
+        VARCHAR circuit_state
+    }
+```
+
 ```sql
 -- Core Payment Schema
 CREATE TABLE merchants (
@@ -1032,3 +1117,317 @@ class FXService:
 - **Read replicas**: For reporting/analytics queries
 - **Event sourcing**: Payment events as source of truth, projections for read models
 - **Geographic**: Multi-region active-active with conflict-free payment IDs (UUIDv7)
+
+---
+
+## 12. Sequence Diagrams
+
+### Diagram 1: Payment Intent Creation + PSP Routing
+
+```mermaid
+sequenceDiagram
+    participant M as Merchant
+    participant API as Payment API
+    participant IK as Idempotency Store (Redis)
+    participant Router as PSP Router
+    participant CB as Circuit Breaker
+    participant PSP1 as PSP Primary (Stripe)
+    participant PSP2 as PSP Fallback (Adyen)
+    participant Ledger as Double-Entry Ledger
+    participant Kafka as Event Bus
+
+    M->>API: POST /payment_intents (idempotency_key=abc123)
+    API->>IK: CHECK idempotency_key=abc123
+    IK-->>API: NOT FOUND (new request)
+    API->>API: Create PaymentIntent (status=requires_confirmation)
+    API->>IK: STORE key=abc123, response=pending
+    M->>API: POST /payment_intents/{id}/confirm
+    API->>Router: Route payment ($150, USD, card_visa)
+    Router->>CB: Check PSP1 health
+    CB-->>Router: CLOSED (healthy, success_rate=98%)
+    Router->>PSP1: Authorize (amount=15000, currency=usd, idempotency_key=abc123)
+    PSP1-->>Router: 200 OK (auth_code=XYZ789)
+    Router-->>API: Authorization successful
+    API->>Ledger: POST double-entry (DR: merchant_receivable, CR: payment_clearing)
+    Ledger-->>API: Entry committed (txn_id=LE001)
+    API->>Kafka: Publish payment.authorized event
+    API->>IK: UPDATE key=abc123, response=succeeded
+    API-->>M: 200 PaymentIntent (status=succeeded)
+
+    Note over M,Kafka: If PSP1 fails, Router retries with PSP2 using SAME idempotency_key
+```
+
+### Diagram 2: 3DS Challenge Flow
+
+```mermaid
+sequenceDiagram
+    participant Card as Cardholder Browser
+    participant M as Merchant
+    participant API as Payment Gateway
+    participant PSP as PSP (Acquirer)
+    participant DS as Directory Server (Visa/MC)
+    participant ACS as Issuer ACS
+    participant Ledger as Ledger
+
+    M->>API: Confirm PaymentIntent (card + 3DS required)
+    API->>PSP: Create 3DS authentication
+    PSP->>DS: AReq (card range lookup)
+    DS->>ACS: AReq (enrolled?)
+    ACS-->>DS: ARes (challenge_required, acs_url)
+    DS-->>PSP: ARes (challenge_required)
+    PSP-->>API: 3DS challenge data (acs_url, creq)
+    API-->>M: PaymentIntent (status=requires_action, next_action=redirect)
+    M-->>Card: Redirect to ACS (iframe/redirect)
+    Card->>ACS: Submit OTP/Biometric
+    ACS-->>Card: CRes (authentication_result=Y)
+    Card->>M: Return from redirect (cres token)
+    M->>API: POST /payment_intents/{id}/confirm (cres=token)
+    API->>PSP: Authorize with 3DS cryptogram
+    PSP-->>API: Authorized (liability_shift=issuer)
+    API->>Ledger: Double-entry posting
+    API-->>M: PaymentIntent (status=succeeded, liability_shift=true)
+
+    Note over Card,Ledger: 3DS shifts fraud liability from merchant to issuer
+```
+
+### Diagram 3: Refund Processing with Compensation
+
+```mermaid
+sequenceDiagram
+    participant M as Merchant
+    participant API as Refund Service
+    participant IK as Idempotency Store
+    participant Ledger as Ledger
+    participant PSP as PSP
+    participant Kafka as Event Bus
+    participant Recon as Reconciliation
+
+    M->>API: POST /refunds (payment_id=PI_001, amount=5000, idempotency_key=ref_001)
+    API->>IK: CHECK ref_001
+    IK-->>API: NOT FOUND
+    API->>API: Validate (amount <= captured, not already refunded)
+    API->>Ledger: Reverse entries (DR: payment_clearing, CR: merchant_receivable)
+    Ledger-->>API: Reversal committed (txn_id=LE002)
+    API->>PSP: POST /refunds (charge_id=ch_xyz, amount=5000)
+    
+    alt PSP refund succeeds
+        PSP-->>API: 200 (refund_id=rf_psp_001)
+        API->>IK: STORE ref_001=succeeded
+        API->>Kafka: Publish refund.succeeded
+        API-->>M: 200 Refund (status=succeeded)
+    else PSP refund fails (timeout/error)
+        PSP-->>API: 500/timeout
+        API->>Ledger: Compensation entry (undo reversal)
+        Ledger-->>API: Compensation committed
+        API->>Kafka: Publish refund.failed (needs_manual_review)
+        API->>IK: STORE ref_001=failed
+        API-->>M: 200 Refund (status=failed, reason=psp_error)
+        Recon->>Recon: T+1 reconciliation catches orphaned refunds
+    end
+
+    Note over M,Recon: Ledger ALWAYS reflects actual money movement. Compensation ensures consistency.
+```
+
+## 13. Caching Strategy
+
+### Balance & Account Caching (Write-Through)
+
+```
+┌─────────────────────────────────────────────────────────┐
+│ CACHING LAYER FOR PAYMENT GATEWAY                        │
+├─────────────────────────────────────────────────────────┤
+│                                                          │
+│ 1. MERCHANT ACCOUNT CACHE (Write-Through)                │
+│    Key: merchant:{id}:config                             │
+│    TTL: 5 minutes                                        │
+│    Pattern: Write-through (update cache on config change)│
+│    Content: PSP credentials, routing rules, fee config   │
+│    Invalidation: On merchant settings update via webhook  │
+│                                                          │
+│ 2. PSP HEALTH/RATE CACHE (TTL-based)                     │
+│    Key: psp:{name}:health                                │
+│    TTL: 10 seconds (near real-time)                      │
+│    Content: success_rate, avg_latency, circuit_state     │
+│    Updated: Every 10s from sliding window metrics        │
+│                                                          │
+│ 3. FX RATE CACHE (TTL with forced refresh)               │
+│    Key: fx:{from}:{to}                                   │
+│    TTL: 60 seconds                                       │
+│    Source: Rate provider API (refreshed by cron)         │
+│    DANGER: Stale FX rate = financial loss                 │
+│    Mitigation: Hard-fail if rate > 60s old               │
+│                                                          │
+│ 4. IDEMPOTENCY CACHE (Redis primary, DB backup)          │
+│    Key: idem:{merchant_id}:{idempotency_key}             │
+│    TTL: 24 hours                                         │
+│    Pattern: Read-through from DB if Redis miss           │
+│    CRITICAL: Cache miss ≠ new request (always check DB)  │
+│                                                          │
+└─────────────────────────────────────────────────────────┘
+```
+
+### Why Eventual Consistency is DANGEROUS in Payments
+
+| Scenario | Risk if Eventually Consistent | Mitigation |
+|----------|-------------------------------|------------|
+| Idempotency check | Double-charge customer | Synchronous Redis + DB unique constraint |
+| Balance deduction | Overdraft/double-spend | Serializable isolation on balance row |
+| Refund eligibility | Refund > captured amount | Read from primary, not replica |
+| FX rate lookup | Wrong currency conversion | Hard TTL with fail-closed on stale |
+
+**Where eventual consistency IS acceptable:**
+- Reporting/analytics dashboards (seconds of lag OK)
+- Merchant notification webhooks (retry with at-least-once)
+- Fraud scoring feature updates (near-real-time acceptable)
+
+## 14. Algorithm Deep Dives
+
+### Deep Dive: PSP Routing & Smart Retry
+
+```python
+class PSPRouter:
+    """
+    Smart PSP routing with circuit breaker and cascading fallback.
+    Goal: Maximize authorization rate while minimizing cost.
+    """
+    
+    def __init__(self):
+        self.circuit_breakers = {}  # psp_name -> CircuitBreaker
+        self.routing_rules = {}     # merchant_id -> RoutingConfig
+    
+    def route_payment(self, payment: Payment) -> PSPResult:
+        # Step 1: Get candidate PSPs (ordered by priority)
+        candidates = self._get_candidates(payment)
+        
+        # Step 2: Filter by circuit breaker state
+        available = [p for p in candidates if self._is_available(p)]
+        
+        # Step 3: Try each PSP with same idempotency key
+        for psp in available:
+            result = self._attempt_authorization(psp, payment)
+            if result.success:
+                return result
+            if result.is_hard_decline:  # Card declined, don't retry
+                return result
+            # Soft failure (timeout, 5xx) → try next PSP
+            self._record_failure(psp)
+        
+        return PSPResult(success=False, error="all_psps_exhausted")
+    
+    def _get_candidates(self, payment: Payment) -> List[PSP]:
+        """
+        Routing factors:
+        1. Card BIN → issuer country → prefer local acquirer (higher auth rate)
+        2. Amount threshold → some PSPs better for micro/macro payments
+        3. Merchant category → PSP specialization
+        4. Cost optimization → cheapest PSP that meets SLA
+        5. Load balancing → spread traffic to maintain warm connections
+        """
+        rules = self.routing_rules[payment.merchant_id]
+        scored = []
+        for psp in rules.psps:
+            score = (
+                psp.auth_rate_for_bin(payment.card_bin) * 0.4 +
+                psp.cost_score(payment.amount) * 0.3 +
+                psp.health_score() * 0.2 +
+                psp.locality_score(payment.issuer_country) * 0.1
+            )
+            scored.append((score, psp))
+        return [psp for _, psp in sorted(scored, reverse=True)]
+    
+    def _is_available(self, psp: PSP) -> bool:
+        cb = self.circuit_breakers[psp.name]
+        if cb.state == "OPEN":
+            if cb.should_try_half_open():
+                return True  # Allow one probe request
+            return False
+        return True
+
+
+class CircuitBreaker:
+    """
+    States: CLOSED → OPEN → HALF_OPEN → CLOSED
+    
+    CLOSED: Normal operation, track failure rate in sliding window
+    OPEN: All requests fail-fast, wait for recovery_timeout
+    HALF_OPEN: Allow 1 probe request, success → CLOSED, fail → OPEN
+    """
+    
+    def __init__(self, failure_threshold=0.5, window_size=60, recovery_timeout=30):
+        self.failure_threshold = failure_threshold  # 50% failure rate
+        self.window_size = window_size              # 60 second window
+        self.recovery_timeout = recovery_timeout    # 30 seconds before probe
+        self.state = "CLOSED"
+        self.failures = SlidingWindow(window_size)
+        self.last_failure_time = None
+    
+    def record_success(self):
+        if self.state == "HALF_OPEN":
+            self.state = "CLOSED"
+            self.failures.reset()
+    
+    def record_failure(self):
+        self.failures.add(1)
+        if self.failures.rate() > self.failure_threshold:
+            self.state = "OPEN"
+            self.last_failure_time = now()
+    
+    def should_try_half_open(self) -> bool:
+        if now() - self.last_failure_time > self.recovery_timeout:
+            self.state = "HALF_OPEN"
+            return True
+        return False
+```
+
+**Idempotency Key Management Across PSP Retries:**
+```
+Original request: idempotency_key = "merchant_abc_order_123"
+
+PSP1 attempt: Send with key "merchant_abc_order_123"
+  → Timeout (unknown state!)
+  
+PSP1 status check: GET /charges?idempotency_key=merchant_abc_order_123
+  → 404 (never received) OR 200 (succeeded!) OR 200 (failed)
+  
+If PSP1 never received or hard-failed:
+  PSP2 attempt: Send with SAME key "merchant_abc_order_123"
+  → PSP2 guarantees: same key = same response (no double-charge)
+
+CRITICAL: Never generate new idempotency key for retry of same payment intent!
+```
+
+### Deep Dive: Double-Entry Bookkeeping
+
+```
+WHY DOUBLE-ENTRY: Every financial movement creates TWO entries that sum to zero.
+This makes it mathematically impossible for money to "disappear" — any imbalance
+means a bug, instantly detectable.
+
+ACCOUNTS IN A PAYMENT GATEWAY:
+┌─────────────────────────────────────────────────────┐
+│ Asset Accounts          │ Liability Accounts         │
+│ (money we hold/owe us)  │ (money we owe others)      │
+├─────────────────────────┼────────────────────────────┤
+│ bank_settlement_account │ merchant_payable           │
+│ psp_receivable          │ customer_refund_payable    │
+│ reserve_account         │ platform_fee_payable       │
+└─────────────────────────┴────────────────────────────┘
+
+EXAMPLE: $100 payment, 2.9% fee
+
+Entry 1 — Authorization/Capture:
+  DR  psp_receivable          $100.00  (PSP will send us this)
+  CR  merchant_payable         $97.10  (we owe merchant this)
+  CR  platform_fee_revenue      $2.90  (our fee)
+
+Entry 2 — Settlement (PSP sends money):
+  DR  bank_settlement_account $100.00  (money arrived)
+  CR  psp_receivable          $100.00  (PSP no longer owes us)
+
+Entry 3 — Payout to merchant:
+  DR  merchant_payable         $97.10  (we no longer owe merchant)
+  CR  bank_settlement_account  $97.10  (money leaves our bank)
+
+INVARIANT: Sum of all DRs = Sum of all CRs (always, for all time)
+AUDIT: Trial balance report verifies this hourly
+```

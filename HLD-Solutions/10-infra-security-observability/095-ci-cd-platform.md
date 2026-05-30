@@ -44,6 +44,76 @@
 
 ## 3. Data Modeling
 
+### Entity-Relationship Diagram
+
+```mermaid
+erDiagram
+    PIPELINES {
+        uuid pipeline_id PK
+        uuid repo_id
+        string name
+        string branch
+        boolean is_active
+    }
+    PIPELINE_RUNS {
+        uuid run_id PK
+        uuid pipeline_id FK
+        bigint run_number
+        string status
+        string conclusion
+        string git_sha
+    }
+    JOBS {
+        uuid job_id PK
+        uuid run_id FK
+        string name
+        string status
+        string runner_id
+    }
+    JOB_STEPS {
+        uuid step_id PK
+        uuid job_id FK
+        string name
+        string step_type
+        string status
+    }
+    ARTIFACTS {
+        uuid artifact_id PK
+        uuid run_id FK
+        uuid job_id FK
+        string name
+        bigint size_bytes
+    }
+    ENVIRONMENTS {
+        uuid environment_id PK
+        uuid pipeline_id FK
+        string name
+        string tier
+    }
+    DEPLOYMENTS {
+        uuid deployment_id PK
+        uuid environment_id FK
+        uuid run_id FK
+        string strategy
+        string status
+    }
+    PIPELINE_SECRETS {
+        uuid secret_id PK
+        string scope_type
+        uuid scope_id
+        string name
+    }
+
+    PIPELINES ||--o{ PIPELINE_RUNS : "triggers"
+    PIPELINES ||--o{ ENVIRONMENTS : "defines"
+    PIPELINE_RUNS ||--o{ JOBS : "contains"
+    JOBS ||--o{ JOB_STEPS : "executes"
+    PIPELINE_RUNS ||--o{ ARTIFACTS : "produces"
+    ENVIRONMENTS ||--o{ DEPLOYMENTS : "receives"
+    PIPELINE_RUNS ||--o{ DEPLOYMENTS : "deploys"
+    ARTIFACTS ||--o| DEPLOYMENTS : "deployed via"
+```
+
 ### Database Schemas
 
 ```sql
@@ -1203,3 +1273,144 @@ Total: 915s (15.25 minutes) ✓
 - Auto-scale to zero during off-hours (save 60% compute)
 - Artifact lifecycle policies: delete intermediate artifacts after 7 days
 - Log compression + tiering: hot (1 day) → warm (7 days) → cold (90 days)
+
+---
+
+## Sequence Diagrams
+
+### Pipeline Trigger + Stage Execution
+
+```mermaid
+sequenceDiagram
+    participant Dev as Developer
+    participant Git as GitHub/GitLab
+    participant Webhook as Webhook Receiver
+    participant Scheduler as Pipeline Scheduler
+    participant Queue as Job Queue (Redis)
+    participant Worker as Build Worker (K8s pod)
+    participant Artifact as Artifact Store (S3)
+    participant Notify as Notification Service
+
+    Dev->>Git: git push (branch: feature/x)
+    Git->>Webhook: POST webhook {repo, branch, commit_sha}
+    Webhook->>Webhook: Validate signature (HMAC)
+    Webhook->>Scheduler: Trigger pipeline for commit
+    Scheduler->>Scheduler: Load pipeline config (.ci/pipeline.yml)
+    Scheduler->>Scheduler: Build DAG of stages
+    Scheduler->>Queue: Enqueue stage 1: [lint, unit-test] (parallel)
+
+    par Lint job
+        Queue->>Worker: Dequeue lint job
+        Worker->>Worker: Spin up container, run lint
+        Worker->>Scheduler: Report: lint PASSED
+    and Unit test job
+        Queue->>Worker: Dequeue test job
+        Worker->>Worker: Run tests in container
+        Worker->>Artifact: Upload test results + coverage
+        Worker->>Scheduler: Report: tests PASSED
+    end
+
+    Scheduler->>Queue: Enqueue stage 2: [build, docker-push]
+    Queue->>Worker: Dequeue build job
+    Worker->>Artifact: Upload build artifact
+    Worker->>Scheduler: Report: build PASSED
+    Scheduler->>Notify: Pipeline complete (Slack, GitHub status)
+    Notify->>Git: Update commit status: success ✓
+```
+
+### Build Cache Hit/Miss
+
+```mermaid
+sequenceDiagram
+    participant Worker as Build Worker
+    participant CacheCtrl as Cache Controller
+    participant CacheStore as Cache Store (S3/Redis)
+    participant Registry as Container Registry
+
+    Worker->>CacheCtrl: Request cache for {repo, lockfile_hash, stage}
+    CacheCtrl->>CacheCtrl: Compute cache key = hash(lockfile + build_config)
+    CacheCtrl->>CacheStore: HEAD object (check existence)
+    alt Cache HIT
+        CacheStore-->>CacheCtrl: 200 (exists, size: 500MB)
+        CacheCtrl->>CacheStore: GET cached layer/dependencies
+        CacheStore-->>Worker: Cached artifacts (streamed)
+        Worker->>Worker: Skip install step, use cached deps
+        Note over Worker: Build time: 30s (vs 5min without cache)
+    else Cache MISS
+        CacheStore-->>CacheCtrl: 404
+        Worker->>Worker: Full install (npm install / go mod download)
+        Worker->>CacheCtrl: Upload new cache artifact
+        CacheCtrl->>CacheStore: PUT object {key, artifact, metadata}
+        Note over Worker: Build time: 5min (cache populated for next build)
+    end
+    Worker->>Registry: Push built container image (tagged: commit_sha)
+```
+
+### Canary Deployment + Rollback
+
+```mermaid
+sequenceDiagram
+    participant CD as CD Controller
+    participant K8s as Kubernetes
+    participant Mesh as Service Mesh (Istio)
+    participant Monitor as Metrics (Prometheus)
+    participant Alert as Alert Manager
+    participant Rollback as Rollback Controller
+
+    CD->>K8s: Deploy canary (1 pod, new version)
+    CD->>Mesh: Route 5% traffic to canary
+    CD->>Monitor: Start canary analysis window (5 min)
+
+    loop Every 30s for 5 minutes
+        Monitor->>Monitor: Compare canary vs baseline metrics
+        Monitor->>Monitor: Check: error_rate, latency_p99, saturation
+    end
+
+    alt Canary healthy (metrics within threshold)
+        Monitor-->>CD: Analysis: PASS
+        CD->>Mesh: Increase to 25% → 50% → 100%
+        CD->>K8s: Scale up new version, scale down old
+        CD-->>CD: Deployment complete
+    else Canary degraded (error rate > 1% OR p99 > 2x baseline)
+        Monitor->>Alert: Canary failure detected
+        Alert->>Rollback: Trigger automatic rollback
+        Rollback->>Mesh: Route 100% to stable version
+        Rollback->>K8s: Terminate canary pods
+        Rollback->>CD: Mark deployment: FAILED
+        CD->>CD: Notify team, attach metrics diff
+    end
+```
+
+## Async Processing
+
+### Event-Driven Pipeline Architecture
+- **Job scheduling**: Redis-backed priority queue with delayed jobs (retry after backoff)
+- **Artifact upload**: Async multipart upload to S3 (non-blocking to pipeline progress)
+- **Notification delivery**: Fan-out via SNS/Kafka to Slack, email, GitHub webhooks
+- **Log streaming**: Workers stream logs to Kafka → Elasticsearch (async, buffered)
+- **Cache warming**: Background job pre-builds cache for main branch on dependency updates
+
+### Exactly-Once Job Execution
+- Workers acquire jobs with visibility timeout (if worker dies, job re-appears)
+- Idempotency key per job (commit_sha + stage + attempt) prevents duplicate execution
+- Job state machine: QUEUED → RUNNING → SUCCESS/FAILED (transitions are atomic via Redis MULTI)
+
+## Infrastructure Components
+
+| Component | Technology | Sizing | HA Strategy |
+|-----------|-----------|--------|-------------|
+| Pipeline Scheduler | Go service | 3 pods (leader election) | Raft-based leader, standby replicas |
+| Job Queue | Redis Cluster | 6 nodes, 32GB | Multi-AZ, persistence (AOF) |
+| Build Workers | K8s pods (ephemeral) | Auto-scale 0→100 | Spot instances + on-demand fallback |
+| Artifact Store | S3 | Unlimited | Cross-region replication |
+| Cache Store | S3 + Redis (hot) | Tiered | S3 for large, Redis for metadata |
+| Container Registry | ECR/Harbor | - | Multi-AZ, geo-replicated |
+| Log Store | Kafka → Elasticsearch | 6 Kafka brokers | Replication factor 3 |
+| CD Controller | Argo Rollouts / Flagger | 2 pods | Leader election |
+| Metrics | Prometheus + Grafana | - | Thanos for HA |
+
+### Scalability Design
+- Workers auto-scale based on queue depth (KEDA scaler)
+- Build isolation: each job runs in fresh container (no cross-contamination)
+- Pipeline DAG execution: stages run in parallel when no dependency edges
+- Resource quotas per team/repo to prevent noisy neighbor

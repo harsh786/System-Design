@@ -80,6 +80,29 @@ Redis (caching):           100 nodes, 10TB total
 
 ## 5. Data Modeling
 
+### Entity-Relationship Diagram
+
+```mermaid
+erDiagram
+    PRODUCT {
+        string product_id PK
+        string title
+        string brand
+        string category_id
+        float price_current
+        float rating_average
+        boolean prime_eligible
+    }
+    USER_PROFILES {
+        bigint user_id PK
+        jsonb preferred_brands
+        float price_sensitivity
+        jsonb category_affinity
+        jsonb purchase_history
+    }
+    USER_PROFILES }o--o{ PRODUCT : "searches/views/buys"
+```
+
 ### Product Document (Elasticsearch)
 ```json
 {
@@ -1170,6 +1193,113 @@ Decision:
 - Cap personalization influence at 20% of final score
 - Always show some diverse/unexpected results
 - A/B test personalization level continuously
+```
+
+---
+
+## 16. Sequence Diagrams
+
+### 16.1 Search Query Pipeline
+
+```mermaid
+sequenceDiagram
+    participant User
+    participant API as API Gateway
+    participant QU as Query Understanding
+    participant Retrieval as Retrieval Service
+    participant ES as Elasticsearch (BM25)
+    participant ANN as ANN Index (HNSW)
+    participant Rank as L2 Ranker (LambdaMART)
+    participant Personal as Personalization
+    participant Cache as Redis Cache
+
+    User->>API: GET /search?q=wireless noise cancelling headphones&page=1
+    API->>Cache: Check (query_hash + user_segment)
+    alt Cache Miss
+        API->>QU: Understand query
+        QU->>QU: NER: {type=headphones, feature=[wireless, noise_cancelling]}
+        QU->>QU: Intent: product_search (not informational)
+        QU->>QU: Expand: "ANC" synonym, spell check
+        QU-->>API: Structured query + intent
+
+        par Lexical Retrieval
+            API->>ES: BM25 query (boosted fields: title^3, brand^2, features)
+            ES-->>API: Top-500 by BM25 score
+        and Semantic Retrieval
+            API->>ANN: Embed query → vector, k-NN search (HNSW)
+            ANN-->>API: Top-500 by cosine similarity
+        end
+
+        API->>API: RRF fusion (1/(60+rank_bm25) + 1/(60+rank_ann))
+        API->>Rank: Re-rank top-200 candidates
+        Rank->>Rank: LambdaMART with 300 features (CTR, conversion, reviews, price)
+        Rank-->>API: Scored and ranked results
+        API->>Personal: Apply user preferences (brand affinity, price range)
+        Personal-->>API: Final re-ranked list
+        API->>Cache: Store (TTL=5min, segment-specific)
+    end
+    API-->>User: {results: [...], facets: {...}, total: 2847}
+```
+
+### 16.2 Catalog Indexing Pipeline
+
+```mermaid
+sequenceDiagram
+    participant Seller as Seller Portal
+    participant CatalogDB as Catalog DB (DynamoDB)
+    participant CDC as CDC Stream
+    participant Kafka
+    participant Enricher as Enrichment Service
+    participant ML as ML Embedding Service
+    participant ESIdx as ES Index Writer
+    participant ANNIdx as ANN Index Builder
+
+    Seller->>CatalogDB: Create/Update product listing
+    CatalogDB->>CDC: Change event {product_id, fields_changed}
+    CDC->>Kafka: Publish to product-updates topic
+    
+    Kafka->>Enricher: Consume product event
+    Enricher->>Enricher: Normalize attributes (color, size, brand)
+    Enricher->>Enricher: Compute derived fields (price_bucket, review_summary)
+    Enricher->>ML: Generate embedding(title + description + attributes)
+    ML-->>Enricher: 768-dim vector
+    
+    par Write to Search Index
+        Enricher->>ESIdx: Upsert document (partial update if possible)
+        ESIdx->>ESIdx: Refresh interval: 1s (near-real-time)
+    and Write to Vector Index
+        Enricher->>ANNIdx: Update vector for product_id
+        ANNIdx->>ANNIdx: Rebuild HNSW graph segment (batched every 5 min)
+    end
+    
+    Note over ESIdx: Searchable within ~5 seconds
+    Note over ANNIdx: Searchable within ~5 minutes
+```
+
+### 16.3 Faceted Filtering Flow
+
+```mermaid
+sequenceDiagram
+    participant User
+    participant API as Search API
+    participant ES as Elasticsearch
+    participant FacetSvc as Facet Service
+    participant Cache as Facet Cache
+
+    User->>API: GET /search?q=headphones&brand=Sony&price=50-200&rating=4+
+    API->>ES: Bool query with filters
+    Note over ES: must: match "headphones"<br/>filter: term brand=Sony<br/>filter: range price [50,200]<br/>filter: range rating [4,5]<br/>aggs: [brand, price_range, rating, category, features]
+    
+    ES-->>API: {hits: [...], aggregations: {brand: [{Sony:45}, {Bose:32}...], price: [...]}}
+    API->>FacetSvc: Build facet response (counts, selected state)
+    FacetSvc->>FacetSvc: Mark "Sony" as selected, compute remaining facets
+    FacetSvc->>FacetSvc: Smart ordering: most relevant facets first
+    FacetSvc-->>API: Structured facets with counts
+    API-->>User: {results: [...], facets: {brand: [...], price_ranges: [...], features: [...]}}
+    
+    Note over User: User clicks "Wireless" feature facet
+    User->>API: GET /search?q=headphones&brand=Sony&price=50-200&rating=4+&feature=wireless
+    Note over API: Additional filter applied, facet counts update
 ```
 
 ---

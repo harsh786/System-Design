@@ -99,6 +99,54 @@ Total outbound: ~30 GB/s peak
 
 ## 4. Data Modeling
 
+### Entity-Relationship Diagram
+
+```mermaid
+erDiagram
+    USERS {
+        bigint user_id PK
+        varchar email
+        varchar first_name
+        varchar last_name
+        varchar headline
+    }
+    EXPERIENCES {
+        bigint experience_id PK
+        bigint user_id FK
+        bigint company_id FK
+        varchar title
+        date start_date
+    }
+    EDUCATION {
+        bigint education_id PK
+        bigint user_id FK
+        bigint school_id FK
+        varchar degree
+    }
+    USER_SKILLS {
+        bigint user_id PK
+        bigint skill_id PK
+        int endorsement_count
+    }
+    ENDORSEMENTS {
+        bigint endorsement_id PK
+        bigint user_id FK
+        bigint endorser_id FK
+        bigint skill_id FK
+    }
+    RECOMMENDATIONS {
+        bigint recommendation_id PK
+        bigint author_id FK
+        bigint recipient_id FK
+        text body
+    }
+    USERS ||--o{ EXPERIENCES : "has"
+    USERS ||--o{ EDUCATION : "has"
+    USERS ||--o{ USER_SKILLS : "has"
+    USERS ||--o{ ENDORSEMENTS : "receives"
+    USERS ||--o{ RECOMMENDATIONS : "receives"
+```
+
 ### PostgreSQL - Profiles & Jobs (Sharded by user_id / job_id)
 
 ```sql
@@ -1380,6 +1428,135 @@ Capacity Planning:
   - Auto-scaling for compute (feed generation, search)
   - Provisioned capacity for storage (graph, messages)
 ```
+
+---
+
+## Sequence Diagrams
+
+### 1. Connection Request + 2nd Degree Update
+
+```mermaid
+sequenceDiagram
+    participant UA as User A
+    participant API as API Gateway
+    participant CS as Connection Service
+    participant GS as Graph Store
+    participant K as Kafka
+    participant NS as Notification Service
+    participant FS as Feed Service
+    participant UB as User B
+
+    UA->>API: POST /connections/invite {target: user_b}
+    API->>CS: sendRequest(user_a, user_b)
+    CS->>GS: checkExisting(user_a, user_b)
+    GS-->>CS: no existing connection
+
+    CS->>GS: addEdge(user_a, PENDING, user_b)
+    CS->>K: publish ConnectionRequested {from, to}
+    K->>NS: push notification to user_b
+    CS-->>API: 200 OK
+
+    Note over UB: User B accepts
+    UB->>API: POST /connections/accept {request_id}
+    API->>CS: acceptRequest(user_b, request_id)
+    CS->>GS: updateEdge(user_a, CONNECTED, user_b)
+    CS->>K: publish ConnectionAccepted {user_a, user_b}
+
+    par Update graph indices
+        K->>GS: recompute 2nd-degree for user_a's network
+        K->>GS: recompute 2nd-degree for user_b's network
+    and Feed updates
+        K->>FS: add user_b content to user_a feed candidates
+        K->>FS: add user_a content to user_b feed candidates
+    and Notifications
+        K->>NS: notify user_a "user_b accepted"
+    end
+```
+
+### 2. Post + Professional Feed Ranking
+
+```mermaid
+sequenceDiagram
+    participant U as User
+    participant API as API Gateway
+    participant PS as Post Service
+    participant K as Kafka
+    participant SM as Samza (Stream)
+    participant RK as Ranking Service
+    participant RC as Redis Feed Cache
+    participant GS as Graph Store
+
+    U->>API: POST /posts {text, media, visibility}
+    API->>PS: createPost(user_id, content)
+    PS->>PS: persist to Espresso
+    PS->>K: publish PostCreated {post_id, author_id, topic}
+
+    K->>SM: consume PostCreated
+    SM->>GS: getConnections(author_id, depth=1)
+    GS-->>SM: connection_ids[] (avg 500-1000)
+
+    loop Each connection batch
+        SM->>RK: scoreForViewer(post, viewer_profile, relationship)
+        Note over RK: Signals: connection strength, topic affinity, author authority, recency
+        RK-->>SM: relevance_score
+        SM->>RC: ZADD feed:{viewer_id} score post_id
+    end
+
+    Note over SM: Also process for followers (1-way) with lower priority
+    SM->>K: publish FanoutComplete
+```
+
+### 3. Job Recommendation Pipeline
+
+```mermaid
+sequenceDiagram
+    participant U as User
+    participant API as API Gateway
+    participant JS as Job Rec Service
+    participant RC as Redis Cache
+    participant PS as Profile Service
+    participant ES as Elasticsearch
+    participant ML as ML Ranking (Samza)
+    participant JDB as Job Store
+
+    U->>API: GET /jobs/recommended
+    API->>JS: getRecommendations(user_id)
+    JS->>RC: GET job_recs:{user_id}
+
+    alt Cache hit (refreshed <6h)
+        RC-->>JS: cached_jobs[]
+    else Generate fresh recommendations
+        JS->>PS: getProfile(user_id)
+        PS-->>JS: skills, title, location, experience, preferences
+        JS->>ES: query(skills match, location, seniority, recency)
+        ES-->>JS: 500 candidate jobs
+
+        JS->>ML: rank(candidates, user_profile, application_history)
+        Note over ML: Features: skill overlap, company affinity, salary fit, commute, growth potential
+        ML-->>JS: top_50_scored_jobs
+
+        JS->>JDB: enrich(job_ids) - company info, applicant count
+        JDB-->>JS: enriched_jobs[]
+        JS->>RC: SET job_recs:{user_id} TTL=21600
+    end
+
+    JS-->>API: recommended_jobs[]
+    API-->>U: 200 OK
+```
+
+---
+
+## Infrastructure Components
+
+| Component | Technology | Purpose |
+|-----------|-----------|---------|
+| CDN | Akamai + LinkedIn PoPs | Profile images, static assets, video |
+| Load Balancer | Custom L7 (Indis) | Routing, TLS, A/B traffic splitting |
+| API Gateway | Rest.li + custom gateway | Schema validation, rate limiting, auth |
+| Service Mesh | Envoy-based (custom) | mTLS, circuit breaking, load balancing |
+| Edge Proxy | Regional PoPs | SSL termination, DDoS protection |
+| DNS | Custom GeoDNS | Latency-based routing across 3 regions |
+| Feature Store | Voldemort + Venice | Real-time ML features for ranking |
 
 ---
 

@@ -86,6 +86,64 @@
 
 ## 4. Data Model / Schema Design
 
+### Entity-Relationship Diagram
+
+```mermaid
+erDiagram
+    TRAINING_JOB {
+        string job_id PK
+        string user_id FK
+        string team_id FK
+        string name
+        string status
+        string framework
+        int priority
+        boolean preemptible
+    }
+    RESOURCE_SPEC {
+        string instance_type
+        int instance_count
+        int gpu_count_per_node
+    }
+    EXPERIMENT {
+        string experiment_id PK
+        string name
+        string project_id FK
+        string created_by FK
+    }
+    RUN {
+        string run_id PK
+        string experiment_id FK
+        string status
+    }
+    METRIC_ENTRY {
+        string key
+        float value
+        int step
+        int worker_rank
+    }
+    ARTIFACT {
+        string artifact_id PK
+        string name
+        string artifact_type
+        string uri
+    }
+    GPU_NODE {
+        string node_id PK
+        string gpu_type
+        int gpu_count
+        string rack_id
+        string status
+    }
+
+    TRAINING_JOB ||--|| RESOURCE_SPEC : requires
+    TRAINING_JOB ||--|| RUN : "tracked as"
+    EXPERIMENT ||--o{ RUN : contains
+    RUN ||--o{ METRIC_ENTRY : logs
+    RUN ||--o{ ARTIFACT : produces
+    GPU_NODE ||--o{ TRAINING_JOB : executes
+```
+
 ### Training Job Definition
 ```python
 @dataclass
@@ -1166,3 +1224,148 @@ spec:
 - **Cluster efficiency**: GPU allocation rate, fragmentation %, queue wait time
 - **Job health**: loss curve progression, gradient norms, learning rate schedule
 - **System health**: node availability, network bandwidth utilization, storage IOPS
+
+---
+
+## 12. Sequence Diagrams
+
+### 12.1 Training Job Submission + Distributed Execution
+
+```mermaid
+sequenceDiagram
+    participant U as Data Scientist
+    participant API as API Gateway
+    participant Sched as Job Scheduler
+    participant Res as Resource Manager
+    participant K8s as Kubernetes (GPU Cluster)
+    participant W1 as Worker 0 (Rank 0, Master)
+    participant W2 as Worker 1 (Rank 1)
+    participant S3 as Object Storage (S3)
+    participant Mon as Monitoring (MLflow)
+
+    U->>API: POST /training-jobs {image, config, num_gpus: 8, framework: "pytorch"}
+    API->>Sched: Enqueue job (priority: normal, estimated: 4h)
+    Sched->>Res: Request 8× A100 GPUs (prefer same node for NVLink)
+    Res->>Res: Bin packing: find 1 node with 8 free GPUs (or 2 nodes × 4)
+    Res-->>Sched: Allocated: node_1 (8× A100, NVLink connected)
+    
+    Sched->>K8s: Create PyTorchJob (workers=2, gpus_per_worker=4)
+    K8s->>W1: Launch worker 0 (RANK=0, WORLD_SIZE=8, MASTER_ADDR=w1)
+    K8s->>W2: Launch worker 1 (RANK=4, WORLD_SIZE=8, MASTER_ADDR=w1)
+    
+    W1->>W2: NCCL init (ring-allreduce topology established)
+    W1->>S3: Download training data (DataLoader → streaming prefetch)
+    W2->>S3: Download training data (sharded: each worker gets 1/2 data)
+    
+    loop Training loop (epochs)
+        W1->>W1: Forward + backward pass (local gradient computation)
+        W2->>W2: Forward + backward pass (local gradient computation)
+        W1->>W2: AllReduce(gradients) — NCCL ring, 200 Gbps NVLink
+        W2->>W1: AllReduce(gradients) — synchronized
+        W1->>W1: Optimizer step (update weights)
+        W2->>W2: Optimizer step (same update, models stay in sync)
+        W1->>Mon: Log metrics {loss: 2.34, lr: 0.001, step: 1000, gpu_util: 94%}
+    end
+    
+    W1->>S3: Save final model checkpoint
+    W1-->>Sched: Job completed (4h 12min, final_loss: 0.45)
+    Sched-->>U: Notification: Training complete, model at s3://bucket/model/
+```
+
+### 12.2 Checkpoint + Fault Recovery
+
+```mermaid
+sequenceDiagram
+    participant W1 as Worker 0 (Master)
+    participant W2 as Worker 1
+    participant Ckpt as Checkpoint Manager
+    participant S3 as S3 (Durable Storage)
+    participant NVMe as Local NVMe (Fast)
+    participant Sched as Scheduler
+    participant K8s as Kubernetes
+    participant W2New as Worker 1 (Replacement)
+
+    Note over W1,W2: Normal training at step 5000...
+    
+    W1->>Ckpt: Checkpoint trigger (every 1000 steps)
+    Ckpt->>W1: Gather model state, optimizer state, scheduler state
+    Ckpt->>W2: Gather shard state (if FSDP/ZeRO sharded)
+    
+    par Async checkpoint (non-blocking)
+        Ckpt->>NVMe: Write checkpoint to local NVMe (fast, <10s for 70B model)
+        Ckpt->>S3: Upload to S3 async (background, takes 2-5 min)
+    end
+    Note over W1,W2: Training continues immediately (no blocking)
+    
+    Note over W2: ⚡ Worker 1 crashes (GPU error / OOM / node failure)
+    W1->>W1: NCCL timeout (30s) → detect peer failure
+    W1->>Sched: Report worker failure
+    Sched->>Sched: Decide: restart from checkpoint (not full restart)
+    
+    Sched->>K8s: Launch replacement worker (same spec)
+    K8s->>W2New: Start new Worker 1
+    W2New->>NVMe: Load checkpoint step 5000 (if same node) or...
+    W2New->>S3: Download checkpoint step 5000 (if different node)
+    W1->>NVMe: Reload checkpoint step 5000
+    
+    W1->>W2New: NCCL re-init (new topology)
+    W1->>W2New: Sync: resume from step 5000 (lost ~200 steps of work)
+    
+    Note over W1,W2New: Training resumes from step 5000
+    Note over Sched: Total downtime: ~2-3 min (vs full restart: hours)
+```
+
+### Caching Strategy
+
+| Layer | Technology | Data Cached | TTL / Policy | Purpose |
+|-------|-----------|-------------|-------------|---------|
+| Data loading | Local NVMe | Training data shards | LRU, capacity-based | Avoid repeated S3 reads across epochs |
+| Model artifacts | Docker layer cache | Base images, framework binaries | Until version change | Fast container startup |
+| Checkpoint | Local NVMe → S3 | Model state, optimizer state | Keep last 3 checkpoints | Fast recovery on same node |
+| Feature store | Redis | Pre-computed embeddings, features | TTL varies | Avoid recomputation in feature pipelines |
+| Pip/Conda packages | Shared NFS | Python packages | Version-pinned | Eliminate download time across jobs |
+| Dataset metadata | PostgreSQL + Redis | Dataset schema, stats, lineage | On dataset update | Fast job validation without scanning data |
+
+**Key Patterns:**
+- **Training data pipeline caching**: Prefetch next batch while GPU computes current batch (hide I/O latency)
+- **Checkpoint caching on NVMe**: Write locally first (10 GB/s) then upload to S3 async (avoids training stalls)
+- **Container image caching**: Pre-pull popular images on GPU nodes (saves 2-5 min cold start)
+
+### Infrastructure Components
+
+```
+┌─────────────────────────────────────────────────────────────────────────────┐
+│                        ML Training Platform                                   │
+├─────────────────────────────────────────────────────────────────────────────┤
+│                                                                               │
+│  ┌─────────────────────────────────────────────────────────────────────┐    │
+│  │  GPU Cluster (Kubernetes + GPU Operator)                             │    │
+│  │  ┌─────────────────┐  ┌─────────────────┐  ┌─────────────────┐    │    │
+│  │  │ Node 1           │  │ Node 2           │  │ Node N           │    │    │
+│  │  │ 8× A100 80GB    │  │ 8× A100 80GB    │  │ 8× H100 80GB    │    │    │
+│  │  │ 2TB NVMe        │  │ 2TB NVMe        │  │ 2TB NVMe        │    │    │
+│  │  │ 200Gbps InfiniBand│ │ 200Gbps IB      │  │ 400Gbps IB      │    │    │
+│  │  └─────────────────┘  └─────────────────┘  └─────────────────┘    │    │
+│  └─────────────────────────────────────────────────────────────────────┘    │
+│                                                                               │
+│  ┌──────────────────┐  ┌──────────────────┐  ┌──────────────────────┐     │
+│  │ Job Scheduler     │  │ Resource Manager  │  │ Experiment Tracker    │     │
+│  │ (Custom/Volcano)  │  │ - Bin packing    │  │ (MLflow / W&B)        │     │
+│  │ - Priority queues │  │ - GPU topology   │  │ - Metrics, params     │     │
+│  │ - Fair-share      │  │ - Spot instances │  │ - Artifacts, models   │     │
+│  │ - Preemption      │  │ - Quota mgmt    │  │ - Comparison          │     │
+│  └──────────────────┘  └──────────────────┘  └──────────────────────┘     │
+│                                                                               │
+│  ┌──────────────────┐  ┌──────────────────┐  ┌──────────────────────┐     │
+│  │ Storage Layer     │  │ Networking        │  │ Monitoring            │     │
+│  │ - S3 (datasets,   │  │ - InfiniBand/RoCE│  │ - GPU metrics (DCGM) │     │
+│  │   checkpoints)    │  │ - NCCL optimized │  │ - Job dashboards      │     │
+│  │ - NFS (shared)    │  │ - GPUDirect RDMA │  │ - Cost attribution    │     │
+│  │ - NVMe (local)    │  │ - ECMP routing   │  │ - Alerting (PagerDuty)│     │
+│  └──────────────────┘  └──────────────────┘  └──────────────────────┘     │
+│                                                                               │
+│  Scaling: 100-1000 GPUs | Multi-tenancy: namespace isolation + quotas        │
+│  Cost: Spot instances for fault-tolerant jobs, on-demand for deadline jobs    │
+└─────────────────────────────────────────────────────────────────────────────┘
+```
+

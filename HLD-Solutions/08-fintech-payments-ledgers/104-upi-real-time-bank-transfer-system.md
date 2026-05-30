@@ -55,6 +55,87 @@
 
 ## 4. Data Modeling
 
+## 4. Data Modeling
+
+### Entity-Relationship Diagram
+
+```mermaid
+erDiagram
+    vpa_registry }o--|| bank_accounts : "linked to"
+    vpa_registry ||--o{ transactions : "payer"
+    vpa_registry ||--o{ transactions : "payee"
+    transactions ||--o{ transaction_states : "state changes"
+    transactions }o--o| settlement_batches : "settled in"
+    transactions ||--o| disputes : "may dispute"
+    mandates ||--o{ transactions : "executes"
+    psp_registry ||--o{ vpa_registry : "manages"
+
+    vpa_registry {
+        UUID vpa_id PK
+        VARCHAR vpa_address
+        UUID customer_id
+        VARCHAR psp_id FK
+        UUID linked_account_id FK
+        VARCHAR status
+    }
+    bank_accounts {
+        UUID account_id PK
+        UUID customer_id
+        VARCHAR bank_code
+        VARCHAR ifsc_code
+        VARCHAR account_type
+    }
+    transactions {
+        UUID txn_id PK
+        VARCHAR rrn
+        VARCHAR txn_type
+        VARCHAR payer_vpa FK
+        VARCHAR payee_vpa FK
+        DECIMAL amount
+        VARCHAR status
+        VARCHAR response_code
+    }
+    transaction_states {
+        UUID state_id PK
+        UUID txn_id FK
+        VARCHAR from_state
+        VARCHAR to_state
+        VARCHAR actor
+        INTEGER latency_ms
+    }
+    mandates {
+        UUID mandate_id PK
+        VARCHAR umn
+        VARCHAR payer_vpa FK
+        VARCHAR payee_vpa FK
+        VARCHAR recurrence_pattern
+        DECIMAL amount
+        VARCHAR status
+    }
+    disputes {
+        UUID dispute_id PK
+        UUID txn_id FK
+        VARCHAR complainant_vpa
+        VARCHAR dispute_type
+        VARCHAR status
+        VARCHAR resolution
+    }
+    settlement_batches {
+        UUID batch_id PK
+        VARCHAR settlement_cycle
+        DATE cycle_date
+        DECIMAL total_amount
+        JSONB net_positions
+        VARCHAR status
+    }
+    psp_registry {
+        VARCHAR psp_id PK
+        VARCHAR psp_name
+        VARCHAR handle
+        VARCHAR status
+    }
+```
+
 ### Full Database Schemas
 
 ```sql
@@ -818,3 +899,173 @@ alerts:
 | VPA directory | Centralized (NPCI) | Distributed (each PSP) | Single source of truth, instant resolution |
 | Timeout strategy | Deemed approval | Immediate reversal | Prevents stuck transactions, payee bank liability |
 | Dispute model | Chargeback-based | Escrow | Similar to card networks, proven model |
+
+---
+
+## 12. Sequence Diagrams
+
+### Diagram 1: Pay Request Flow Through Switch
+
+```mermaid
+sequenceDiagram
+    participant Payer as Payer App (GPay)
+    participant PSP_P as Payer PSP
+    participant Switch as UPI Switch (NPCI)
+    participant PSP_R as Remitter Bank PSP
+    participant Bank_R as Remitter Bank (CBS)
+    participant Bank_B as Beneficiary Bank (CBS)
+    participant PSP_B as Beneficiary PSP
+    participant Payee as Payee
+
+    Payer->>PSP_P: Pay ₹500 to user@okbank (UPI PIN entered)
+    PSP_P->>PSP_P: Encrypt UPI PIN with NPCI public key
+    PSP_P->>Switch: ReqPay (payer_vpa=user@gpay, payee_vpa=user@okbank, amount=500, txn_id=TXN_001)
+    
+    Switch->>Switch: Validate: txn_id unique, amount > 0, VPAs valid
+    Switch->>Switch: Resolve payee VPA → beneficiary bank (PSP_B handle lookup)
+    Switch->>PSP_R: ReqPay → route to remitter bank (payer's bank)
+    PSP_R->>Bank_R: Debit ₹500 from payer account (PIN verified via HSM)
+    
+    alt Debit successful
+        Bank_R-->>PSP_R: Debit OK (balance_after=4500)
+        PSP_R-->>Switch: RespPay (status=SUCCESS, approval_num=APR_001)
+        Switch->>PSP_B: Credit notification to beneficiary bank
+        PSP_B->>Bank_B: Credit ₹500 to payee account
+        Bank_B-->>PSP_B: Credit OK
+        PSP_B-->>Switch: Credit confirmation
+        Switch-->>PSP_P: RespPay (status=SUCCESS, txn_id=TXN_001, rrn=RRN_789)
+        PSP_P-->>Payer: "₹500 sent to user@okbank ✓"
+        PSP_B-->>Payee: "₹500 received from user@gpay"
+    else Debit failed (insufficient funds)
+        Bank_R-->>PSP_R: Debit FAILED (reason=INSUFFICIENT_FUNDS)
+        PSP_R-->>Switch: RespPay (status=FAILURE, error_code=U30)
+        Switch-->>PSP_P: RespPay (FAILURE)
+        PSP_P-->>Payer: "Payment failed: Insufficient funds"
+    end
+
+    Note over Payer,Payee: Entire flow completes in <5 seconds (NPCI SLA).<br/>If response not received in 30s → deemed approved (payee bank liable).<br/>txn_id ensures idempotency across retries.
+```
+
+### Diagram 2: Collect Request + Approval
+
+```mermaid
+sequenceDiagram
+    participant Merchant as Merchant App
+    participant PSP_M as Merchant PSP
+    participant Switch as UPI Switch (NPCI)
+    participant PSP_C as Customer PSP
+    participant Customer as Customer App
+    participant Bank as Customer's Bank
+
+    Merchant->>PSP_M: Create collect request (payee=merchant@axis, payer=cust@gpay, amount=1200)
+    PSP_M->>Switch: ReqCollect (payee_vpa=merchant@axis, payer_vpa=cust@gpay, amount=1200, expiry=5min)
+    Switch->>Switch: Validate, resolve payer VPA → customer's PSP
+    Switch->>PSP_C: Forward collect request
+    PSP_C-->>Customer: Push notification: "merchant@axis requests ₹1,200. Approve?"
+    
+    alt Customer approves (within 5 min expiry)
+        Customer->>PSP_C: Approve collect (enter UPI PIN)
+        PSP_C->>PSP_C: Encrypt PIN
+        PSP_C->>Switch: RespCollect (status=APPROVED, encrypted_pin)
+        Switch->>Bank: Debit customer ₹1,200 (PIN verification)
+        Bank-->>Switch: Debit SUCCESS
+        Switch->>PSP_M: Credit ₹1,200 to merchant bank
+        Switch-->>PSP_C: Transaction SUCCESS
+        Switch-->>PSP_M: Transaction SUCCESS
+        PSP_C-->>Customer: "₹1,200 paid to merchant@axis ✓"
+        PSP_M-->>Merchant: "Payment received from cust@gpay ✓"
+    else Customer declines
+        Customer->>PSP_C: Decline collect request
+        PSP_C->>Switch: RespCollect (status=DECLINED)
+        Switch-->>PSP_M: Collect DECLINED
+        PSP_M-->>Merchant: "Payment request declined by customer"
+    else Timeout (5 minutes)
+        Switch->>Switch: Expiry timer fires
+        Switch-->>PSP_M: Collect EXPIRED
+        PSP_M-->>Merchant: "Payment request expired"
+    end
+
+    Note over Merchant,Bank: Collect requests are PULL-based (merchant initiates, customer approves).<br/>Expiry prevents stale requests cluttering customer's inbox.<br/>PIN is NEVER sent in plaintext — encrypted end-to-end via device binding.
+```
+
+### Caching Strategy
+
+```
+UPI SYSTEM CACHING
+
+1. VPA RESOLUTION CACHE
+   Key: vpa:{vpa_address} → {psp_handle, bank_code, account_ref}
+   TTL: 24 hours (VPA mappings change rarely)
+   Source: NPCI central directory
+   On miss: Query NPCI directory (adds 50-100ms latency)
+   Invalidation: On VPA deregistration event from NPCI
+
+2. BANK ROUTING CACHE
+   Key: bank:{ifsc_prefix} → {endpoint, protocol, timeout}
+   TTL: 1 hour
+   Content: Bank CBS endpoint, supported UPI version, health status
+   Critical: Wrong routing = failed transaction
+
+3. TRANSACTION STATUS CACHE (for duplicate check)
+   Key: txn:{txn_id}:status
+   TTL: 48 hours (NPCI dispute window)
+   Pattern: Write-through (set on every status change)
+   Used for: Idempotency (same txn_id = return cached response)
+
+4. RATE LIMITER CACHE
+   Key: ratelimit:{vpa}:{window}
+   Content: Transaction count per VPA per time window
+   NPCI limits: 20 txns/day per VPA, ₹1L per transaction
+   Implementation: Redis INCR with TTL = window expiry
+
+WHY EVENTUAL CONSISTENCY IS DANGEROUS:
+- Stale VPA resolution → money sent to wrong account (nightmare to reverse)
+- Stale transaction status → duplicate payment (debit twice)
+- Stale rate limit → exceed NPCI limits → PSP gets penalized
+
+WHERE EVENTUAL CONSISTENCY IS ACCEPTABLE:
+- Transaction history display (1-2 second lag is fine)
+- Balance display (can show "pending" state)
+- Analytics/reporting
+```
+
+### Infrastructure Components
+
+```
+┌─────────────────────────────────────────────────────────────┐
+│ UPI PSP INFRASTRUCTURE                                       │
+├─────────────────────────────────────────────────────────────┤
+│                                                              │
+│ CONNECTIVITY TO NPCI:                                        │
+│ ├── Dedicated leased lines (2 links, active-active)          │
+│ ├── NPCI-certified HSM for PIN encryption/decryption         │
+│ ├── XML message format (NPCI Common Library)                 │
+│ ├── mTLS + IP whitelisting                                   │
+│ └── Message signing (digital signature per transaction)      │
+│                                                              │
+│ TRANSACTION PROCESSING:                                      │
+│ ├── API servers: 50 pods (handle 10K TPS peak - Diwali)     │
+│ ├── Transaction DB: PostgreSQL (sharded by txn_id hash)      │
+│ ├── Idempotency: Redis + DB unique constraint on txn_id      │
+│ └── Timeout handler: Auto-reversal if no response in 30s     │
+│                                                              │
+│ SECURITY:                                                    │
+│ ├── Device binding: Device fingerprint + SIM binding          │
+│ ├── PIN block: Encrypted in hardware, never in memory plain  │
+│ ├── Token vault: Card/account tokens (PCI-DSS Level 1)       │
+│ └── Fraud scoring: Real-time before PIN prompt               │
+│                                                              │
+│ DISPUTE & RECONCILIATION:                                    │
+│ ├── T+1 settlement reconciliation with NPCI                  │
+│ ├── Auto-reversal: Credit back if debit succeeded but credit failed │
+│ ├── Dispute API: NPCI adjudication for unresolved cases      │
+│ └── Chargeback window: 30 days (NPCI guidelines)             │
+│                                                              │
+│ SCALE:                                                       │
+│ ├── Peak: 10,000 TPS (UPI processed 12B txns in Dec 2023)   │
+│ ├── Auto-scale: Based on time-of-day patterns                │
+│ ├── Circuit breaker: Per-bank (isolate slow banks)           │
+│ └── Graceful degradation: Queue non-critical if overloaded   │
+│                                                              │
+└─────────────────────────────────────────────────────────────┘
+```

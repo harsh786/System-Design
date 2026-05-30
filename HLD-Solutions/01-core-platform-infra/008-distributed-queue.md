@@ -95,6 +95,39 @@ Monitoring: 10 nodes (metrics, alerting)
 
 ## 4. Data Modeling
 
+### Entity-Relationship Diagram
+
+```mermaid
+erDiagram
+    ACCOUNTS {
+        uuid id PK
+        string name
+    }
+    QUEUES {
+        uuid id PK
+        uuid account_id FK
+        string name
+        string type
+        int visibility_timeout_seconds
+    }
+    MESSAGES {
+        uuid message_id PK
+        uuid queue_id FK
+        bigint sequence_number
+        string state
+        bytes body
+    }
+    DEAD_LETTER_QUEUE {
+        uuid id PK
+        uuid source_queue_id FK
+        int max_receive_count
+    }
+
+    ACCOUNTS ||--o{ QUEUES : owns
+    QUEUES ||--o{ MESSAGES : contains
+    QUEUES |o--o| DEAD_LETTER_QUEUE : "redrives to"
+```
+
 ### Database Choice
 | Data | Store | Why |
 |------|-------|-----|
@@ -1078,3 +1111,120 @@ Dashboard 4: Operations
 | Poison message (always fails) | Consumer keeps retrying | After maxReceiveCount: move to DLQ, stop retrying |
 | Clock skew between nodes | Delay/visibility timing inaccuracy | NTP synchronization; use logical clocks for ordering |
 | Split-brain | Risk of duplicate message delivery | Raft quorum prevents; partitions minority become read-only |
+
+---
+
+## Sequence Diagrams
+
+### 1. Produce/Consume Flow
+
+```mermaid
+sequenceDiagram
+    participant P as Producer
+    participant LB as Queue LB
+    participant Leader as Partition Leader
+    participant F1 as Follower-1
+    participant F2 as Follower-2
+    participant C as Consumer
+
+    P->>LB: PRODUCE {queue: orders, msg: {order_id: 123, ...}}
+    LB->>Leader: Route to partition leader (hash(order_id) % partitions)
+
+    Leader->>Leader: Write to WAL (fsync)
+    par Replicate
+        Leader->>F1: Replicate message
+        Leader->>F2: Replicate message
+    end
+    F1-->>Leader: ACK
+    F2-->>Leader: ACK
+
+    Note over Leader: Quorum achieved (2/3 nodes)<br/>Message is now durable
+
+    Leader-->>P: ACK {offset: 847, partition: 3}
+
+    Note over C: Consumer polls (long-poll, max 500ms)
+    C->>Leader: POLL {queue: orders, partition: 3, offset: 847, max_msgs: 100}
+    Leader-->>C: [{offset:847, msg:{order_id:123,...}}, ...]
+
+    C->>C: Process message (idempotent handler)
+    C->>Leader: ACK {offset: 847}
+    Leader->>Leader: Advance consumer checkpoint
+
+    Note over Leader: Visibility timeout: 30s<br/>If no ACK → message redelivered
+```
+
+### 2. Dead Letter Queue (DLQ) Retry Flow
+
+```mermaid
+sequenceDiagram
+    participant C as Consumer
+    participant Q as Main Queue
+    participant DLQ as Dead Letter Queue
+    participant Alert as Alerting
+    participant Op as Operator
+    participant Retry as Retry Service
+
+    Q->>C: Deliver message (attempt 1)
+    C->>C: Process → ERROR (invalid payload)
+    C->>Q: NACK
+
+    Q->>C: Redeliver (attempt 2, after 5s backoff)
+    C->>C: Process → ERROR
+    C->>Q: NACK
+
+    Q->>C: Redeliver (attempt 3, after 30s backoff)
+    C->>C: Process → ERROR
+    C->>Q: NACK
+
+    Note over Q: maxReceiveCount (3) exceeded
+    Q->>DLQ: Move message to DLQ {original_queue, attempts: 3, last_error}
+    Q->>Alert: Emit metric (dlq.messages.count++)
+
+    Alert->>Op: PagerDuty alert (DLQ depth > threshold)
+    Op->>DLQ: Inspect message (admin console)
+    Op->>Op: Fix consumer bug / data issue
+
+    Op->>Retry: Trigger replay {filter: last_24h, queue: orders}
+    Retry->>DLQ: Read messages
+    Retry->>Q: Re-enqueue (reset attempt counter)
+    Q->>C: Deliver (now succeeds with fix deployed)
+    C->>Q: ACK ✓
+```
+
+### Caching Strategy
+
+#### Multi-Tier Caching for Queue Metadata
+- **L1 (In-Process)**: Queue topology, partition assignments, consumer group state; TTL 10s
+- **L2 (Redis)**: Message deduplication window (message_id → delivered); TTL = visibility_timeout × 2
+- **Index cache**: Hot segment indexes kept in page cache (mmap); cold segments evicted by OS LRU
+
+#### Cache Eviction Policies
+- **Message cache**: Messages evicted after ACK (no TTL caching of consumed messages)
+- **Metadata cache**: LRU with 10s TTL; force-invalidate on rebalance events
+- **Dedup cache**: TTL-based (exactly visibility_timeout + buffer); LRU eviction under memory pressure
+
+#### Cache Invalidation
+- **Event-driven**: Consumer rebalance → invalidate all partition assignment caches
+- **Write-through**: Queue config changes → update cache synchronously before returning to caller
+- **Protocol-level**: Producers receive `NOT_LEADER` error if routing cache is stale → refresh
+
+#### Thundering Herd Prevention
+- **Consumer backoff**: Jittered exponential backoff on empty polls (prevents all consumers polling simultaneously)
+- **Batch polling**: Consumers fetch up to 100 messages per poll (amortizes coordination overhead)
+
+### Infrastructure Components
+
+#### Load Balancer
+- **L4 (TCP)**: NLB for client connections; routes to broker by partition leadership
+- **Protocol-aware**: Custom routing layer that parses queue protocol to route produce/consume to correct partition leader
+- **Health checks**: Broker-level health via Raft heartbeat; client-visible health via metadata API
+
+#### API Gateway
+- **Management API**: RESTful API for queue CRUD, consumer group management; behind API gateway with OAuth2
+- **Data plane**: Direct TCP connections from producers/consumers to brokers (no gateway in hot path)
+- **Rate limiting**: Per-producer rate limits enforced at broker level (bytes/sec and msgs/sec)
+
+#### Monitoring Infrastructure
+- **Metrics**: Per-queue depth, age of oldest message, produce/consume rates, consumer lag
+- **Alerting thresholds**: Queue depth > 10K, message age > 5min, consumer lag > 1000 messages
+- **Dashboard**: Real-time queue topology visualization, consumer group health

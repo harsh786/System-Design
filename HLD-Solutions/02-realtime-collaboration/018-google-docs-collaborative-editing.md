@@ -68,6 +68,53 @@
 
 ## 4. Data Modeling
 
+### Entity-Relationship Diagram
+
+```mermaid
+erDiagram
+    DOCUMENTS {
+        uuid document_id PK
+        uuid owner_id FK
+        varchar title
+        varchar doc_type
+        bigint current_revision
+        varchar status
+    }
+    DOCUMENT_ACCESS {
+        uuid document_id PK
+        uuid user_id PK
+        varchar role
+        uuid granted_by FK
+    }
+    SHARING_LINKS {
+        uuid link_id PK
+        uuid document_id FK
+        varchar role
+        timestamp expires_at
+    }
+    DOCUMENT_COMMENTS {
+        uuid comment_id PK
+        uuid document_id FK
+        uuid parent_comment_id FK
+        uuid author_id FK
+        varchar status
+        int anchor_start
+    }
+    DOCUMENT_OPERATIONS {
+        uuid document_id PK
+        bigint revision PK
+        uuid user_id FK
+        text op_type
+        blob operation
+    }
+
+    DOCUMENTS ||--o{ DOCUMENT_ACCESS : "shared via"
+    DOCUMENTS ||--o{ SHARING_LINKS : "has"
+    DOCUMENTS ||--o{ DOCUMENT_COMMENTS : "has"
+    DOCUMENT_COMMENTS ||--o{ DOCUMENT_COMMENTS : "replies to"
+    DOCUMENTS ||--o{ DOCUMENT_OPERATIONS : "versioned by"
+```
+
 ### 4.1 Database Selection
 
 | Workload | Database | Justification |
@@ -773,3 +820,159 @@ docs_s3_snapshot_upload_duration_ms                        # Histogram
 | Very large documents | Chunk-based loading; only load visible sections |
 | Cross-region collaboration | Regional collaboration servers with async replication |
 | Search indexing at scale | Async indexing via Kafka; eventual consistency for search |
+
+---
+
+## Sequence Diagrams
+
+### 1. OT Transform + Apply
+
+```mermaid
+sequenceDiagram
+    participant A as Client A (Author)
+    participant B as Client B (Collaborator)
+    participant GW as WebSocket Gateway
+    participant OT as OT Engine
+    participant DB as Spanner (Document Store)
+    participant Cache as Redis (Doc Cache)
+
+    Note over A,B: Both clients have document at revision 5
+
+    A->>A: Type "Hello" at position 10
+    A->>GW: Op{insert "Hello", pos:10, baseRev:5}
+    
+    B->>B: Type "World" at position 5 (concurrent)
+    B->>GW: Op{insert "World", pos:5, baseRev:5}
+
+    GW->>OT: Process Op_A (arrives first)
+    OT->>OT: Base revision matches server (rev 5), apply directly
+    OT->>DB: Persist Op_A as revision 6
+    OT->>Cache: Update doc cache
+    OT-->>GW: Broadcast Op_A to all clients (rev 6)
+    GW-->>B: Op{insert "Hello", pos:10, rev:6}
+    B->>B: Apply remote op (no conflict, pos 10 > local pos 5)
+
+    GW->>OT: Process Op_B (base rev 5, but server at rev 6)
+    OT->>OT: Transform Op_B against Op_A<br/>Original: insert "World" at pos 5<br/>After transform: insert "World" at pos 5 (pos < 10, no shift needed)
+    OT->>DB: Persist transformed Op_B as revision 7
+    OT->>Cache: Update doc cache
+    OT-->>GW: Broadcast transformed Op_B (rev 7)
+    GW-->>A: Op{insert "World", pos:5, rev:7}
+    A->>A: Transform against local pending ops<br/>Adjust cursor position (shift +5)
+
+    Note over A,B: Both clients converge to same state<br/>"World" at pos 5, "Hello" at pos 15
+```
+
+### 2. Cursor Sync (Awareness)
+
+```mermaid
+sequenceDiagram
+    participant A as Client A
+    participant B as Client B
+    participant C as Client C
+    participant GW as WebSocket Gateway
+    participant AS as Awareness Service
+    participant Cache as Redis (Presence)
+
+    Note over A,B,C: All editors have document open
+
+    A->>A: Cursor moves to position 42, selects range [42, 58]
+    A->>GW: awareness_update {cursor: {pos:42, sel:[42,58]}, color: "#FF5733"}
+    
+    GW->>AS: Throttle check (max 10 updates/sec per user)
+    AS->>Cache: HSET doc:{id}:cursors user_A {pos:42, sel:[42,58], ts}
+    
+    AS->>GW: Broadcast to other editors (exclude sender)
+    par
+        GW-->>B: cursor_update {user: A, pos:42, sel:[42,58], color: "#FF5733", name: "Alice"}
+        B->>B: Render colored cursor + name label at pos 42
+    and
+        GW-->>C: cursor_update {user: A, pos:42, sel:[42,58], color: "#FF5733", name: "Alice"}
+        C->>C: Render colored cursor at pos 42
+    end
+
+    Note over AS: When document ops arrive,<br/>cursor positions are transformed<br/>to maintain correct visual position
+
+    A->>GW: Op{insert text, pos:30}
+    GW->>AS: Transform all cursors after pos 30
+    AS->>AS: User B cursor at pos 50 → shift to pos 50+len
+    AS->>GW: Updated cursor positions
+    GW-->>B: cursor_transform {shifts}
+```
+
+### 3. Comment + Resolve Flow
+
+```mermaid
+sequenceDiagram
+    participant A as Commenter
+    participant GW as WebSocket Gateway
+    participant CS as Comment Service
+    participant DB as Spanner
+    participant NS as Notification Service
+    participant Q as Kafka
+    participant Cache as Redis
+    participant B as Document Owner
+    participant C as Mentioned User
+
+    A->>GW: create_comment {doc_id, anchor: {start:10, end:25}, text: "Should we rephrase this? @Bob"}
+    GW->>CS: Process comment
+    CS->>CS: Parse mentions, validate anchor range
+    CS->>DB: INSERT comment {id, doc_id, anchor, text, author, thread_id, resolved: false}
+    CS->>Cache: Add to doc:{id}:comments sorted set
+    CS->>Q: Publish comment.created
+
+    par Notify document owner
+        Q->>NS: Notify owner
+        NS->>GW: Push comment_added event
+        GW-->>B: comment_added {comment, anchor_highlight}
+    and Notify mentioned user
+        Q->>NS: Notify @Bob
+        NS->>GW: Push mention_notification
+        GW-->>C: mention_in_comment {doc_id, comment_id}
+    end
+
+    Note over B: Owner reads and resolves comment
+    B->>GW: resolve_comment {comment_id}
+    GW->>CS: Mark resolved
+    CS->>DB: UPDATE comment SET resolved=true, resolved_by=B, resolved_at=now()
+    CS->>Q: Publish comment.resolved
+
+    Q->>GW: Broadcast to all editors
+    GW-->>A: comment_resolved {comment_id, resolved_by: "Owner"}
+    A->>A: Comment thread collapses, anchor highlight removed
+```
+
+### Caching Strategy
+
+| Layer | Store | Content | TTL | Eviction |
+|-------|-------|---------|-----|----------|
+| Document Snapshot | Redis | Full document state at latest revision | Until next edit | Overwrite on each revision |
+| Operation Log | Redis Sorted Set | Last 1000 ops per document | 24h | Trim by score (revision) |
+| Active Cursors | Redis Hash | All editor cursor positions per doc | 60s | Expire on editor disconnect |
+| Comment Threads | Redis | Active (unresolved) comments | 1h | Invalidate on create/resolve |
+| Permission Cache | Redis | User → doc access level | 5min | Invalidate on share change |
+| Document Metadata | Redis | Title, owner, last_modified, sharing settings | 10min | Write-through on update |
+
+**Cache Patterns:**
+- **Write-through for document state**: Every OT operation updates cache synchronously before DB persist
+- **Operation log as cache**: Redis sorted set serves as both cache and conflict resolution buffer
+- **Lease-based locking**: Prevent concurrent snapshot writes during compaction
+
+### Infrastructure Components
+
+| Component | Technology | Configuration | Purpose |
+|-----------|-----------|---------------|---------|
+| WebSocket Gateway | Custom (Go) | 100K connections/node, horizontal scale | Real-time bidirectional ops |
+| Load Balancer | L4 (Envoy) | Sticky sessions by doc_id | Route editors of same doc to same node |
+| API Gateway | REST/gRPC | Rate limiting, auth | Document CRUD, sharing, export |
+| CDN | CloudFront | Cache static assets, images in docs | Image/embed delivery |
+| OT Engine Cluster | Stateful service | Partitioned by document_id | Serialize and transform operations |
+| Spanner | Multi-region | Strong consistency | Document storage, revision history |
+| Pub/Sub | Redis Pub/Sub | Per-document channels | Fan out ops to all editors of a doc |
+
+**WebSocket Gateway Details:**
+- **Connection draining**: On deploy, stop accepting new connections, drain existing over 60s
+- **Document affinity**: All editors of a document route to same gateway node (consistent hashing)
+- **Fallback**: Long-polling for clients behind restrictive firewalls
+- **Compression**: Per-message deflate for operation payloads
+

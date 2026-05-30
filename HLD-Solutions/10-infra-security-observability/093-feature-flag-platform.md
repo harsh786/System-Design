@@ -42,6 +42,63 @@
 
 ## 3. Data Modeling
 
+### Entity-Relationship Diagram
+
+```mermaid
+erDiagram
+    FEATURE_FLAGS {
+        uuid flag_id PK
+        uuid project_id
+        string key
+        string flag_type
+        boolean targeting_enabled
+        bigint version
+    }
+    FLAG_ENVIRONMENTS {
+        uuid flag_id FK
+        uuid environment_id FK
+        boolean targeting_enabled
+        bigint version
+    }
+    SEGMENTS {
+        uuid segment_id PK
+        uuid project_id
+        string key
+        string name
+        jsonb rules
+    }
+    FLAG_AUDIT_LOG {
+        uuid audit_id PK
+        uuid flag_id FK
+        uuid actor_id
+        string action
+    }
+    EXPERIMENTS {
+        uuid experiment_id PK
+        uuid flag_id FK
+        uuid environment_id
+        string name
+        string status
+    }
+    EXPERIMENT_EVENTS {
+        uuid event_id
+        uuid experiment_id FK
+        string user_key
+        int variation_index
+    }
+    SDK_CONNECTIONS {
+        string connection_id PK
+        uuid project_id
+        uuid environment_id
+        string sdk_type
+    }
+
+    FEATURE_FLAGS ||--o{ FLAG_ENVIRONMENTS : "configured per"
+    FEATURE_FLAGS ||--o{ FLAG_AUDIT_LOG : "tracked by"
+    FEATURE_FLAGS ||--o{ EXPERIMENTS : "tested via"
+    EXPERIMENTS ||--o{ EXPERIMENT_EVENTS : "collects"
+```
+
 ### Database Schemas
 
 ```sql
@@ -1032,3 +1089,88 @@ alerts:
 - Client-side SDK keys: only receive pre-evaluated results (no targeting rules exposed)
 - Management API: OAuth2 with scoped permissions per project/environment
 - Audit log: immutable, every change attributed to actor
+
+---
+
+## Sequence Diagrams
+
+### Flag Evaluation at SDK
+
+```mermaid
+sequenceDiagram
+    participant App as Application Code
+    participant SDK as Feature Flag SDK
+    participant LocalCache as In-Memory Cache
+    participant SSE as SSE Connection
+    participant FlagSvc as Flag Service
+    participant Store as Flag Store (DB)
+
+    App->>SDK: evaluate("new-checkout", user_context)
+    SDK->>LocalCache: Lookup flag rules
+    alt Cache populated (hot path ~1μs)
+        LocalCache-->>SDK: Flag rules + targeting
+        SDK->>SDK: Evaluate rules against user_context
+        SDK->>SDK: Apply percentage rollout (hash(user_id + flag_key) % 100)
+        SDK-->>App: {value: true, reason: "rule_match"}
+    else Cache empty (cold start)
+        SDK->>FlagSvc: GET /flags/all (bootstrap)
+        FlagSvc->>Store: Fetch all active flags
+        Store-->>FlagSvc: Flag definitions[]
+        FlagSvc-->>SDK: All flags payload
+        SDK->>LocalCache: Populate cache
+        SDK->>SDK: Evaluate flag
+        SDK-->>App: {value: true, reason: "rule_match"}
+    end
+    Note over SDK,SSE: Background: SSE keeps cache updated
+```
+
+### Flag Update Propagation to All Clients
+
+```mermaid
+sequenceDiagram
+    participant Admin as Admin UI
+    participant API as Flag Management API
+    participant DB as Flag Store
+    participant Pub as Redis Pub/Sub
+    participant StreamSvc as Stream Service
+    participant SDK1 as SDK Instance 1
+    participant SDK2 as SDK Instance 2
+    participant Webhook as Webhook Subscribers
+
+    Admin->>API: PUT /flags/new-checkout {enabled: true, rollout: 50%}
+    API->>API: Validate rules, check conflicts
+    API->>DB: Update flag (version increment, optimistic lock)
+    DB-->>API: Success (version: 42)
+    API->>Pub: Publish flag.updated {flag_key, version: 42}
+    API-->>Admin: 200 OK
+
+    Pub->>StreamSvc: Notify all stream servers
+    par SSE to SDK1
+        StreamSvc->>SDK1: SSE event {flag: "new-checkout", version: 42}
+        SDK1->>SDK1: Update local cache
+    and SSE to SDK2
+        StreamSvc->>SDK2: SSE event {flag: "new-checkout", version: 42}
+        SDK2->>SDK2: Update local cache
+    and Webhook delivery
+        StreamSvc->>Webhook: POST callback URL {flag, changes}
+    end
+    Note over SDK1,SDK2: Propagation latency: < 500ms P99
+```
+
+## Infrastructure Components
+
+| Component | Technology | Sizing | HA Strategy |
+|-----------|-----------|--------|-------------|
+| Flag Service API | Go/Node.js | 4 pods, 1 vCPU/2GB | Multi-AZ, stateless |
+| Stream Service (SSE) | Go with epoll | 6 pods (10K conns/pod) | Sticky sessions, graceful drain |
+| Flag Store | PostgreSQL | db.r6g.xlarge | Multi-AZ RDS, read replicas |
+| Pub/Sub | Redis (Pub/Sub mode) | 3-node cluster | Sentinel failover |
+| CDN (bootstrap payload) | CloudFront | - | Global edge cache |
+| SDK | Client-side library | Embedded | Local cache survives server outage |
+| Admin UI | React SPA | S3 + CloudFront | Static, always available |
+
+### Availability Design
+- SDK operates fully offline using local cache (flag evaluation never blocks on network)
+- SSE reconnection with exponential backoff + jitter
+- Bootstrap payload served from CDN (survives origin failure)
+- Flag store uses optimistic concurrency (version field) to prevent conflicts

@@ -80,6 +80,61 @@ Search scatter-gather: highly variable, up to 50 GB/s burst reads
 
 ## 3. Data Modeling
 
+### Entity-Relationship Diagram
+
+```mermaid
+erDiagram
+    TENANTS {
+        serial tenant_id PK
+        varchar name
+        varchar tier
+        bigint daily_quota_gb
+        int retention_days
+    }
+    INDEXES {
+        serial index_id PK
+        int tenant_id FK
+        varchar index_name
+        int hot_days
+        int warm_days
+    }
+    SEGMENTS {
+        bigint segment_id PK
+        int index_id FK
+        int tenant_id FK
+        timestamptz time_start
+        bigint event_count
+        varchar tier
+        text storage_path
+    }
+    SAVED_SEARCHES {
+        serial search_id PK
+        int tenant_id FK
+        text query
+        varchar schedule_cron
+    }
+    DASHBOARDS {
+        serial dashboard_id PK
+        int tenant_id FK
+        varchar name
+        jsonb panels
+    }
+    EVENTS {
+        bigint event_id PK
+        int tenant_id FK
+        varchar index_name
+        timestamptz timestamp
+        varchar source
+        text raw_event
+    }
+    TENANTS ||--o{ INDEXES : owns
+    TENANTS ||--o{ SAVED_SEARCHES : creates
+    TENANTS ||--o{ DASHBOARDS : creates
+    INDEXES ||--o{ SEGMENTS : "partitioned into"
+    TENANTS ||--o{ EVENTS : ingests
+    INDEXES ||--o{ EVENTS : stores
+```
+
 ### 3.1 Event Schema (Internal Representation)
 ```sql
 -- Logical event structure (stored in columnar segments)
@@ -1227,3 +1282,214 @@ Phase 2: Multi-tenant, hot+warm tiers, alerting (1 PB)
 Phase 3: Cold tier (S3), distributed query, dashboards (10 PB)
 Phase 4: ML-powered anomaly detection, frozen tier, compliance (100 PB+)
 ```
+
+---
+
+## 13. Sequence Diagrams
+
+### 13.1 Log Ingestion Pipeline
+
+```mermaid
+sequenceDiagram
+    participant App as Application Pods
+    participant Agent as Log Agent (Fluentd/Vector)
+    participant Kafka as Kafka (Buffer)
+    participant Ingest as Ingest Pipeline
+    participant Parse as Parser (Grok/JSON)
+    participant Enrich as Enricher
+    participant Index as Index Writer
+    participant Hot as Hot Tier (NVMe SSD)
+    participant ILM as Index Lifecycle Manager
+
+    App->>Agent: stdout/file logs (structured JSON or raw text)
+    Agent->>Agent: Buffer locally (backpressure if Kafka slow)
+    Agent->>Kafka: Batch produce (partitioned by service_name)
+    
+    Kafka->>Ingest: Consume batch (parallel consumers per partition)
+    Ingest->>Parse: Parse log format (JSON, grok pattern, regex)
+    Parse-->>Ingest: Structured fields: {timestamp, level, service, message, trace_id}
+    Ingest->>Enrich: Add metadata (k8s labels, geo-IP, service owner)
+    Enrich-->>Ingest: Enriched document
+    Ingest->>Index: Bulk index (batch 5000 docs or 5s, whichever first)
+    Index->>Hot: Write to hot tier index (today's index)
+    
+    Note over ILM: Background process
+    ILM->>ILM: After 3 days: hot → warm (cheaper SSD, fewer replicas)
+    ILM->>ILM: After 30 days: warm → cold (object storage, read-only)
+    ILM->>ILM: After 90 days: cold → frozen (S3, on-demand retrieval)
+```
+
+### 13.2 Distributed Query Execution
+
+```mermaid
+sequenceDiagram
+    participant User
+    participant UI as Search UI (Kibana/Grafana)
+    participant Coord as Coordinator Node
+    participant Shard1 as Shard 1 (Hot)
+    participant Shard2 as Shard 2 (Hot)
+    participant ShardW as Shard 3 (Warm)
+    participant ShardC as Shard 4 (Cold/S3)
+    participant Cache as Query Cache
+
+    User->>UI: Search: level:ERROR AND service:payment AND @timestamp:[now-1h TO now]
+    UI->>Coord: Execute query
+    Coord->>Cache: Check query cache (query_hash + time_bucket)
+    alt Cache Miss
+        Coord->>Coord: Determine target indices (last 1h = today's hot index only)
+        Coord->>Coord: Identify relevant shards (routing by time range)
+        
+        par Fan-out to shards
+            Coord->>Shard1: Query shard 1 (terms: level=ERROR, service=payment)
+            Shard1-->>Coord: Local top-50 hits + partial aggregations
+        and
+            Coord->>Shard2: Query shard 2
+            Shard2-->>Coord: Local top-50 hits + partial aggregations
+        end
+        
+        Note over ShardW,ShardC: Not queried (outside time range)
+        
+        Coord->>Coord: Merge results: global top-50, combine aggregations
+        Coord->>Coord: Compute: total hits=1,247, histogram by minute
+        Coord->>Cache: Store (TTL=30s for real-time queries)
+    end
+    Coord-->>UI: {hits: [...], total: 1247, histogram: [...], took: "45ms"}
+    UI-->>User: Results with timeline visualization
+```
+
+---
+
+## 14. Deep Dive: Log Search Internals
+
+### 14.1 Inverted Index for Log Data
+
+```
+Log-specific optimizations vs web search index:
+1. Time-partitioned: each day/hour is a separate index
+2. No relevance ranking needed (sort by timestamp)
+3. High cardinality fields: trace_id, request_id → use hash-based lookup
+4. Columnar storage for aggregations (like ClickHouse)
+
+Index structure per time shard:
+┌────────────────────────────────────────────┐
+│ Shard: logs-2024.01.15-000001              │
+├────────────────────────────────────────────┤
+│ Inverted Index:                            │
+│   "ERROR" → [doc1, doc5, doc8, doc12, ...]│
+│   "payment" → [doc2, doc5, doc9, ...]     │
+│   "timeout" → [doc3, doc5, ...]           │
+│                                            │
+│ Columnar Store (doc values):               │
+│   @timestamp: [sorted array, δ-encoded]   │
+│   level: [dictionary-encoded: 0=INFO,1=WARN,2=ERROR] │
+│   service: [dictionary-encoded]           │
+│                                            │
+│ BKD Tree (for numeric/timestamp ranges):   │
+│   Efficient range queries on @timestamp   │
+└────────────────────────────────────────────┘
+```
+
+### 14.2 Bloom Filters for Shard Skipping
+
+```python
+# Problem: querying trace_id across 1000 shards is expensive
+# Solution: each shard maintains a Bloom filter for high-cardinality fields
+
+# At index time:
+bloom_filter[shard_id].add(trace_id)  # 10 bits per element, 1% FPR
+
+# At query time:
+def find_trace(trace_id):
+    candidate_shards = []
+    for shard in all_shards:
+        if shard.bloom_filter.might_contain(trace_id):
+            candidate_shards.append(shard)
+    
+    # Typically reduces 1000 shards to 1-3 candidates
+    return parallel_query(candidate_shards, trace_id)
+```
+
+---
+
+## 15. Caching Strategy
+
+### 15.1 Multi-Level Cache
+
+| Layer | What | TTL | Hit Rate |
+|-------|------|-----|----------|
+| Browser/UI | Recent query results | 30s | 20% |
+| Query result cache | Exact query → results | 30s (real-time), 5min (historical) | 35% |
+| Field data cache | Aggregation column data in memory | Until segment changes | 90% |
+| OS page cache | Hot index segments | LRU eviction | 70% |
+| Request cache | Shard-level query results | Until refresh | 40% |
+
+### 15.2 Caching Strategy by Query Pattern
+
+```python
+# Pattern 1: Dashboard queries (same query, refresh every 30s)
+# → Aggressive caching, short TTL, high hit rate
+cache_key = f"dashboard:{query_hash}:{time_bucket_30s}"
+
+# Pattern 2: Ad-hoc investigation (unique queries)
+# → Don't cache results, but cache field data and segment data
+# → OS page cache handles hot segments
+
+# Pattern 3: Alerting queries (periodic, same query)
+# → Cache with TTL = alert_interval - 5s
+# → Warm cache before alert fires
+
+# Pattern 4: Trace lookup (high cardinality, rarely repeated)
+# → Use Bloom filter to skip shards (not result caching)
+```
+
+---
+
+## 16. Infrastructure Components
+
+### 16.1 Storage Tier Architecture
+
+```
+┌────────────────────────────────────────────────────────────────────┐
+│                    Log Storage Tiers                                 │
+├───────────┬────────────┬──────────────┬────────────┬───────────────┤
+│           │ Hot        │ Warm         │ Cold       │ Frozen        │
+├───────────┼────────────┼──────────────┼────────────┼───────────────┤
+│ Age       │ 0-3 days   │ 3-30 days    │ 30-90 days │ 90+ days      │
+│ Storage   │ NVMe SSD   │ SSD          │ S3 + cache │ S3 Glacier    │
+│ Replicas  │ 2          │ 1            │ 0 (S3 HA)  │ 0             │
+│ Query ms  │ 10-50ms    │ 50-200ms     │ 1-10s      │ Minutes-hours │
+│ Cost/GB   │ $0.25      │ $0.10        │ $0.023     │ $0.004        │
+│ Searchable│ Always     │ Always       │ On-demand  │ Restore first │
+│ Typical   │ Today's    │ Last month   │ Compliance │ Legal hold    │
+│ queries   │ debugging  │ trends       │ audit      │ forensics     │
+└───────────┴────────────┴──────────────┴────────────┴───────────────┘
+```
+
+### 16.2 Cluster Sizing (10 TB/day ingestion)
+
+```
+Ingestion: 10 TB/day = ~115 MB/s sustained
+With replicas + overhead: ~350 MB/s write throughput needed
+
+Hot tier (3 days × 10 TB × 2 replicas = 60 TB):
+  - 20 nodes × 3TB NVMe each
+  - 32 vCPU, 128 GB RAM per node (for JVM heap + OS cache)
+
+Warm tier (27 days × 10 TB × 1 replica = 270 TB):
+  - 30 nodes × 10TB SSD each  
+  - 16 vCPU, 64 GB RAM
+
+Coordinator nodes: 3 (query routing, merge, no data)
+Master nodes: 3 dedicated (cluster state, shard allocation)
+
+Kafka buffer: 6 brokers, 3-day retention, 30 TB
+Total cluster: ~56 data nodes + 9 management nodes
+```
+
+### 16.3 High Availability & Disaster Recovery
+
+- **Cluster health:** 3 master-eligible nodes (quorum), avoid split-brain
+- **Shard allocation:** Rack-aware, ensure primary + replica on different racks
+- **Cross-DC replication:** Active-passive with CCR (Cross-Cluster Replication)
+- **Backup:** Daily snapshots to S3 (warm/cold only; hot is recreatable from Kafka)
+- **Recovery time:** Hot tier: minutes (replay from Kafka); Warm: restore from snapshot (~1 hour/TB)

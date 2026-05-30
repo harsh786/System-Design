@@ -94,6 +94,66 @@
 
 ## 4. Data Modeling
 
+### Entity-Relationship Diagram
+
+```mermaid
+erDiagram
+    WORKSPACES {
+        uuid id PK
+        varchar name
+        varchar slug
+        uuid owner_id FK
+        varchar plan_type
+    }
+    USERS {
+        uuid id PK
+        varchar email
+        varchar display_name
+        timestamptz created_at
+    }
+    WORKSPACE_MEMBERS {
+        uuid workspace_id PK
+        uuid user_id PK
+        varchar role
+        varchar status
+    }
+    CHANNELS {
+        uuid id PK
+        uuid workspace_id FK
+        varchar name
+        varchar type
+        boolean is_archived
+    }
+    CHANNEL_MEMBERS {
+        uuid channel_id PK
+        uuid user_id PK
+        varchar notification_pref
+        timestamptz last_read_ts
+    }
+    MESSAGES {
+        uuid channel_id PK
+        timeuuid message_id PK
+        uuid sender_id FK
+        varchar message_type
+        text content
+    }
+    THREAD_MESSAGES {
+        uuid channel_id PK
+        timeuuid parent_message_id PK
+        timeuuid reply_id PK
+        uuid sender_id FK
+    }
+
+    USERS ||--o{ WORKSPACE_MEMBERS : "belongs to"
+    WORKSPACES ||--o{ WORKSPACE_MEMBERS : "has"
+    WORKSPACES ||--o{ CHANNELS : "contains"
+    USERS ||--o{ CHANNEL_MEMBERS : "joins"
+    CHANNELS ||--o{ CHANNEL_MEMBERS : "has"
+    CHANNELS ||--o{ MESSAGES : "contains"
+    USERS ||--o{ MESSAGES : "sends"
+    MESSAGES ||--o{ THREAD_MESSAGES : "has replies"
+```
+
 ### Database Selection Strategy
 
 | Data Store | Technology | Purpose |
@@ -1297,3 +1357,132 @@ Trace: message.send
 - CDN: Cache-control headers to maximize edge cache hits
 - Elasticsearch: ILM policies (hot→warm→cold→delete)
 - Compute: Auto-scaling based on WebSocket connections and message QPS
+
+---
+
+## Sequence Diagrams
+
+### 1. Channel Message Flow
+
+```mermaid
+sequenceDiagram
+    participant C as Client (Web/Desktop)
+    participant LB as Load Balancer (L4)
+    participant GW as WebSocket Gateway
+    participant MS as Message Service
+    participant SS as Search Service (Elasticsearch)
+    participant Q as Kafka
+    participant DB as MySQL (Messages)
+    participant Cache as Redis
+    participant GW_N as Other Gateway Nodes
+    participant R as Channel Members
+
+    C->>LB: WebSocket frame (channel_message)
+    LB->>GW: Route (sticky session by connection)
+    GW->>GW: Validate token + check channel membership
+    GW->>MS: POST /messages {channel_id, content, thread_ts}
+    MS->>DB: INSERT message (channel_id, ts, user_id, content)
+    MS->>Cache: Update channel:latest_messages (ZADD sorted set)
+    MS->>Q: Publish channel.message.created
+    MS-->>GW: 200 OK {message_id, ts}
+    GW-->>C: message_ack {ts, message_id}
+
+    par Fanout to channel members
+        Q->>GW: Notify local subscribers
+        Q->>GW_N: Notify other gateway nodes
+        GW->>R: Push message event (WebSocket)
+        GW_N->>R: Push message event (WebSocket)
+    and Index for search
+        Q->>SS: Index message in Elasticsearch
+    and Update unread counters
+        Q->>Cache: INCR unread count per user-channel
+    end
+```
+
+### 2. File Upload + Sharing
+
+```mermaid
+sequenceDiagram
+    participant C as Client
+    participant API as API Gateway
+    participant FS as File Service
+    participant S3 as S3 (Object Store)
+    participant VS as Virus Scanner
+    participant TS as Thumbnail Service
+    participant Q as Kafka
+    participant MS as Message Service
+    participant DB as MySQL
+    participant GW as WebSocket Gateway
+    participant R as Channel Members
+
+    C->>API: POST /files.upload {channel_id, file, title}
+    API->>FS: Initiate upload
+    FS->>S3: Generate pre-signed upload URL
+    FS-->>C: {upload_url, file_id}
+    C->>S3: PUT file (multipart, direct upload)
+    S3-->>C: 200 OK
+
+    C->>FS: POST /files.complete {file_id}
+    FS->>Q: Publish file.uploaded event
+
+    par Async processing
+        Q->>VS: Scan for malware
+        VS-->>Q: scan.complete {status: clean}
+    and
+        Q->>TS: Generate thumbnails (multiple sizes)
+        TS->>S3: Store thumbnails
+        TS-->>Q: thumbnails.ready
+    end
+
+    Q->>FS: All processing complete
+    FS->>DB: Update file status = ready
+    FS->>MS: Create file_share message in channel
+    MS->>Q: Publish channel.message.created
+    Q->>GW: Fanout to channel
+    GW-->>R: file_shared event {file_id, thumbnails, url}
+
+    Note over C,R: Files available to all channel members<br/>Respects channel permissions
+```
+
+### 3. Thread Reply Notification
+
+```mermaid
+sequenceDiagram
+    participant C as Replier
+    participant GW as WebSocket Gateway
+    participant MS as Message Service
+    participant NS as Notification Service
+    participant DB as MySQL
+    participant Cache as Redis
+    participant Q as Kafka
+    participant GW_N as Gateway Nodes
+    participant OP as Original Poster
+    participant TF as Thread Followers
+
+    C->>GW: Send thread reply {channel_id, thread_ts, content}
+    GW->>MS: Create threaded message
+    MS->>DB: INSERT message (thread_ts as parent)
+    MS->>DB: UPDATE thread metadata (reply_count++, latest_reply_ts)
+    MS->>Cache: Update thread:replies sorted set
+    MS->>Q: Publish thread.reply.created
+
+    Q->>NS: Process notification rules
+    NS->>DB: Fetch thread subscribers (OP + explicit followers + mentioned users)
+    
+    loop For each subscriber
+        NS->>NS: Check user notification preferences
+        alt User subscribed to thread + online
+            NS->>Cache: Lookup user's gateway
+            NS->>GW_N: Send thread_reply event
+            GW_N-->>TF: Real-time thread update
+        else User has mobile push enabled
+            NS->>Q: Publish push_notification event
+        else User has "muted" thread
+            Note over NS: Skip notification
+        end
+    end
+
+    NS->>Cache: Update thread unread badge for OP
+    GW_N-->>OP: thread_marked_unread event
+```
+

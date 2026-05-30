@@ -58,6 +58,90 @@
 
 ## 4. Data Modeling
 
+### Entity-Relationship Diagram
+
+```mermaid
+erDiagram
+    expenses }o--|| expense_reports : "grouped in"
+    expenses ||--o{ receipts : "has"
+    expenses }o--o| card_transactions : "matched to"
+    expenses }o--|| categories : "categorized as"
+    receipts ||--o| ocr_extractions : "extracted"
+    expense_reports ||--o{ approval_actions : "reviewed by"
+    expense_reports ||--o| reimbursements : "reimbursed via"
+    policy_rules ||--o{ expenses : "evaluates"
+    approval_workflows ||--o{ expense_reports : "routes"
+
+    expenses {
+        UUID expense_id PK
+        UUID tenant_id
+        UUID employee_id
+        UUID report_id FK
+        DECIMAL amount
+        VARCHAR status
+        JSONB policy_result
+    }
+    expense_reports {
+        UUID report_id PK
+        UUID employee_id
+        VARCHAR status
+        DECIMAL total_amount
+        UUID current_approver_id
+    }
+    receipts {
+        UUID receipt_id PK
+        UUID expense_id FK
+        TEXT storage_url
+        VARCHAR ocr_status
+        JSONB ocr_result
+    }
+    ocr_extractions {
+        UUID extraction_id PK
+        UUID receipt_id FK
+        VARCHAR merchant_name
+        DECIMAL total_amount
+        DATE transaction_date
+    }
+    card_transactions {
+        UUID transaction_id PK
+        UUID employee_id
+        DECIMAL amount
+        VARCHAR merchant_category_code
+        VARCHAR status
+    }
+    categories {
+        UUID category_id PK
+        VARCHAR name
+        VARCHAR gl_code
+    }
+    policy_rules {
+        UUID rule_id PK
+        UUID tenant_id
+        VARCHAR rule_type
+        JSONB conditions
+        JSONB actions
+    }
+    approval_actions {
+        UUID action_id PK
+        UUID report_id FK
+        UUID approver_id
+        VARCHAR action
+    }
+    reimbursements {
+        UUID reimbursement_id PK
+        UUID report_id FK
+        DECIMAL amount
+        VARCHAR payment_method
+        VARCHAR status
+    }
+    approval_workflows {
+        UUID workflow_id PK
+        UUID tenant_id
+        JSONB steps
+        BOOLEAN is_active
+    }
+```
+
 ### Full Database Schemas
 
 ```sql
@@ -1025,3 +1109,85 @@ TraceID: expense-submit-flow
 - **Phase 2** (< 1M expenses/mo): Read replicas, dedicated OCR cluster
 - **Phase 3** (< 10M expenses/mo): Sharding by tenant_id, multi-region
 - **Phase 4** (> 10M expenses/mo): Dedicated infrastructure per large tenant
+
+---
+
+## 12. Sequence Diagrams
+
+### Diagram 1: Receipt OCR + Auto-Categorization
+
+```mermaid
+sequenceDiagram
+    participant User as Employee App
+    participant API as Expense API
+    participant S3 as Object Store (S3)
+    participant OCR as OCR Service (Textract)
+    participant ML as Categorization ML
+    participant Policy as Policy Engine
+    participant DB as Expense DB
+    participant Kafka as Event Bus
+
+    User->>API: POST /expenses/upload (image=receipt.jpg)
+    API->>S3: Store original image (key=receipts/{user}/{uuid}.jpg)
+    S3-->>API: stored (url=s3://...)
+    API->>DB: INSERT expense (id=EXP_001, status=PROCESSING, image_url=...)
+    API-->>User: 202 Accepted (expense_id=EXP_001, status=processing)
+    
+    API->>OCR: Extract text from receipt image
+    OCR->>OCR: Detect: merchant, date, amount, line items, tax
+    OCR-->>API: {merchant: "Uber", date: "2024-01-15", amount: 45.50, tax: 3.50}
+    
+    API->>ML: Categorize (merchant="Uber", amount=45.50)
+    ML-->>API: {category: "Transportation", confidence: 0.94, subcategory: "Ride-hailing"}
+    
+    API->>Policy: Check against expense policy
+    Policy->>Policy: Rules: Transport limit=$100/trip, requires receipt>$25 ✓
+    Policy-->>API: {compliant: true, auto_approvable: true (amount < $50)}
+    
+    API->>DB: UPDATE expense SET merchant=Uber, amount=45.50, category=Transport, status=AUTO_APPROVED
+    API->>Kafka: Publish expense.created {EXP_001, auto_approved, category: Transport}
+    API-->>User: Push: "Expense auto-categorized: Uber $45.50 → Transportation ✓"
+
+    Note over User,Kafka: OCR confidence < 80% → flag for manual review.<br/>Category confidence < 85% → suggest top-3, let user pick.
+```
+
+### Diagram 2: Approval Workflow Routing
+
+```mermaid
+sequenceDiagram
+    participant Emp as Employee
+    participant API as Expense API
+    participant Workflow as Workflow Engine
+    participant Policy as Policy Engine
+    participant DB as Expense DB
+    participant Mgr as Manager
+    participant Finance as Finance Team
+    participant ERP as ERP/Accounting System
+
+    Emp->>API: POST /expenses/submit (report_id=RPT_001, expenses=[EXP_001..EXP_005], total=$2,340)
+    API->>Policy: Evaluate approval routing (amount=$2340, category=mixed, submitter=L5_eng)
+    Policy-->>API: Route: L1=direct_manager (< $5000), L2=not_needed
+    
+    API->>Workflow: Create approval chain (RPT_001 → [manager_alice])
+    API->>DB: UPDATE report SET status=PENDING_APPROVAL
+    Workflow->>Mgr: Notification: "Expense report $2,340 from Bob needs approval"
+    
+    alt Manager approves
+        Mgr->>API: POST /approvals (report=RPT_001, action=APPROVE)
+        API->>Workflow: L1 approved. Check: need L2?
+        Workflow->>Policy: Amount $2340 < $5000 threshold → No L2 needed
+        API->>DB: UPDATE report SET status=APPROVED, approved_by=alice
+        API->>Kafka: Publish report.approved
+        Kafka-->>ERP: Sync to accounting (GL posting: DR: T&E expense, CR: employee_payable)
+        Kafka-->>Emp: Push: "Report approved! Reimbursement in 3-5 days"
+    else Manager requests changes
+        Mgr->>API: POST /approvals (action=REQUEST_CHANGES, comment="Missing client name on dinner receipt")
+        API->>DB: UPDATE report SET status=RETURNED
+        API-->>Emp: Push: "Report returned: Missing client name on EXP_003"
+        Emp->>API: POST /expenses/EXP_003 (update: client="Acme Corp")
+        Emp->>API: POST /expenses/resubmit (report=RPT_001)
+        API->>Workflow: Re-enter approval chain
+    end
+
+    Note over Emp,ERP: Approval routing is dynamic: amount thresholds, category,<br/>department budget remaining, and policy exceptions all factor in.
+```

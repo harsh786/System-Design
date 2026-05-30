@@ -66,6 +66,69 @@ CDN: Global (static assets, movie posters)
 
 ## 4. Data Modeling
 
+### Entity-Relationship Diagram
+
+```mermaid
+erDiagram
+    movies {
+        UUID movie_id PK
+        VARCHAR title
+        INTEGER duration_minutes
+        VARCHAR status
+        DECIMAL user_rating
+    }
+    theatres {
+        UUID theatre_id PK
+        UUID city_id FK
+        VARCHAR name
+        INTEGER total_screens
+    }
+    screens {
+        UUID screen_id PK
+        UUID theatre_id FK
+        INTEGER screen_number
+        VARCHAR screen_type
+        INTEGER total_seats
+    }
+    seat_layout {
+        UUID seat_id PK
+        UUID screen_id FK
+        VARCHAR row_label
+        INTEGER seat_number
+        VARCHAR seat_type
+    }
+    shows {
+        UUID show_id PK
+        UUID movie_id FK
+        UUID screen_id FK
+        UUID theatre_id FK
+        DATE show_date
+        TIME start_time
+        VARCHAR status
+        INTEGER available_seats
+    }
+    show_pricing {
+        UUID show_id FK
+        VARCHAR seat_type
+        INTEGER price_cents
+    }
+    bookings {
+        UUID booking_id PK
+        UUID user_id FK
+        UUID show_id FK
+        INTEGER num_seats
+        INTEGER total_cents
+        VARCHAR status
+    }
+
+    theatres ||--o{ screens : "has"
+    screens ||--o{ seat_layout : "layout"
+    movies ||--o{ shows : "screened in"
+    screens ||--o{ shows : "hosts"
+    shows ||--o{ show_pricing : "priced"
+    shows ||--o{ bookings : "booked for"
+```
+
 ### Full Database Schemas
 
 ```sql
@@ -1040,3 +1103,307 @@ Sold out time: 8 minutes 23 seconds
 Zero double-allocations confirmed
 WebSocket message fan-out P95: 12ms
 ```
+
+---
+
+## 12. Sequence Diagrams
+
+### 12.1 Seat Selection + Temporary Lock
+
+```mermaid
+sequenceDiagram
+    participant User
+    participant API Gateway
+    participant SeatService
+    participant Redis
+    participant PostgreSQL
+    participant WebSocket
+
+    User->>API Gateway: GET /shows/S-100/seats
+    API Gateway->>SeatService: getSeatMap(show_id=S-100)
+    SeatService->>Redis: HGETALL seats:S-100
+    Redis-->>SeatService: {A1:available, A2:locked, A3:booked, ...}
+    SeatService-->>User: Seat map (color-coded: green/yellow/red)
+
+    User->>API Gateway: POST /shows/S-100/lock {seats: [A5, A6]}
+    API Gateway->>SeatService: lockSeats(show_id, user_id, [A5, A6])
+
+    SeatService->>Redis: SET seat:S-100:A5 LOCKED:{user_id} NX EX 480
+    Redis-->>SeatService: OK (acquired)
+    SeatService->>Redis: SET seat:S-100:A6 LOCKED:{user_id} NX EX 480
+    Redis-->>SeatService: OK (acquired)
+
+    SeatService->>Redis: HSET seats:S-100 A5 locked A6 locked
+    SeatService->>PostgreSQL: INSERT seat_lock(S-100, [A5,A6], user_id, expires_at)
+
+    SeatService->>WebSocket: broadcast(show=S-100, {A5: locked, A6: locked})
+    WebSocket-->>User: "Seats locked for 8 minutes"
+    Note over WebSocket: All other users see A5, A6 turn yellow in real-time
+```
+
+### 12.2 Payment + Seat Confirmation
+
+```mermaid
+sequenceDiagram
+    participant User
+    participant BookingService
+    participant SeatService
+    participant Redis
+    participant PaymentService
+    participant PaymentGateway
+    participant PostgreSQL
+    participant TicketService
+    participant NotificationService
+
+    User->>BookingService: POST /bookings {show: S-100, seats: [A5,A6], payment_method}
+    BookingService->>SeatService: validateLock(S-100, [A5,A6], user_id)
+    SeatService->>Redis: GET seat:S-100:A5, GET seat:S-100:A6
+    Redis-->>SeatService: both LOCKED:{user_id} ✓
+    SeatService-->>BookingService: locks valid, 4min remaining
+
+    BookingService->>PaymentService: charge(user_id, amount=$25.00)
+    PaymentService->>PaymentGateway: POST /payments
+    PaymentGateway-->>PaymentService: {status: SUCCESS, txn_id}
+    PaymentService-->>BookingService: payment_confirmed
+
+    BookingService->>SeatService: confirmSeats(S-100, [A5,A6])
+    SeatService->>Redis: SET seat:S-100:A5 BOOKED (no expiry)
+    SeatService->>Redis: SET seat:S-100:A6 BOOKED (no expiry)
+    SeatService->>PostgreSQL: UPDATE seats SET status=BOOKED, booking_id=B-200
+
+    BookingService->>TicketService: generateTickets(booking_id, show, seats)
+    TicketService-->>BookingService: {ticket_urls, qr_codes}
+
+    BookingService->>NotificationService: sendConfirmation(user, tickets)
+    NotificationService-->>User: Email + SMS with QR codes
+    BookingService-->>User: "Booking confirmed! Tickets for A5, A6"
+```
+
+### 12.3 Flash Sale Queue Management
+
+```mermaid
+sequenceDiagram
+    participant Thousands of Users
+    participant CDN/WAF
+    participant QueueService
+    participant Redis(Queue)
+    participant BookingWorker
+    participant SeatService
+    participant WebSocket
+
+    Note over Thousands of Users: Popular show goes live at 10:00 AM<br/>50,000 users hit simultaneously
+
+    Thousands of Users->>CDN/WAF: GET /shows/AVENGERS/seats (rate limited)
+    CDN/WAF->>QueueService: Admitted users (token bucket: 5000/sec)
+
+    QueueService->>Redis(Queue): RPUSH queue:AVENGERS {user_id, timestamp, priority}
+    QueueService-->>Thousands of Users: "You're in queue. Position: 3,421. ETA: ~4 min"
+
+    loop Process queue FIFO (500 users/batch)
+        Redis(Queue)->>BookingWorker: LPOP queue:AVENGERS (batch of 500)
+        BookingWorker->>SeatService: getAvailableCount(AVENGERS)
+        SeatService-->>BookingWorker: 200 seats remaining
+
+        BookingWorker->>WebSocket: notify batch users: "Your turn! Select seats now"
+        WebSocket->>Thousands of Users: Redirect to seat selection (8min timer)
+
+        Note over BookingWorker: Users who don't complete in 8min<br/>→ seats released, next batch admitted
+    end
+
+    Note over QueueService: When seats exhausted:<br/>Notify remaining queue: "SOLD OUT"
+```
+
+## 13. Algorithm Deep Dives
+
+### 13.1 Distributed Seat Locking
+
+#### The Core Problem
+When 10,000 users view the same show simultaneously, multiple users may try to select the same seat at the exact same millisecond. We need **mutual exclusion** without blocking the entire system.
+
+#### Approach Comparison
+
+| Approach | Mechanism | Pros | Cons | When to Use |
+|----------|-----------|------|------|-------------|
+| **Optimistic Locking** | Version check at write time | No lock overhead, high throughput | Retries on conflict, wasted work | Low contention (< 5% conflict rate) |
+| **Pessimistic Locking** | Acquire lock before read | No conflicts, predictable | Lock contention, deadlock risk | High contention, short critical sections |
+| **Redis SETNX** | Atomic set-if-not-exists | Distributed, fast, auto-expire | Redis failure = lock loss | Distributed systems, seat locking ✓ |
+
+#### BookMyShow's Approach: Redis SETNX with Lua Atomicity
+
+**Why Redis SETNX?**
+- **Atomic**: SETNX is a single atomic operation — no race condition possible
+- **Distributed**: Works across multiple application servers
+- **Auto-expiry**: TTL ensures abandoned locks don't persist forever
+- **Fast**: Sub-millisecond lock acquisition
+
+#### Step-by-Step Implementation
+
+**Step 1: Atomic multi-seat locking with Lua script**
+```lua
+-- lock_seats.lua (executed atomically on Redis)
+-- KEYS = seat keys, ARGV[1] = user_id, ARGV[2] = ttl_seconds
+
+local locked = {}
+local failed = nil
+
+-- Try to lock all seats atomically
+for i, key in ipairs(KEYS) do
+    local result = redis.call('SET', key, ARGV[1], 'NX', 'EX', ARGV[2])
+    if result == false then
+        failed = key
+        break
+    end
+    table.insert(locked, key)
+end
+
+-- If any seat failed, rollback all previously locked seats
+if failed then
+    for _, key in ipairs(locked) do
+        redis.call('DEL', key)
+    end
+    return {0, failed}  -- Failure: return which seat was taken
+end
+
+return {1, #locked}  -- Success: return count locked
+```
+
+**Step 2: Application-level locking flow**
+```python
+class SeatLockService:
+    LOCK_TTL = 480  # 8 minutes
+    MAX_SEATS_PER_USER = 10
+    
+    def lock_seats(self, show_id: str, user_id: str, seat_ids: list[str]) -> LockResult:
+        # Validation
+        if len(seat_ids) > self.MAX_SEATS_PER_USER:
+            raise ValidationError("Max 10 seats per booking")
+        
+        # Check if user already has locks for this show
+        existing_locks = self.redis.smembers(f"user_locks:{user_id}:{show_id}")
+        if existing_locks:
+            raise ConflictError("Release existing locks first")
+        
+        # Build Redis keys
+        keys = [f"seat:{show_id}:{seat_id}" for seat_id in seat_ids]
+        
+        # Execute Lua script atomically
+        result = self.redis.eval(
+            LOCK_SEATS_LUA,
+            keys=keys,
+            args=[user_id, self.LOCK_TTL]
+        )
+        
+        if result[0] == 0:
+            failed_seat = result[1].decode()
+            return LockResult(success=False, failed_seat=failed_seat)
+        
+        # Track user's locks (for cleanup and validation)
+        pipe = self.redis.pipeline()
+        pipe.sadd(f"user_locks:{user_id}:{show_id}", *seat_ids)
+        pipe.expire(f"user_locks:{user_id}:{show_id}", self.LOCK_TTL)
+        pipe.execute()
+        
+        # Broadcast to other users via WebSocket
+        self.broadcast_seat_status(show_id, seat_ids, status="locked")
+        
+        return LockResult(success=True, expires_in=self.LOCK_TTL)
+```
+
+**Step 3: Lock timeout and release**
+```python
+    def on_lock_expired(self, show_id: str, seat_id: str):
+        """Called by Redis keyspace notification when TTL expires"""
+        # Update seat map
+        self.redis.hset(f"seats:{show_id}", seat_id, "available")
+        
+        # Broadcast availability to all connected users
+        self.broadcast_seat_status(show_id, [seat_id], status="available")
+        
+        # Log for analytics (how many locks expire without booking?)
+        self.metrics.increment("seat_lock_expired", tags={"show": show_id})
+    
+    def release_seats(self, show_id: str, user_id: str, seat_ids: list[str]):
+        """Explicit release (user deselects or navigates away)"""
+        for seat_id in seat_ids:
+            key = f"seat:{show_id}:{seat_id}"
+            # Only delete if this user owns the lock
+            current_owner = self.redis.get(key)
+            if current_owner and current_owner.decode() == user_id:
+                self.redis.delete(key)
+        
+        self.redis.srem(f"user_locks:{user_id}:{show_id}", *seat_ids)
+        self.broadcast_seat_status(show_id, seat_ids, status="available")
+```
+
+**Step 4: Confirm seats after payment (promote lock to permanent booking)**
+```python
+    def confirm_seats(self, show_id: str, user_id: str, seat_ids: list[str], booking_id: str):
+        """Called after successful payment"""
+        pipe = self.redis.pipeline()
+        
+        for seat_id in seat_ids:
+            key = f"seat:{show_id}:{seat_id}"
+            # Verify lock still held by this user
+            owner = self.redis.get(key)
+            if not owner or owner.decode() != user_id:
+                raise LockExpiredError(f"Lock expired for {seat_id}")
+            
+            # Remove TTL (permanent) and mark as booked
+            pipe.persist(key)  # Remove expiry
+            pipe.set(key, f"BOOKED:{booking_id}")  # Change value
+            pipe.hset(f"seats:{show_id}", seat_id, "booked")
+        
+        pipe.delete(f"user_locks:{user_id}:{show_id}")
+        pipe.execute()
+        
+        # Write to durable storage
+        self.db.execute("""
+            UPDATE show_seats 
+            SET status = 'BOOKED', booking_id = %s 
+            WHERE show_id = %s AND seat_id = ANY(%s)
+        """, (booking_id, show_id, seat_ids))
+        
+        self.broadcast_seat_status(show_id, seat_ids, status="booked")
+```
+
+#### Handling Edge Cases
+
+**Race condition: Two users click same seat simultaneously**
+```
+User A: SET seat:S100:A5 "user_A" NX EX 480 → OK (wins)
+User B: SET seat:S100:A5 "user_B" NX EX 480 → nil (loses, NX prevents overwrite)
+User B sees: "Seat A5 is no longer available"
+```
+
+**Redis node failure during lock**
+```python
+# Use Redis Cluster with replicas; on failover:
+# 1. Locks may be lost (replica hadn't replicated yet)
+# 2. Mitigation: Fencing token (monotonic lock version)
+# 3. At payment time, re-validate lock exists; if lost, fail gracefully
+
+def safe_payment(show_id, user_id, seats):
+    # Re-check all locks still valid before charging
+    for seat in seats:
+        owner = redis.get(f"seat:{show_id}:{seat}")
+        if owner != user_id:
+            return PaymentResult(success=False, reason="lock_lost")
+    
+    # Proceed with payment...
+```
+
+**User opens multiple tabs**
+```python
+# Track locks per user per show
+# If user tries to lock from different session:
+# - Option 1: Reject ("You already have seats locked")
+# - Option 2: Release old locks, create new ones
+# BookMyShow uses Option 1
+```
+
+#### Performance Under Load
+- **Lock acquisition**: < 1ms (Redis SETNX)
+- **Lua script for multi-seat**: < 2ms for 10 seats
+- **Throughput**: 100,000 lock operations/second per Redis shard
+- **Concurrent viewers per show**: 50,000+ with WebSocket broadcasting
+- **Lock expiry precision**: ±1 second (Redis lazy + active expiry)

@@ -64,6 +64,59 @@ ML inference: 50 GPU instances for pricing/ranking
 
 ## 4. Data Modeling
 
+### Entity-Relationship Diagram
+
+```mermaid
+erDiagram
+    users {
+        UUID user_id PK
+        VARCHAR email UK
+        BOOLEAN superhost
+        VARCHAR verification_level
+        VARCHAR account_status
+    }
+    listings {
+        UUID listing_id PK
+        UUID host_id FK
+        VARCHAR property_type
+        VARCHAR room_type
+        INTEGER base_price_cents
+        VARCHAR status
+        DECIMAL avg_rating
+    }
+    listing_calendar {
+        UUID listing_id FK
+        DATE date
+        BOOLEAN available
+        INTEGER price_cents
+    }
+    bookings {
+        UUID booking_id PK
+        UUID listing_id FK
+        UUID guest_id FK
+        UUID host_id FK
+        DATE check_in
+        DATE check_out
+        INTEGER total_cents
+        VARCHAR status
+    }
+    reviews {
+        UUID review_id PK
+        UUID booking_id FK
+        UUID listing_id FK
+        UUID reviewer_id FK
+        INTEGER overall_rating
+        VARCHAR review_type
+    }
+
+    users ||--o{ listings : "hosts"
+    users ||--o{ bookings : "books as guest"
+    listings ||--o{ listing_calendar : "availability"
+    listings ||--o{ bookings : "booked"
+    bookings ||--o{ reviews : "reviewed"
+    users ||--o{ reviews : "writes"
+```
+
 ### Full Database Schemas
 
 ```sql
@@ -1148,4 +1201,116 @@ def compute_listing_score(listing, query, user):
     score += 0.05 * collaborative_filtering_score(listing, user)
     
     return score
+```
+
+---
+
+## 12. Sequence Diagrams
+
+### 12.1 Search + Availability Check
+
+```mermaid
+sequenceDiagram
+    participant Guest
+    participant API Gateway
+    participant SearchService
+    participant Elasticsearch
+    participant AvailabilityService
+    participant Redis
+    participant PricingService
+
+    Guest->>API Gateway: GET /search?city=SF&checkin=Dec1&checkout=Dec5&guests=2
+    API Gateway->>SearchService: search(filters)
+    SearchService->>Elasticsearch: query(city=SF, guests≥2, amenities, price_range)
+    Elasticsearch-->>SearchService: 120 matching listings
+
+    SearchService->>AvailabilityService: checkBulkAvailability(listing_ids[], Dec1-Dec5)
+    AvailabilityService->>Redis: MGET availability:{listing_id}:2024-12-{01..04}
+    Redis-->>AvailabilityService: 85 listings available for all 4 nights
+
+    SearchService->>PricingService: getBulkPricing(85 listings, 4 nights)
+    PricingService-->>SearchService: prices with dynamic/seasonal adjustments
+
+    Note over SearchService: Rank by: relevance(0.3) + price(0.2) +<br/>rating(0.25) + response_rate(0.15) + recency(0.1)
+
+    SearchService-->>API Gateway: top 20 results (paginated)
+    API Gateway-->>Guest: Search results with maps + pricing
+```
+
+### 12.2 Booking: Instant Book vs Request to Book
+
+```mermaid
+sequenceDiagram
+    participant Guest
+    participant BookingService
+    participant AvailabilityService
+    participant PaymentService
+    participant Kafka
+    participant Host
+    participant NotificationService
+
+    Guest->>BookingService: POST /bookings {listing_id, dates, guests}
+    BookingService->>AvailabilityService: lockDates(listing_id, Dec1-Dec5, ttl=10min)
+    AvailabilityService-->>BookingService: lock_acquired
+
+    alt Instant Book enabled
+        BookingService->>PaymentService: chargeGuest(amount=$580, guest_payment_method)
+        PaymentService-->>BookingService: charge_id (funds held)
+        BookingService->>BookingService: status = CONFIRMED
+        BookingService->>Kafka: publish("booking.confirmed")
+        Kafka->>NotificationService: notify host + guest
+        BookingService-->>Guest: "Booking confirmed! Check-in Dec 1"
+    else Request to Book
+        BookingService->>BookingService: status = PENDING_HOST
+        BookingService->>Kafka: publish("booking.requested")
+        Kafka->>Host: "New booking request from Guest for Dec 1-5"
+
+        alt Host accepts (within 24h)
+            Host->>BookingService: ACCEPT
+            BookingService->>PaymentService: chargeGuest($580)
+            BookingService->>AvailabilityService: confirmLock → permanent block
+            BookingService-->>Guest: "Host accepted! Booking confirmed"
+        else Host declines / 24h timeout
+            Host->>BookingService: DECLINE
+            BookingService->>AvailabilityService: releaseLock
+            BookingService-->>Guest: "Host declined. Here are similar listings..."
+        end
+    end
+```
+
+### 12.3 Host Payout Calculation
+
+```mermaid
+sequenceDiagram
+    participant Guest
+    participant BookingService
+    participant PayoutService
+    participant LedgerDB
+    participant PaymentProvider
+    participant Host
+    participant TaxService
+
+    Note over Guest: Check-in confirmed (Day 1)
+    Guest->>BookingService: check-in confirmed (smart lock / host confirms)
+
+    Note over PayoutService: Payout scheduled 24h after check-in
+    BookingService->>PayoutService: triggerPayout(booking_id, check_in_confirmed)
+
+    PayoutService->>LedgerDB: calculatePayout(booking_id)
+    Note over LedgerDB: Total: $580<br/>Airbnb service fee (14%): -$81.20<br/>Cleaning fee (to host): +$75<br/>Host service fee (3%): -$17.40<br/>Net to host: $556.40
+
+    PayoutService->>TaxService: calculateWithholding(host_country, amount)
+    TaxService-->>PayoutService: withholding = $0 (W-9 on file)
+
+    PayoutService->>LedgerDB: INSERT payout_record(host, $556.40, PENDING)
+    PayoutService->>PaymentProvider: initTransfer(host_bank_account, $556.40)
+    PaymentProvider-->>PayoutService: transfer_id, eta=2-3 business days
+
+    PayoutService->>LedgerDB: UPDATE payout status=PROCESSING
+    PayoutService-->>Host: Email: "Payout of $556.40 initiated"
+
+    Note over PaymentProvider: 2-3 days later
+    PaymentProvider->>PayoutService: webhook(transfer_complete)
+    PayoutService->>LedgerDB: UPDATE payout status=COMPLETED
+    PayoutService-->>Host: "Payout of $556.40 deposited"
 ```

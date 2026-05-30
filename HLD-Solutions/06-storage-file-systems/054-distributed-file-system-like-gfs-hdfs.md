@@ -55,6 +55,41 @@ Heartbeats: 10,000 nodes × 1/3sec = ~3,333/sec
 
 ## 3. Data Modeling
 
+### Entity-Relationship Diagram
+
+```mermaid
+erDiagram
+    INODE_DIRECTORY {
+        long id PK
+        bytes name
+        long permission
+        long modification_time
+    }
+    INODE_FILE {
+        long id PK
+        bytes name
+        long header
+        long modification_time
+    }
+    BLOCK_INFO {
+        long block_id PK
+        long generation_stamp
+        long num_bytes
+        string block_state
+    }
+    DATANODE_DESCRIPTOR {
+        string datanode_id PK
+        string ip_address
+        string rack_location
+        long capacity
+        long remaining
+    }
+    INODE_DIRECTORY ||--o{ INODE_DIRECTORY : "contains dirs"
+    INODE_DIRECTORY ||--o{ INODE_FILE : "contains files"
+    INODE_FILE ||--|{ BLOCK_INFO : "composed of"
+    BLOCK_INFO }|--|{ DATANODE_DESCRIPTOR : "replicated on"
+```
+
 ### NameNode In-Memory Data Structures
 
 ```java
@@ -1064,3 +1099,257 @@ Cluster Health:
 - **Cross-rack bandwidth**: Pipeline replication uses cross-rack bandwidth; EC can reduce this for cold data
 - **Recovery time**: NameNode restart requires loading FsImage + replaying edits (can take minutes for large clusters)
 - **Hot spots**: Popular files create DataNode hot spots; use caching tier or increase replication
+
+---
+
+## Sequence Diagrams
+
+### Write Pipeline - Chunk Replication
+
+```mermaid
+sequenceDiagram
+    participant C as Client
+    participant NN as NameNode
+    participant DN1 as DataNode-1 (Primary)
+    participant DN2 as DataNode-2 (Same Rack)
+    participant DN3 as DataNode-3 (Remote Rack)
+
+    C->>NN: Create file /data/log.txt (replication=3)
+    NN->>NN: Check namespace, allocate block_id=B001
+    NN->>NN: Rack-aware placement: [DN1(R1), DN2(R1), DN3(R2)]
+    NN-->>C: Block B001 → pipeline [DN1, DN2, DN3]
+
+    C->>DN1: Write packet (64KB) + pipeline setup
+    DN1->>DN2: Forward packet (intra-rack: 1Gbps)
+    DN2->>DN3: Forward packet (cross-rack: 200Mbps)
+    DN3-->>DN2: ACK
+    DN2-->>DN1: ACK
+    DN1-->>C: ACK (all 3 replicas written)
+
+    Note over C,DN3: Repeat for all packets in block (128MB / 64KB = 2048 packets)
+
+    C->>NN: BlockComplete(B001, [DN1, DN2, DN3])
+    NN->>NN: Update block map, mark block COMPLETE
+    NN-->>C: OK
+
+    Note over C: Continue with next block B002...
+    C->>NN: AddBlock(/data/log.txt)
+    NN-->>C: Block B002 → pipeline [DN3, DN4, DN1]
+```
+
+### Read with Data Locality
+
+```mermaid
+sequenceDiagram
+    participant C as Client (Rack 1)
+    participant NN as NameNode
+    participant DN1 as DataNode-1 (Rack 1, local)
+    participant DN2 as DataNode-2 (Rack 2, remote)
+    participant Cache as Block Cache (SSD)
+
+    C->>NN: GetBlockLocations(/data/log.txt, offset=0, len=256MB)
+    NN-->>C: Block B001: [DN1(R1,local), DN2(R2), DN3(R2)]<br/>Block B002: [DN2(R2), DN3(R2), DN4(R1,local)]
+
+    Note over C: Sort replicas by network distance (local rack first)
+    
+    C->>DN1: Read B001 (offset=0, len=128MB) [LOCAL - same rack]
+    DN1->>Cache: Check block cache
+    
+    alt Cache hit
+        Cache-->>DN1: Cached block data
+    else Cache miss
+        DN1->>DN1: Read from disk
+        DN1->>Cache: Populate cache (if hot block)
+    end
+    
+    DN1-->>C: Stream B001 data (intra-rack speed)
+
+    C->>DN1: Read B002 - but DN1 doesn't have it
+    Note over C: Fallback to DN4 (also Rack 1)
+    C->>DN2: Read B002 (cross-rack, DN4 not available)
+    DN2-->>C: Stream B002 data (cross-rack, slower)
+```
+
+### NameNode Failover (HA with Journal Nodes)
+
+```mermaid
+sequenceDiagram
+    participant ANN as Active NameNode
+    participant SNN as Standby NameNode
+    participant JN1 as JournalNode-1
+    participant JN2 as JournalNode-2
+    participant JN3 as JournalNode-3
+    participant ZK as ZooKeeper
+    participant ZKFC as ZK Failover Controller
+    participant DN as DataNodes
+
+    Note over ANN,SNN: Normal operation - Active writes edits to Journal
+    ANN->>JN1: Write edit log entry #1001
+    ANN->>JN2: Write edit log entry #1001
+    ANN->>JN3: Write edit log entry #1001
+    JN1-->>ANN: ACK (majority = 2 of 3 needed)
+    JN2-->>ANN: ACK
+    
+    SNN->>JN1: Tail edit log (streaming)
+    SNN->>SNN: Apply edits to in-memory namespace (stay current)
+
+    Note over ANN: Active NameNode CRASHES
+    ANN--xZK: Heartbeat timeout
+    ZK->>ZKFC: Session expired for Active NN
+    ZKFC->>ZKFC: Verify ANN is truly dead (SSH fence)
+    ZKFC->>ANN: STONITH fence (kill process / power off)
+    
+    ZKFC->>SNN: Promote to Active
+    SNN->>JN1: Read remaining edits (catch up)
+    SNN->>JN2: Read remaining edits
+    SNN->>SNN: Apply final edits → fully consistent namespace
+    SNN->>ZK: Register as new Active NameNode
+    
+    DN->>SNN: Block reports (re-register)
+    SNN->>SNN: Rebuild block→DN mapping from reports
+    Note over SNN: Failover complete (~30 seconds)
+```
+
+## Caching Strategy
+
+| Layer | Technology | What's Cached | TTL | Eviction |
+|-------|-----------|---------------|-----|----------|
+| Client | OS page cache | Recently read blocks | Until memory pressure | LRU by OS |
+| DataNode | SSD block cache | Hot blocks (MapReduce input) | Configurable per-path | LFU with pinning |
+| NameNode | In-memory (heap) | Entire namespace + block map | Permanent | N/A (must fit in RAM) |
+| Short-circuit | Unix domain socket | Local reads bypass TCP | Session-based | Connection close |
+| Centralized cache | HDFS CacheDirective | Explicitly pinned datasets | Until uncached | Manual / TTL-based |
+
+**Design Decisions:**
+- NameNode metadata must fit in RAM (~150 bytes/file → 200GB heap for 1B files)
+- Short-circuit local reads: client reads directly from DataNode's disk file via shared memory (no network hop)
+- Centralized cache management lets admins pin hot datasets (e.g., dimension tables for joins)
+
+## Async Processing
+
+| Operation | Queue/Mechanism | Workers | SLA |
+|-----------|----------------|---------|-----|
+| Block replication (under-replicated) | NameNode replication monitor | DataNode-to-DataNode | 10 min to restore |
+| Balancer (disk utilization evening) | Standalone balancer process | Throttled transfers | Hours (background) |
+| Trash deletion | Checkpoint thread | NameNode | 6h default retention |
+| Audit log shipping | Kafka topic | Log aggregator | Near real-time |
+| Erasure coding conversion | EC policy worker | DataNode compute | Batch overnight |
+
+## Infrastructure Components
+
+```
+┌─────────────────────────────────────────────────────────────────┐
+│                      HDFS Cluster Layout                         │
+├─────────────────────────────────────────────────────────────────┤
+│ Management Plane:                                                │
+│   2× NameNodes (Active/Standby) - 256GB RAM, 32 cores          │
+│   3× JournalNodes - SSD for edit log durability                 │
+│   3× ZooKeeper nodes - Leader election + fencing                │
+│                                                                  │
+│ Data Plane:                                                      │
+│   1000× DataNodes across 50 racks                               │
+│   Each: 12× 16TB HDD, 2× 1TB NVMe (cache), 25Gbps NIC        │
+│   Total raw: ~192 PB, usable ~64 PB (3x replication)           │
+│                                                                  │
+│ Network:                                                         │
+│   Intra-rack: 25 Gbps (leaf switch)                             │
+│   Inter-rack: 100 Gbps spine (2:1 oversubscription)             │
+│   Cross-DC: 10 Gbps dedicated links                             │
+│                                                                  │
+│ Monitoring:                                                      │
+│   Prometheus + Grafana (metrics)                                 │
+│   HDFS Audit Log → Kafka → Elasticsearch                        │
+│   Alerting: DataNode death, under-replication, NN heap pressure │
+└─────────────────────────────────────────────────────────────────┘
+```
+
+## Algorithm Deep Dive: Block Placement Policy (Rack-Aware Replication)
+
+### Problem
+
+Place `r` replicas of each block to maximize:
+1. **Fault tolerance** (survive rack failure)
+2. **Write performance** (minimize cross-rack hops in pipeline)
+3. **Read locality** (place near likely readers)
+
+### HDFS Default Policy (r=3)
+
+```
+Replica 1: Same node as writer (data locality for MapReduce)
+            If writer is not a DataNode → random node in writer's rack
+            
+Replica 2: A node in a DIFFERENT rack (survive rack failure)
+
+Replica 3: A different node in the SAME rack as Replica 2
+            (one cross-rack hop in pipeline, not two)
+```
+
+**Why this specific arrangement?**
+
+```
+Writer's Rack (R1)         Remote Rack (R2)
+┌──────────────────┐      ┌──────────────────┐
+│  [DN-A: Rep1] ───────────▶ [DN-C: Rep2]    │
+│                  │      │       │           │
+│                  │      │       ▼           │
+│                  │      │  [DN-D: Rep3]     │
+└──────────────────┘      └──────────────────┘
+
+Pipeline: Client → DN-A → DN-C → DN-D
+Cross-rack hops: 1 (A→C only; C→D is intra-rack)
+Rack failure tolerance: Lose R1 → still have Rep2+Rep3 in R2
+                        Lose R2 → still have Rep1 in R1
+```
+
+### GFS/HDFS Write Pipeline Step-by-Step
+
+**Scenario:** Client writes a 128MB block with 64KB packets, replication factor 3.
+
+```
+Step 1: Client asks NameNode for block allocation
+        NN returns ordered pipeline: [DN-A, DN-C, DN-D]
+
+Step 2: Client connects to DN-A, sends pipeline setup:
+        "Pipeline: [DN-A, DN-C, DN-D], Block: B001"
+        DN-A connects to DN-C, DN-C connects to DN-D
+        
+Step 3: Pipeline ready ACK propagates back:
+        DN-D → DN-C → DN-A → Client: "Pipeline established"
+
+Step 4: Client streams packets (64KB each):
+        
+        Packet #1: Client → DN-A buffer
+        DN-A: Write to local disk + forward to DN-C
+        DN-C: Write to local disk + forward to DN-D  
+        DN-D: Write to local disk
+        
+        ACK #1: DN-D → DN-C → DN-A → Client
+        
+        Note: Pipelining! Client sends Packet #2 before ACK #1 returns
+        (window of outstanding packets, typically 80 = 5MB)
+
+Step 5: After all 2048 packets (128MB / 64KB):
+        Client sends "EndBlock" marker
+        All DataNodes finalize block (fsync)
+        Final ACK propagates back
+
+Step 6: Client reports to NameNode:
+        "Block B001 complete at [DN-A, DN-C, DN-D]"
+        NameNode updates block map
+
+Performance:
+  Intra-rack throughput: ~1 GB/s per pipeline
+  Cross-rack bottleneck: depends on spine bandwidth
+  Effective write speed: min(disk_write, network_bottleneck)
+  With 3 replicas: ~300 MB/s effective write speed typical
+```
+
+### Complexity Analysis
+
+| Operation | Time Complexity | Network Cost |
+|-----------|----------------|--------------|
+| Block placement decision | O(r × racks) | None (NN local) |
+| Pipeline setup | O(r) round trips | r-1 connections |
+| Write 128MB block | O(block_size) | block_size × r bytes total |
+| Effective cross-rack | O(block_size) | block_size × 1 (pipelining) |
+| NameNode block report | O(blocks_per_DN) | Periodic (hourly) |

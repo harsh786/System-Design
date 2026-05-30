@@ -45,6 +45,62 @@
 
 ## 3. Data Modeling
 
+### Entity-Relationship Diagram
+
+```mermaid
+erDiagram
+    PHOTOS {
+        uuid photo_id PK
+        uuid user_id PK
+        timestamptz capture_time
+        string mime_type
+        bigint file_size
+        string storage_ref
+    }
+    ML_LABELS {
+        uuid user_id PK
+        uuid photo_id PK
+        string label_type PK
+        string label_name PK
+        float confidence
+    }
+    FACE_CLUSTERS {
+        uuid cluster_id PK
+        uuid user_id FK
+        string person_name
+        int face_count
+    }
+    FACE_CLUSTER_MEMBERS {
+        uuid cluster_id PK
+        uuid face_id PK
+        uuid photo_id FK
+        decimal confidence
+    }
+    USER_TAGS {
+        uuid tag_id PK
+        uuid user_id FK
+        string tag_name
+        string tag_type
+    }
+    PHOTO_TAGS {
+        uuid photo_id PK
+        uuid user_id PK
+        uuid tag_id PK
+    }
+    GEO_PLACES {
+        string place_id PK
+        string name
+        string place_type
+        string parent_place_id FK
+    }
+    PHOTOS ||--o{ ML_LABELS : "classified by"
+    PHOTOS ||--o{ FACE_CLUSTER_MEMBERS : "has faces"
+    PHOTOS ||--o{ PHOTO_TAGS : "tagged with"
+    FACE_CLUSTERS ||--o{ FACE_CLUSTER_MEMBERS : contains
+    USER_TAGS ||--o{ PHOTO_TAGS : "applied via"
+    GEO_PLACES ||--o{ PHOTOS : "located in"
+```
+
 ### Photo Metadata (PostgreSQL - partitioned by user)
 ```sql
 CREATE TABLE photos (
@@ -896,3 +952,117 @@ class ReverseGeocodingService:
 | Search engine | Elasticsearch | Powerful text search + geo but expensive at scale; alternative: Meilisearch for simpler needs |
 | Processing mode | Async with priority | Users don't wait but fresh photos may lack labels for ~2s; VIP queue for premium users |
 | Duplicate detection | Perceptual hash | Works for near-duplicates but misses crops/edits; could add CNN embedding comparison at higher cost |
+
+---
+
+## Sequence Diagrams
+
+### Photo Upload + ML Tagging Pipeline
+
+```mermaid
+sequenceDiagram
+    participant C as Mobile Client
+    participant API as API Gateway
+    participant US as Upload Service
+    participant BS as Blob Store (S3)
+    participant Q as Processing Queue
+    participant ML as ML Pipeline
+    participant Meta as Metadata Service
+    participant Idx as Search Index (ES)
+
+    C->>API: POST /photos (image + EXIF metadata)
+    API->>US: ValidateImage(format, size < 50MB)
+    US->>BS: Store original (photos/{user_id}/{uuid}.jpg)
+    BS-->>US: blob_url
+    US->>Meta: CreatePhotoRecord(user_id, blob_url, EXIF)
+    Meta->>Meta: Extract EXIF: GPS, camera, timestamp, orientation
+    Meta-->>US: photo_id
+    US-->>C: 201 Created (photo_id, thumbnail processing...)
+
+    US->>Q: Enqueue([Thumbnail, ObjectDetect, FaceDetect, OCR])
+
+    par Parallel ML processing
+        Q->>ML: Generate thumbnails (150px, 600px, 1200px)
+        ML->>BS: Store thumbnails
+        ML->>Meta: Update thumbnail_urls
+    and
+        Q->>ML: Object detection (YOLOv8)
+        ML-->>Meta: Tags: ["beach", "sunset", "palm_tree", "person"]
+    and
+        Q->>ML: Face detection + embedding (ArcFace)
+        ML-->>Meta: Faces: [{bbox, embedding_512d, cluster_id=?}]
+    and
+        Q->>ML: OCR (if text detected)
+        ML-->>Meta: Text: "Beach Resort Welcome Sign"
+    end
+
+    Meta->>Idx: Index(photo_id, tags, faces, text, GPS, timestamp)
+    Idx-->>Meta: Indexed
+    Meta->>C: Push notification: "Photo processing complete"
+```
+
+### Face Cluster Merge
+
+```mermaid
+sequenceDiagram
+    participant Trigger as New Face Event
+    participant FC as Face Clustering Service
+    participant VDB as Vector DB (face embeddings)
+    participant Meta as Metadata Service
+    participant U as User (confirmation)
+
+    Trigger->>FC: NewFace(photo_id, embedding_512d, bbox)
+    FC->>VDB: ANN search (embedding, top_k=10, threshold=0.75)
+    VDB-->>FC: Nearest clusters: [{cluster_3: dist=0.12}, {cluster_7: dist=0.68}]
+
+    alt Strong match (distance < 0.3)
+        FC->>Meta: AssignToCluster(face_id, cluster_3)
+        FC->>VDB: Update cluster centroid (running average)
+        Meta-->>FC: Assigned (cluster_3 = "Mom", 847 photos)
+    else Weak match (0.3 < distance < 0.6)
+        FC->>Meta: CreateMergeCandidate(face_id, cluster_3, confidence=0.65)
+        Meta->>U: "Is this the same person?" (show examples)
+        U-->>Meta: Confirm/Deny
+        alt Confirmed
+            Meta->>FC: MergeClusters(new_face → cluster_3)
+            FC->>VDB: Update centroid
+        else Denied
+            Meta->>FC: CreateNewCluster(face_id)
+            FC->>VDB: Insert new cluster centroid
+        end
+    else No match (distance > 0.6)
+        FC->>Meta: CreateNewCluster(face_id)
+        FC->>VDB: Insert new cluster centroid
+        Meta-->>FC: New cluster created (unnamed)
+    end
+```
+
+## Infrastructure Components
+
+```
+┌─────────────────────────────────────────────────────────────────┐
+│                Photo Metadata Service Infrastructure             │
+├─────────────────────────────────────────────────────────────────┤
+│ Ingest Layer:                                                    │
+│   API Gateway (rate limit: 100 uploads/min/user)                │
+│   Upload workers: 20 pods, auto-scale on queue depth            │
+│                                                                  │
+│ Storage:                                                         │
+│   S3: Original photos + thumbnails (lifecycle to Glacier 1yr)   │
+│   PostgreSQL (RDS): Photo metadata, albums, sharing             │
+│   Elasticsearch: Full-text + geo search                          │
+│   Milvus/Pinecone: Face embeddings (512d, HNSW index)           │
+│   Redis: Session cache, rate limiting, recent uploads           │
+│                                                                  │
+│ ML Pipeline:                                                     │
+│   GPU nodes: 4× A100 (object detection + face embedding)        │
+│   CPU nodes: 16× (thumbnail generation, OCR)                    │
+│   Model serving: Triton Inference Server                        │
+│   Queue: SQS FIFO (ordered per-user processing)                 │
+│                                                                  │
+│ Monitoring:                                                      │
+│   Processing latency p99 < 5s (thumbnail), < 30s (full ML)     │
+│   Face clustering accuracy: 97% precision, 94% recall           │
+│   Storage cost optimization: auto-tier based on access patterns │
+└─────────────────────────────────────────────────────────────────┘
+```

@@ -97,6 +97,39 @@ Feature computation (Flink):     200B events/day → 2.3M events/sec
 
 ## 4. Data Modeling
 
+### Entity-Relationship Diagram
+
+```mermaid
+erDiagram
+    VIDEOS {
+        uuid video_id PK
+        bigint creator_id FK
+        int duration_ms
+        tinyint status
+        uuid sound_id FK
+    }
+    CREATOR_VIDEOS {
+        bigint creator_id PK
+        timestamp upload_ts
+        uuid video_id FK
+    }
+    USER_INTERACTIONS {
+        bigint user_id PK
+        uuid video_id FK
+        tinyint interaction_type
+        float watch_percentage
+    }
+    VIDEO_FEATURES {
+        uuid video_id PK
+        text category
+        float engagement_rate
+        float virality_score
+    }
+    VIDEOS ||--o{ USER_INTERACTIONS : "receives"
+    VIDEOS ||--|| VIDEO_FEATURES : "has"
+    VIDEOS }o--|| CREATOR_VIDEOS : "indexed in"
+```
+
 ### Video Metadata (Cassandra - wide column)
 ```sql
 CREATE TABLE videos (
@@ -955,3 +988,175 @@ Architecture:
 - Engagement fraud: statistical anomaly detection on like/view patterns
 - Recommendation manipulation: down-rank videos with suspicious engagement
 - Rate limiting: per-user, per-IP, per-device interaction caps
+
+---
+
+## Sequence Diagrams
+
+### 1. Video Upload + Processing Pipeline
+
+```mermaid
+sequenceDiagram
+    participant U as Creator
+    participant API as API Gateway
+    participant US as Upload Service
+    participant S3 as Object Store
+    participant K as Kafka
+    participant TP as Transcoding Pipeline
+    participant ML as Content Analysis (GPU)
+    participant CDN as CDN Edge
+    participant VS as Video Service
+
+    U->>API: POST /video/upload {video_chunk, metadata}
+    API->>US: initiateMultipartUpload(creator_id)
+    US->>S3: multipart upload (chunked)
+    S3-->>US: upload_complete, s3_key
+
+    US->>K: publish VideoUploaded {video_id, s3_key, metadata}
+
+    par Transcoding
+        K->>TP: consume VideoUploaded
+        TP->>TP: transcode to 360p, 720p, 1080p (H.265)
+        TP->>TP: generate HLS/DASH segments
+        TP->>S3: store all variants
+        TP->>CDN: pre-warm popular edge locations
+    and Content Analysis
+        K->>ML: extract frames, audio
+        ML->>ML: safety check, copyright detection
+        ML->>ML: generate embeddings for recommendation
+        ML-->>VS: content_tags, embedding_vector, safety_score
+    end
+
+    alt Content approved
+        VS->>VS: mark video LIVE
+        VS->>K: publish VideoReady {video_id, cdn_urls, tags}
+        Note over K: Triggers initial cold-start distribution
+    else Content rejected
+        VS-->>U: notification: policy violation
+    end
+```
+
+### 2. For You Page Recommendation
+
+```mermaid
+sequenceDiagram
+    participant U as User
+    participant API as API Gateway
+    participant FYP as ForYou Service
+    participant RC as Redis Cache
+    participant CG as Candidate Retrieval
+    participant VDB as Vector DB (Milvus)
+    participant RK as Ranking Service (GPU)
+    participant DV as Diversity/Filter
+
+    U->>API: GET /foryou?session_id=xxx
+    API->>FYP: getRecommendations(user_id, context)
+    FYP->>RC: GET fyp_prefetch:{user_id}
+
+    alt Prefetch buffer has items
+        RC-->>FYP: next_batch (8 videos)
+    else Buffer empty - generate new batch
+        FYP->>CG: retrieveCandidates(user_id, 5000)
+        Note over CG: Multi-source: collaborative filter, content-based, trending, geo
+        CG->>VDB: ANN(user_embedding, top_k=2000)
+        VDB-->>CG: similar_content_ids
+        CG-->>FYP: 5000 candidates
+
+        FYP->>RK: rank(candidates, user_history, real_time_signals)
+        Note over RK: Multi-task model: P(watch), P(like), P(share), P(follow)
+        RK-->>FYP: scored_candidates
+
+        FYP->>DV: applyDiversity(scored, creator_spread, topic_mix)
+        DV-->>FYP: final_200_videos
+        FYP->>RC: SET fyp_prefetch:{user_id} TTL=120
+    end
+
+    FYP-->>API: video_batch[] + preload_urls
+    API-->>U: 200 OK
+```
+
+### 3. Duet/Stitch Creation
+
+```mermaid
+sequenceDiagram
+    participant U as Creator B
+    participant API as API Gateway
+    participant DS as Duet Service
+    participant VS as Video Service
+    participant PS as Permission Service
+    participant K as Kafka
+    participant TP as Transcoding Pipeline
+    participant NS as Notification Service
+
+    U->>API: POST /duet {original_video_id, new_video}
+    API->>DS: createDuet(creator_b, original_id, new_content)
+    DS->>PS: checkDuetPermission(original_id, creator_b)
+    PS->>VS: getVideoSettings(original_id)
+
+    alt Duet allowed by original creator
+        VS-->>PS: duet_enabled=true
+        PS-->>DS: permitted
+        DS->>VS: getVideoSegment(original_id, trim_range)
+        DS->>K: publish DuetCreated {original_id, new_video_s3, layout}
+        K->>TP: compositeRender(side_by_side or stitch_sequential)
+        TP->>TP: merge audio/video tracks, sync timing
+        TP-->>DS: composite_video_url
+        DS->>VS: createPost(composite, linked_original_id)
+        DS->>K: publish VideoReady
+        K->>NS: notify original creator
+        DS-->>API: 200 OK {duet_post_id}
+    else Duet disabled
+        PS-->>DS: denied
+        DS-->>API: 403 Duet not allowed for this video
+    end
+```
+
+---
+
+## Caching Strategy
+
+### Multi-Tier Cache Architecture
+
+| Tier | Technology | TTL | Use Case |
+|------|-----------|-----|----------|
+| L1 - Edge | CDN PoP (local SSD) | 5-60s | Video segments, thumbnails |
+| L2 - Regional | Redis Cluster | 2-10 min | FYP prefetch, user session, trending |
+| L3 - Central | Redis + Memcached | 30 min-24h | Video metadata, creator profiles |
+| L4 - Persistent | RocksDB (embedded) | Days | ML feature cache, embeddings |
+
+### Eviction & Invalidation
+
+- **FYP cache**: LRU with 120s TTL; invalidated on explicit "Not Interested" signal
+- **Video metadata**: Write-through on edit; event-driven invalidation via Kafka
+- **Trending cache**: Rebuilt every 30s by Flink streaming job; no explicit invalidation
+- **Creator profile**: Cache-aside with 5min TTL; invalidated on profile update event
+- **Edge video segments**: TTL-based (60s for new videos, 24h for viral); purge API for takedowns
+
+---
+
+## Async Processing - Kafka Topic Design
+
+| Topic | Partitions | Key | Consumers |
+|-------|-----------|-----|-----------|
+| `video.uploaded` | 128 | video_id | Transcoding, Content Analysis, Metadata |
+| `video.ready` | 64 | creator_id | Feed fanout, Notification, Analytics |
+| `engagement.events` | 256 | video_id | Recommendation update, Counter, Anti-fraud |
+| `recommendation.feedback` | 128 | user_id | Model retraining, A/B metrics |
+| `content.moderation` | 32 | video_id | Review queue, Appeal processing |
+| `creator.events` | 64 | creator_id | Profile update, Follower notify |
+
+**Processing guarantees**: Exactly-once via idempotent producers + transactional consumers. Consumer lag monitored with alerting at >10s for engagement topics.
+
+---
+
+## Infrastructure Components
+
+| Component | Technology | Purpose |
+|-----------|-----------|---------|
+| CDN | Multi-CDN (Akamai + CloudFront + own PoPs) | Video delivery, 98%+ cache hit ratio |
+| Load Balancer | L4 (DPDK-based) + L7 (Envoy) | 10M+ concurrent connections |
+| API Gateway | Custom (Go) | Auth, rate limit, geo-routing, A/B assignment |
+| Edge Computing | Edge PoPs with GPU | Video pre-processing, thumbnail generation |
+| Service Mesh | Istio/Envoy | mTLS, traffic splitting, circuit breaking |
+| DNS | GeoDNS + Anycast | <10ms DNS resolution, failover |
+| Object Storage | Multi-region S3 + own HDFS | Video origin, ML training data |

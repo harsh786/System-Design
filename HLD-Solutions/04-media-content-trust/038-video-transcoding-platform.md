@@ -51,6 +51,46 @@
 
 ## 3. Data Modeling
 
+### Entity-Relationship Diagram
+
+```mermaid
+erDiagram
+    TRANSCODE_JOBS {
+        uuid job_id PK
+        uuid tenant_id FK
+        smallint priority
+        varchar status
+        text input_uri
+        jsonb output_profiles
+    }
+    JOB_RENDITIONS {
+        uuid rendition_id PK
+        uuid job_id FK
+        varchar codec
+        varchar resolution
+        int bitrate_kbps
+        varchar status
+    }
+    JOB_CHUNKS {
+        uuid chunk_id PK
+        uuid job_id FK
+        uuid rendition_id FK
+        int chunk_index
+        varchar status
+        varchar worker_id
+    }
+    ENCODING_ANALYSIS {
+        uuid analysis_id PK
+        uuid job_id FK
+        decimal content_complexity
+        jsonb optimal_ladder
+    }
+
+    TRANSCODE_JOBS ||--o{ JOB_RENDITIONS : produces
+    TRANSCODE_JOBS ||--o| ENCODING_ANALYSIS : analyzed
+    JOB_RENDITIONS ||--o{ JOB_CHUNKS : "split into"
+```
+
 ### 3.1 PostgreSQL - Job Metadata
 
 ```sql
@@ -1103,3 +1143,199 @@ Spans tagged with: job_id, tenant_id, priority, codec, resolution, chunk_index
 - S3 Intelligent Tiering: auto-tier cold outputs
 - Per-title encoding: 20-40% CDN bandwidth savings
 - Chunk-level deduplication: skip re-encoding unchanged segments for re-submits
+
+---
+
+## Sequence Diagrams
+
+### 1. Chunk-Based Parallel Transcode
+
+```mermaid
+sequenceDiagram
+    participant API as Job API
+    participant Sched as Scheduler/Orchestrator
+    participant Split as Splitter Worker
+    participant S3 as Object Store
+    participant Pool as Worker Pool (Spot Instances)
+    participant W1 as Worker 1
+    participant W2 as Worker 2
+    participant W3 as Worker N
+    participant Merge as Merger Worker
+    participant DB as Job State DB
+
+    API->>Sched: Submit transcode job {input_url, profiles: [1080p, 720p, 480p]}
+    Sched->>DB: Create job (status: splitting)
+    Sched->>Split: Split video into GOP-aligned chunks
+
+    Split->>S3: Download source video
+    Split->>Split: Detect scene changes + keyframe boundaries
+    Split->>Split: Create N chunks (each 4-10 seconds, GOP-aligned)
+    Split->>S3: Upload chunks [chunk_0, chunk_1, ..., chunk_N]
+    Split->>DB: Record chunk manifest
+
+    Sched->>DB: Update status: encoding
+    loop For each profile × chunk (parallelized)
+        Sched->>Pool: Dispatch encode task {chunk_id, profile}
+        par Parallel encoding across workers
+            Pool->>W1: Encode chunk_0 @ 1080p
+            Pool->>W2: Encode chunk_1 @ 1080p
+            Pool->>W3: Encode chunk_2 @ 1080p
+        end
+
+        alt Worker completes successfully
+            W1->>S3: Upload encoded chunk
+            W1->>DB: Mark chunk complete
+        else Worker fails (spot termination / crash)
+            W1->>Sched: Heartbeat timeout detected
+            Sched->>Pool: Re-dispatch chunk to different worker
+            Note over Sched: Idempotent retry, same chunk_id
+        end
+    end
+
+    Sched->>Sched: All chunks for profile complete?
+    Sched->>Merge: Concatenate encoded chunks (per profile)
+    Merge->>S3: Download all encoded chunks (ordered)
+    Merge->>Merge: Concatenate (binary concat for matching codec params)
+    Merge->>Merge: Generate HLS/DASH manifest + segments
+    Merge->>S3: Upload final output + manifests
+    Merge->>DB: Update job (status: complete, output_urls)
+    Merge->>API: Callback webhook (job complete)
+```
+
+### 2. Per-Title Encoding Optimization
+
+```mermaid
+sequenceDiagram
+    participant Job as Job Orchestrator
+    participant Analyze as Content Analyzer
+    participant S3 as Object Store
+    participant Ladder as Bitrate Ladder Optimizer
+    participant Encode as Encode Workers
+    participant QC as Quality Checker (VMAF)
+    participant DB as Job DB
+
+    Job->>Analyze: Analyze source video characteristics
+    Analyze->>S3: Download source (or representative samples)
+    Analyze->>Analyze: Compute spatial complexity (SI) per scene
+    Analyze->>Analyze: Compute temporal complexity (TI) per scene
+    Analyze->>Analyze: Detect content type (animation, sports, talking-head, action)
+    Analyze-->>Job: Content profile {complexity: high, type: action, motion: fast}
+
+    Job->>Ladder: Determine optimal bitrate ladder for this content
+    Ladder->>Ladder: Select candidate CRF values based on complexity
+    Ladder->>Ladder: Generate trial ladder (e.g., 8 rungs instead of fixed 6)
+
+    loop Convex hull search (for each resolution)
+        Ladder->>Encode: Encode 10-second sample at multiple bitrates
+        Encode-->>Ladder: Encoded samples
+        Ladder->>QC: Compute VMAF scores for each sample
+        QC-->>Ladder: VMAF scores per (resolution, bitrate) pair
+        Ladder->>Ladder: Plot rate-distortion curve
+        Ladder->>Ladder: Find convex hull (optimal quality per bit)
+    end
+
+    Ladder-->>Job: Optimized ladder [{res: 1080p, bitrate: 4800kbps}, {res: 720p, bitrate: 2100kbps}, ...]
+    Note over Ladder,Job: Action movie gets higher bitrates; talking-head gets lower
+
+    Job->>Encode: Encode full video using optimized ladder
+    Encode->>S3: Store all renditions
+    Job->>QC: Final VMAF validation (spot-check segments)
+    QC-->>Job: All renditions meet minimum VMAF threshold
+    Job->>DB: Store optimized ladder metadata for future reference
+```
+
+### 3. Failure Recovery + Retry Chunk
+
+```mermaid
+sequenceDiagram
+    participant Sched as Scheduler
+    participant W as Worker (Spot Instance)
+    participant HB as Heartbeat Monitor
+    participant DB as Job State DB
+    participant DLQ as Dead Letter Queue
+    participant Alert as Alert Service
+    participant S3 as Object Store
+    participant W2 as Replacement Worker
+
+    Sched->>W: Assign chunk_42 encode task
+    W->>S3: Download chunk_42 source
+    W->>W: Begin FFmpeg encode
+
+    par Heartbeat monitoring
+        loop Every 10 seconds
+            W->>HB: Heartbeat {worker_id, chunk_42, progress: 45%}
+            HB->>DB: Update last_heartbeat
+        end
+    end
+
+    Note over W: Spot instance termination notice (2 min warning)
+    W->>Sched: Graceful shutdown signal (or heartbeat stops)
+
+    alt Graceful shutdown (2-min warning received)
+        W->>S3: Upload partial progress checkpoint
+        W->>DB: Record checkpoint {chunk_42, progress: 67%, checkpoint_file}
+        W->>Sched: Task returned (incomplete)
+    else Hard failure (no warning)
+        HB->>HB: Heartbeat timeout (30s with no response)
+        HB->>Sched: Worker presumed dead
+    end
+
+    Sched->>DB: Mark chunk_42 as retry_pending (attempt: 2)
+    Sched->>Sched: Exponential backoff (attempt 2: wait 30s)
+
+    Sched->>W2: Reassign chunk_42 to new worker
+    W2->>DB: Check for checkpoint
+    alt Checkpoint exists
+        W2->>S3: Download checkpoint (resume from 67%)
+        W2->>W2: Resume encode from checkpoint
+    else No checkpoint
+        W2->>S3: Download original chunk source
+        W2->>W2: Restart encode from beginning
+    end
+
+    alt Encode succeeds
+        W2->>S3: Upload completed encoded chunk
+        W2->>DB: Mark chunk_42 complete
+    else Fails again (attempt 3)
+        W2->>Sched: Task failed
+        Sched->>DB: Mark chunk_42 attempt 3
+        alt Max retries exceeded (3)
+            Sched->>DLQ: Move to dead letter queue
+            Sched->>Alert: Page on-call engineer
+            Sched->>DB: Mark job as partial_failure
+            Note over Alert: Human investigates (codec bug? corrupt source?)
+        end
+    end
+```
+
+---
+
+## Expanded Async Processing
+
+### Async Architecture Details
+
+The transcoding platform is fundamentally an async system — no synchronous transcoding occurs:
+
+**Job Submission → Completion (Fully Async)**:
+- Client submits job via API → immediate 202 response with job_id
+- All processing is event-driven via message queues (SQS/Kafka)
+- Status updates via: polling API, webhook callbacks, or WebSocket subscriptions
+- Typical job lifecycle: 2 minutes (short clip) to 4 hours (feature film)
+
+**Multi-Stage Async Pipeline**:
+```
+Submit → Validate → Split → Analyze → Encode (N parallel) → QC → Merge → Package → Deliver
+```
+Each stage is a separate consumer group; stages communicate only via queues + S3.
+
+**Priority Queue System**:
+- P0 (live/urgent): dedicated capacity, preempts lower priority
+- P1 (standard): bulk of traffic, auto-scaled worker pool
+- P2 (background): re-encodes, optimization passes, uses only spare capacity
+- Starvation prevention: P2 jobs promoted after 24h wait
+
+**Async Progress Tracking**:
+- Each chunk reports progress independently
+- Aggregator computes overall job progress: `completed_chunks / total_chunks × 100`
+- Client polls `GET /jobs/{id}/status` or subscribes to WebSocket for real-time updates
+- ETA estimation based on rolling average chunk encode time × remaining chunks

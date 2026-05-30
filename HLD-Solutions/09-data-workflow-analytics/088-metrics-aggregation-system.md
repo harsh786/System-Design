@@ -59,6 +59,62 @@ Compute:
 
 ## 4. Data Modeling
 
+### Entity-Relationship Diagram
+
+```mermaid
+erDiagram
+    METRIC_METADATA {
+        bigint metric_id PK
+        varchar metric_name
+        varchar metric_type
+        varchar status
+    }
+    SERIES_LABELS {
+        bigint series_id PK
+        bigint metric_id FK
+        varchar label_key
+        varchar label_value
+    }
+    LABEL_INVERTED_INDEX {
+        bigint metric_id PK_FK
+        varchar label_key PK
+        varchar label_value PK
+        array series_ids
+    }
+    TS_CHUNKS {
+        bigint series_id PK_FK
+        varchar resolution PK
+        timestamp chunk_start_time PK
+        bytea data_compressed
+        int num_samples
+    }
+    ALERT_RULES {
+        uuid rule_id PK
+        uuid tenant_id
+        text expression
+        varchar severity
+        varchar current_state
+    }
+    DOWNSAMPLING_RULES {
+        uuid rule_id PK
+        varchar source_resolution
+        varchar target_resolution
+        interval source_retention
+    }
+    CARDINALITY_TRACKING {
+        bigint metric_id PK_FK
+        varchar label_key PK
+        int unique_values
+        boolean is_high_cardinality
+    }
+
+    METRIC_METADATA ||--o{ SERIES_LABELS : has
+    METRIC_METADATA ||--o{ LABEL_INVERTED_INDEX : indexed-by
+    METRIC_METADATA ||--o{ CARDINALITY_TRACKING : tracked-by
+    SERIES_LABELS ||--o{ TS_CHUNKS : stores
+    METRIC_METADATA ||--o{ ALERT_RULES : evaluated-by
+```
+
 ### Metric Metadata Schema
 ```sql
 CREATE TABLE metric_metadata (
@@ -1200,3 +1256,283 @@ monitoring:
 - Write-ahead log per node for crash recovery
 - Background compaction merges small chunks into larger blocks
 - Cold tier offloads to object storage (Parquet format for analytics)
+
+---
+
+## 12. Sequence Diagrams
+
+### Diagram 1: Metric Write + Pre-Aggregation
+
+```mermaid
+sequenceDiagram
+    participant Agent as Metrics Agent
+    participant GW as Write Gateway
+    participant Kafka
+    participant Agg as Flink Pre-Aggregator
+    participant TSDB as Time-Series DB
+    participant Rollup as Rollup Storage
+
+    Agent->>Agent: Collect metrics (10s scrape interval)
+    Agent->>Agent: Local pre-aggregation (combine histograms, compute rates)
+    Agent->>GW: Remote write (Prometheus format, snappy compressed, batch=500 samples)
+    
+    GW->>GW: Validate labels, enforce cardinality limit (100K series/tenant)
+    GW->>GW: Hash series fingerprint → determine shard
+    GW->>Kafka: Produce to metrics topic (partition = shard_id)
+    Kafka-->>GW: ACK
+    GW-->>Agent: 200 OK
+
+    par Write path
+        TSDB->>Kafka: Consume from partition (consumer per shard)
+        TSDB->>TSDB: Append to WAL (write-ahead log)
+        TSDB->>TSDB: Buffer in memory (head chunk, 2h window)
+        TSDB->>TSDB: Flush to disk when chunk full (compressed block)
+    and Pre-aggregation path
+        Agg->>Kafka: Consume same partition (separate consumer group)
+        Agg->>Agg: Tumbling window: 1min rollup (sum, count, min, max, p50, p99)
+        Agg->>Rollup: Write 1min aggregates
+        Agg->>Agg: Tumbling window: 1h rollup (from 1min aggregates)
+        Agg->>Rollup: Write 1h aggregates
+    end
+
+    Note over TSDB: Background compaction
+    TSDB->>TSDB: Merge 2h blocks → 24h blocks (better compression)
+    TSDB->>TSDB: Apply retention: delete blocks > 15 days
+    TSDB->>Rollup: Offload cold blocks to object storage (Parquet)
+```
+
+### Diagram 2: Query with Rollup Selection
+
+```mermaid
+sequenceDiagram
+    participant User as Grafana Dashboard
+    participant QFE as Query Frontend
+    participant Cache as Result Cache (Redis)
+    participant QE as Query Engine
+    participant TSDB as TSDB (Hot: <2h)
+    participant Rollup as Rollup Store (1min/1h)
+    participant Cold as Cold Storage (S3)
+
+    User->>QFE: PromQL: rate(http_requests_total{service="api"}[5m]) over last 24h
+    QFE->>QFE: Parse query, determine time range + step
+
+    QFE->>QFE: Split query into sub-queries by time alignment
+    QFE->>Cache: GET hash(query + time_bucket[0h-1h])
+    Cache-->>QFE: HIT (immutable past hour, cached indefinitely)
+    
+    QFE->>Cache: GET hash(query + time_bucket[23h-24h])
+    Cache-->>QFE: MISS (current hour, still accumulating)
+
+    QFE->>QE: Execute sub-query for 23h-24h range
+    QE->>QE: Determine optimal data source:
+    Note over QE: Range=1h, step=15s → use raw data (recent)
+    
+    QE->>TSDB: Fetch series http_requests_total{service="api"} for last hour
+    TSDB-->>QE: Raw samples (240 points per series)
+    QE->>QE: Evaluate rate() function over samples
+
+    Note over QFE: For historical sub-queries (1h-22h): use 1min rollups
+    QFE->>QE: Execute sub-query for 1h-22h
+    QE->>Rollup: Fetch 1min pre-aggregated data
+    Rollup-->>QE: Aggregated points (1260 points vs 75600 raw)
+    QE->>QE: Compute rate from pre-aggregated counters
+
+    QFE->>QFE: Merge all sub-query results
+    QFE->>Cache: SET current-hour result (TTL=scrape_interval)
+    QFE-->>User: Time series response (render chart)
+```
+
+### Caching Strategy
+
+| Cache Type | Key | TTL | Hit Rate | Purpose |
+|-----------|-----|-----|----------|---------|
+| Query result (immutable) | hash(query + aligned_time_bucket) | ∞ (past hours never change) | ~70% | Avoid recomputing historical ranges |
+| Query result (current) | hash(query + current_bucket) | 10-15s (scrape interval) | ~40% | Serve dashboard refreshes |
+| Series metadata | series_fingerprint → labels | 1h | ~95% | Avoid label lookups on every query |
+| Chunk index | series_id → chunk_locations | 30min | ~85% | Fast chunk location without index scan |
+| Recording rules | rule_hash → precomputed series | Evaluation interval | ~99% | Avoid expensive PromQL re-evaluation |
+
+### Infrastructure Components
+
+```
+┌──────────────────────────────────────────────────────────┐
+│ Collection Tier                                           │
+│  ├── Prometheus agents (per-node, DaemonSet)             │
+│  ├── OpenTelemetry Collectors (sidecar + gateway mode)   │
+│  └── StatsD/Graphite receivers (legacy compatibility)    │
+├──────────────────────────────────────────────────────────┤
+│ Ingestion Tier                                            │
+│  ├── Write gateways (stateless, 12 pods, HPA on CPU)    │
+│  ├── Kafka cluster (12 brokers, 256 partitions)          │
+│  └── Flink pre-aggregator (6 task managers, checkpoints) │
+├──────────────────────────────────────────────────────────┤
+│ Storage Tier                                              │
+│  ├── TSDB cluster (Thanos/Mimir: 20 ingesters, 10 store)│
+│  ├── Object storage (S3: long-term blocks, Parquet)      │
+│  └── Redis cluster (6 nodes: query cache + metadata)     │
+├──────────────────────────────────────────────────────────┤
+│ Query Tier                                                │
+│  ├── Query frontends (split + cache + dedup, 6 pods)     │
+│  ├── Query engines (parallel evaluation, 10 pods)        │
+│  └── Grafana (dashboards, alerting rules)                │
+└──────────────────────────────────────────────────────────┘
+```
+
+## 13. Algorithm Deep Dives
+
+### Deep Dive: Time-Series Compression (Gorilla/XOR Encoding)
+
+#### Problem
+Metrics systems store billions of data points. Naive storage (8 bytes timestamp + 8 bytes value = 16 bytes/point) would require petabytes. Most metrics change slowly — exploit temporal patterns.
+
+#### Timestamp Compression: Delta-of-Delta Encoding
+
+Metric timestamps are highly regular (e.g., every 15s). Compress by storing delta-of-deltas.
+
+```
+Raw timestamps:     [1000, 1015, 1030, 1045, 1060, 1075]
+Deltas:             [-, 15, 15, 15, 15, 15]
+Delta-of-deltas:   [-, -, 0, 0, 0, 0]
+
+Encoding (Facebook Gorilla paper):
+  - First timestamp: stored as full 64-bit value
+  - Delta-of-delta = 0:        store '0' (1 bit!)
+  - Delta-of-delta in [-63,64]: store '10' + 7-bit value (9 bits)
+  - Delta-of-delta in [-255,256]: store '110' + 9-bit value (12 bits)
+  - Delta-of-delta in [-2047,2048]: store '1110' + 12-bit value (16 bits)
+  - Otherwise: store '1111' + 32-bit value (36 bits)
+```
+
+**Step-by-step example:**
+```
+Timestamps: [1609459200, 1609459215, 1609459230, 1609459247, 1609459262]
+
+t0 = 1609459200 → store full 64 bits
+t1: delta = 15 → store as header (first delta, 14 bits)
+t2: delta = 15, dod = 15-15 = 0 → store '0' (1 bit)
+t3: delta = 17, dod = 17-15 = 2 → store '10' + 0000010 (9 bits)  
+t4: delta = 15, dod = 15-17 = -2 → store '10' + 1111110 (9 bits, two's complement)
+
+Total: 64 + 14 + 1 + 9 + 9 = 97 bits for 5 timestamps
+Naive: 5 × 64 = 320 bits
+Compression ratio: 3.3×
+```
+
+#### Value Compression: XOR Encoding
+
+Float64 values in metrics often change by small amounts (e.g., CPU from 0.45 to 0.47).
+
+```
+XOR adjacent values → most bits cancel out → store only meaningful bits
+
+Algorithm:
+1. XOR current value with previous: xor = v[i] ^ v[i-1]
+2. If xor == 0: store '0' (1 bit) — value unchanged
+3. If meaningful bits within previous leading/trailing zeros:
+   store '10' + value bits within same position (2 + value_bits)
+4. Otherwise:
+   store '11' + 5-bit leading_zeros + 6-bit block_length + meaningful_bits
+
+Example:
+  v0 = 0.45 = 0x3FDCCCCCCCCCCCCD (IEEE 754)
+  v1 = 0.47 = 0x3FDE147AE147AE14
+  
+  xor = 0x0002D8E62D8E6239
+  Leading zeros: 14, Trailing zeros: 0, Meaningful bits: 50
+  
+  v2 = 0.47 (same as v1)
+  xor = 0x0000000000000000
+  Store: '0' (1 bit!) — 94% of real-world samples
+```
+
+#### Real-World Compression Results
+
+| Data Pattern | Bits/Value (timestamp) | Bits/Value (float) | Total Bytes/Point |
+|-------------|----------------------|-------------------|-------------------|
+| Regular interval, constant | 1 | 1 | 0.25 |
+| Regular interval, slowly changing | 1 | 15-30 | 2-4 |
+| Irregular interval, volatile | 12-36 | 40-50 | 7-11 |
+| **Average across production** | **~4** | **~12** | **~1.37** |
+
+vs naive 16 bytes/point = **12× compression ratio** on average.
+
+---
+
+### Deep Dive: Pre-Aggregation at Scale
+
+#### Problem
+Dashboard queries over 30 days of data at 15s resolution = 172,800 points per series. With 10K series per dashboard query, that's 1.7B points to scan.
+
+#### Multi-Resolution Rollup Architecture
+
+```
+Raw (15s) ──[1min agg]──→ 1min rollups ──[1h agg]──→ 1h rollups ──[1d agg]──→ 1d rollups
+   │                         │                          │                        │
+   retention: 2 weeks        retention: 90 days         retention: 2 years       retention: forever
+   storage: TSDB hot         storage: TSDB warm         storage: S3 Parquet      storage: S3 Parquet
+```
+
+#### Aggregation Functions Preserved at Each Level
+
+For each series at each rollup level, store:
+```
+{
+  "sum": 1234.5,      // enables: sum(), avg() (sum/count)
+  "count": 82,        // enables: rate() (count/interval)
+  "min": 0.1,         // enables: min()
+  "max": 99.8,        // enables: max()
+  "sum_of_squares": 5678.9,  // enables: stddev()
+  "histogram_buckets": {     // enables: histogram_quantile()
+    "0.1": 5, "0.5": 30, "1.0": 60, "5.0": 80, "+Inf": 82
+  }
+}
+```
+
+#### Query Resolution Selection Algorithm
+
+```python
+def select_resolution(time_range, step, query_type):
+    """Automatically choose optimal rollup level"""
+    
+    # Rule 1: Never use rollup coarser than query step
+    if step < 60:
+        return "raw"  # need second-level precision
+    
+    # Rule 2: Use finest rollup that keeps points under budget
+    max_points = 11000  # Grafana default maxDataPoints
+    points_needed = time_range.total_seconds() / step
+    
+    if points_needed <= max_points:
+        # Can afford raw if within retention
+        if time_range < timedelta(weeks=2):
+            return "raw"
+        elif time_range < timedelta(days=90):
+            return "1min"
+        elif time_range < timedelta(days=730):
+            return "1h"
+        else:
+            return "1d"
+    
+    # Rule 3: For counter metrics (rate/increase), need raw or 1min
+    if query_type in ["rate", "increase", "irate"]:
+        return "1min" if time_range > timedelta(weeks=2) else "raw"
+    
+    return select_by_range(time_range)
+```
+
+#### Exactly-Once Pre-Aggregation (Flink)
+
+```
+Checkpoint Protocol:
+1. Flink initiates checkpoint barrier
+2. Each operator saves window state to RocksDB + S3
+3. Kafka source saves consumer offsets as part of checkpoint
+4. Rollup sink uses two-phase commit:
+   a. Pre-commit: write rollup rows to staging table
+   b. On checkpoint complete: atomically move to rollup table
+   c. On failure: rollback staging (idempotent via window_start + series_id key)
+
+This guarantees: each raw sample contributes to exactly one rollup bucket,
+even across failures and restarts.
+```
+

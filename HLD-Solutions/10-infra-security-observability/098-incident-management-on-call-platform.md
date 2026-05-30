@@ -809,6 +809,75 @@ class DoNotDisturbHandler:
 
 ## 8. Database Schema
 
+### Entity-Relationship Diagram
+
+```mermaid
+erDiagram
+    ALERTS {
+        uuid id PK
+        bigint tenant_id
+        string dedup_key
+        string severity
+        string status
+        uuid service_id FK
+        uuid incident_id FK
+    }
+    INCIDENTS {
+        uuid id PK
+        bigint tenant_id
+        string title
+        string severity
+        string status
+        uuid escalation_policy_id FK
+    }
+    INCIDENT_TIMELINE {
+        uuid id PK
+        uuid incident_id FK
+        string event_type
+        uuid user_id
+    }
+    SCHEDULES {
+        uuid id PK
+        bigint tenant_id
+        string name
+        string timezone
+        jsonb layers
+    }
+    ESCALATION_POLICIES {
+        uuid id PK
+        bigint tenant_id
+        string name
+        jsonb rules
+    }
+    NOTIFICATION_LOG {
+        uuid id PK
+        uuid incident_id FK
+        uuid user_id
+        string channel
+        string status
+    }
+    SERVICES {
+        uuid id PK
+        bigint tenant_id
+        string name
+        uuid escalation_policy_id FK
+    }
+    POSTMORTEMS {
+        uuid id PK
+        uuid incident_id FK
+        string title
+        string status
+    }
+
+    SERVICES ||--o{ ALERTS : "triggers"
+    INCIDENTS ||--o{ ALERTS : "groups"
+    INCIDENTS ||--o{ INCIDENT_TIMELINE : "records"
+    INCIDENTS ||--o{ NOTIFICATION_LOG : "notifies"
+    INCIDENTS ||--|| POSTMORTEMS : "reviewed in"
+    ESCALATION_POLICIES ||--o{ INCIDENTS : "escalates"
+    ESCALATION_POLICIES ||--o{ SERVICES : "assigned to"
+```
+
 ```sql
 -- Core tables
 CREATE TABLE alerts (
@@ -1071,3 +1140,115 @@ redis:
 - Notifications: routed to region closest to user's phone carrier
 - RTO < 30 seconds for P1 alert path
 - RPO = 0 for alert events (sync Kafka replication)
+
+---
+
+## Sequence Diagrams
+
+### Alert → Incident → On-Call Notification
+
+```mermaid
+sequenceDiagram
+    participant Monitor as Monitoring System
+    participant Ingest as Alert Intake
+    participant Dedup as Dedup/Correlation Engine
+    participant IncidentDB as Incident Store
+    participant OnCall as On-Call Scheduler
+    participant Notify as Notification Service
+    participant Engineer as On-Call Engineer
+    participant Audit as Audit Trail
+
+    Monitor->>Ingest: Fire alert {service: payments, severity: critical}
+    Ingest->>Ingest: Normalize alert (map source → standard format)
+    Ingest->>Dedup: Check for existing incident (correlation key: service+alert_type)
+    alt Correlates to existing incident
+        Dedup->>IncidentDB: Append alert to incident timeline
+        Dedup-->>Monitor: ACK (deduplicated)
+    else New incident
+        Dedup->>IncidentDB: Create incident {severity, service, status: triggered}
+        Dedup->>OnCall: Resolve on-call for service "payments"
+        OnCall->>OnCall: Load schedule (current rotation, overrides)
+        OnCall-->>Dedup: On-call: Alice (primary), Bob (secondary)
+        Dedup->>Notify: Notify Alice {method: phone + push + SMS}
+    end
+
+    Notify->>Engineer: Push notification (immediate)
+    Notify->>Engineer: Phone call (after 30s if no ACK)
+    Notify->>Engineer: SMS (after 60s if no ACK)
+
+    alt Engineer acknowledges
+        Engineer->>Notify: ACK incident
+        Notify->>IncidentDB: Update status: acknowledged
+        Notify->>Audit: Log ACK {who, when, response_time}
+    else No response (3 min timeout)
+        Notify->>OnCall: Escalate to secondary (Bob)
+        OnCall->>Notify: Notify Bob (same multi-channel)
+    end
+```
+
+### Escalation + War Room Creation
+
+```mermaid
+sequenceDiagram
+    participant Timer as Escalation Timer
+    participant Escalation as Escalation Engine
+    participant IncidentDB as Incident Store
+    participant OnCall as On-Call Service
+    participant Slack as Slack/Teams
+    participant Bridge as Video Bridge
+    participant StatusPage as Status Page
+    participant Notify as Notification Service
+
+    Timer->>Escalation: Incident not resolved (15 min, severity: critical)
+    Escalation->>IncidentDB: Get incident details + timeline
+    Escalation->>Escalation: Apply escalation policy (level 2: manager + team lead)
+    Escalation->>OnCall: Get escalation contacts
+    OnCall-->>Escalation: Manager: Carol, Team Lead: Dave
+
+    Escalation->>Notify: Page Carol + Dave
+    Escalation->>Slack: Create war room channel (#inc-2024-0142)
+    Slack-->>Escalation: Channel created
+    Escalation->>Slack: Invite all responders + post incident summary
+    Escalation->>Bridge: Create video bridge link
+    Bridge-->>Escalation: https://meet.internal/inc-0142
+    Escalation->>Slack: Post bridge link to war room
+
+    alt Severity == SEV1 (customer-facing)
+        Escalation->>StatusPage: Create status page incident
+        StatusPage-->>Escalation: Public incident URL
+        Escalation->>Slack: Post status page link
+    end
+
+    Escalation->>IncidentDB: Update: escalation_level=2, war_room=channel_id
+    Note over Escalation: Auto-escalation continues every 15min until resolved
+```
+
+## Caching Strategy
+
+| Layer | What's Cached | TTL | Invalidation |
+|-------|--------------|-----|-------------|
+| On-call schedule | Redis | 5 min | On schedule edit (pub/sub) |
+| Escalation policies | In-memory | 2 min | Reload on policy change |
+| Dedup correlation window | Redis (sorted set) | 1 hour | TTL-based sliding window |
+| User notification prefs | Redis | 10 min | On preference update |
+| Service→team mapping | In-memory | 5 min | Service catalog webhook |
+
+## Infrastructure Components
+
+| Component | Technology | Sizing | HA Strategy |
+|-----------|-----------|--------|-------------|
+| Alert Intake | Go service | 6 pods | Multi-AZ, stateless (this must never go down) |
+| Correlation Engine | Go + Redis | 4 pods | Redis Cluster for state |
+| Incident Store | PostgreSQL | db.r6g.xlarge | Multi-AZ RDS, point-in-time recovery |
+| On-Call Scheduler | Go service | 3 pods | Leader election for schedule computation |
+| Notification Service | Go service | 6 pods | Multi-provider (Twilio + Vonage fallback) |
+| Escalation Timer | Redis + Worker | 3 pods | Reliable delayed jobs (Redis Streams) |
+| Status Page | Static generator + CDN | - | CDN ensures uptime even during infra outage |
+| Audit Trail | Kafka → S3 | Append-only | Immutable, compliance-grade |
+
+### Reliability Design (Meta-Monitoring)
+- The incident platform itself is monitored by a SEPARATE, simpler system (heartbeat monitor)
+- Multi-provider notifications: if Twilio fails, automatically fails over to Vonage
+- Phone bridge: fallback from Zoom → phone conference bridge
+- The platform must be MORE reliable than the systems it monitors (99.999% target)
+- All state changes are idempotent (safe to retry any notification/escalation)

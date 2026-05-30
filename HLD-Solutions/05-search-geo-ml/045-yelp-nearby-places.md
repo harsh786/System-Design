@@ -85,6 +85,38 @@ Object storage (S3):       Photos, ~500 TB total
 
 ## 5. Data Modeling
 
+### Entity-Relationship Diagram
+
+```mermaid
+erDiagram
+    BUSINESSES {
+        uuid business_id PK
+        varchar name
+        geography location
+        varchar geohash
+        smallint price_level
+        decimal rating_avg
+        integer rating_count
+    }
+    REVIEWS {
+        uuid review_id PK
+        uuid business_id FK
+        uuid user_id FK
+        smallint rating
+        text text
+        timestamp created_at
+    }
+    CATEGORIES {
+        integer category_id PK
+        varchar name
+        integer parent_id FK
+        smallint level
+    }
+    BUSINESSES ||--o{ REVIEWS : receives
+    CATEGORIES ||--o{ CATEGORIES : "parent of"
+    BUSINESSES }o--o{ CATEGORIES : "classified under"
+```
+
 ### Business Listing
 ```sql
 CREATE TABLE businesses (
@@ -1376,6 +1408,464 @@ Solutions:
 - Use owner-provided data (photos, menu) to infer quality
 - Display completeness as trust signal
 ```
+
+---
+
+## 15. Sequence Diagrams
+
+### 15.1 Nearby Search Request Flow
+
+```mermaid
+sequenceDiagram
+    participant Client
+    participant API as API Gateway
+    participant GeoSvc as Geo Service
+    participant H3Idx as H3 Index (Redis)
+    participant ES as Elasticsearch
+    participant Cache as Result Cache
+    participant Rank as Ranking Service
+
+    Client->>API: GET /nearby?lat=37.77&lng=-122.41&radius=2km&q=coffee
+    API->>Cache: Check cache (geohash6 + query hash)
+    alt Cache Hit
+        Cache-->>API: Cached results
+        API-->>Client: 200 OK (cached)
+    else Cache Miss
+        API->>GeoSvc: Find candidates(lat, lng, radius, query)
+        GeoSvc->>H3Idx: k_ring(h3_cell, k=2) → candidate cells
+        H3Idx-->>GeoSvc: business_ids in cells (~500 candidates)
+        GeoSvc->>ES: Bool query: geo_distance + text match "coffee"
+        ES-->>GeoSvc: Scored results (BM25 + geo decay)
+        GeoSvc->>Rank: Re-rank(results, user_context)
+        Rank-->>GeoSvc: Final ranked list (top 20)
+        GeoSvc-->>API: Ranked businesses with metadata
+        API->>Cache: Store (TTL=60s)
+        API-->>Client: 200 OK (ranked results)
+    end
+```
+
+### 15.2 Business Data Update Pipeline
+
+```mermaid
+sequenceDiagram
+    participant Owner as Business Owner
+    participant BizAPI as Business API
+    participant DB as PostgreSQL + PostGIS
+    participant CDC as CDC (Debezium)
+    participant Kafka
+    participant Indexer as Index Updater
+    participant ES as Elasticsearch
+    participant H3Idx as H3 Index (Redis)
+    participant Cache as Result Cache
+
+    Owner->>BizAPI: Update hours / Add photos
+    BizAPI->>DB: UPDATE businesses SET ... WHERE id=123
+    DB->>CDC: WAL change event
+    CDC->>Kafka: business.updated {id:123, fields:[hours,photos]}
+    Kafka->>Indexer: Consume event
+    Indexer->>DB: Fetch full business record
+    DB-->>Indexer: Business data + geometry
+    par Update Search Index
+        Indexer->>ES: Partial update doc 123
+    and Update Geo Index
+        Indexer->>H3Idx: Update H3 cell membership (if location changed)
+    and Invalidate Cache
+        Indexer->>Cache: DEL keys matching business 123's geohash region
+    end
+    Indexer-->>Kafka: Commit offset
+```
+
+### 15.3 Real-time Open/Closed Status Check
+
+```mermaid
+sequenceDiagram
+    participant Client
+    participant API as API Gateway
+    participant StatusSvc as Status Service
+    participant Redis as Redis (Open Status Cache)
+    participant Schedule as Schedule DB
+
+    Client->>API: GET /business/123/status
+    API->>StatusSvc: getStatus(business_id=123)
+    StatusSvc->>Redis: GET status:123
+    alt Fresh in cache
+        Redis-->>StatusSvc: {open: true, closes_at: "22:00"}
+        StatusSvc-->>API: Open (closes in 2h)
+    else Stale/Missing
+        StatusSvc->>Schedule: Query hours for today + exceptions
+        Schedule-->>StatusSvc: Mon-Fri 7:00-22:00, no exceptions
+        StatusSvc->>Redis: SET status:123 {open:true} EX 60
+        StatusSvc-->>API: Open (closes in 2h)
+    end
+    API-->>Client: 200 {is_open: true, closes_at: "22:00 PST"}
+```
+
+---
+
+## 16. Deep Dive: Geospatial Indexing Algorithms
+
+### 16.1 Quadtree (Detailed Step-by-Step)
+
+**What it is**: A tree data structure where each internal node has exactly 4 children, recursively subdividing a 2D space into four quadrants (NW, NE, SW, SE).
+
+**How it works - Step by Step:**
+
+1. Start with the entire map as a single rectangle (root node)
+2. Set a capacity threshold (e.g., max 50 points per leaf)
+3. When a leaf exceeds capacity, split it into 4 equal quadrants
+4. Redistribute points into appropriate child quadrants
+5. Repeat recursively - dense areas get many levels of splits
+
+**Visual example - San Francisco area:**
+```
+Level 0: Entire Bay Area (one big square)
+┌─────────────────────┐
+│                     │
+│    •••  (SF dense)  │
+│   ••••••            │
+│   •••••             │
+│        •  (Oakland) │
+│                     │
+└─────────────────────┘
+
+Level 1: Split into 4 (SF quadrant is over capacity)
+┌──────────┬──────────┐
+│ NW       │ NE       │
+│ •••      │          │
+│ ••••••   │          │
+├──────────┼──────────┤
+│ SW       │ SE       │
+│ •••••    │ •        │
+│          │          │
+└──────────┴──────────┘
+
+Level 2: NW quadrant splits again (still dense)
+┌────┬─────┬──────────┐
+│NW.NW│NW.NE│          │
+│ ••  │ •   │          │
+├────┼─────┤          │
+│NW.SW│NW.SE│          │
+│•••• │ ••  │          │
+├──────────┼──────────┤
+│          │          │
+└──────────┴──────────┘
+```
+
+**Insertion Algorithm (Pseudocode):**
+```python
+class QuadTree:
+    def __init__(self, boundary, capacity=50):
+        self.boundary = boundary  # Rectangle(x, y, width, height)
+        self.capacity = capacity
+        self.points = []
+        self.divided = False
+        self.nw = self.ne = self.sw = self.se = None
+
+    def insert(self, point):
+        # 1. Check if point is within this node's boundary
+        if not self.boundary.contains(point):
+            return False
+
+        # 2. If leaf has space, add here
+        if len(self.points) < self.capacity and not self.divided:
+            self.points.append(point)
+            return True
+
+        # 3. Subdivide if not already done
+        if not self.divided:
+            self._subdivide()
+            # Redistribute existing points
+            for p in self.points:
+                self._insert_into_child(p)
+            self.points = []
+
+        # 4. Insert into appropriate child
+        return self._insert_into_child(point)
+
+    def _subdivide(self):
+        x, y, w, h = self.boundary
+        hw, hh = w/2, h/2
+        self.nw = QuadTree(Rectangle(x, y+hh, hw, hh), self.capacity)
+        self.ne = QuadTree(Rectangle(x+hw, y+hh, hw, hh), self.capacity)
+        self.sw = QuadTree(Rectangle(x, y, hw, hh), self.capacity)
+        self.se = QuadTree(Rectangle(x+hw, y, hw, hh), self.capacity)
+        self.divided = True
+```
+
+**Range Query Algorithm (find all points within radius):**
+```python
+def range_query(self, center, radius):
+    results = []
+
+    # 1. If this node's boundary doesn't intersect the search circle, skip
+    if not self.boundary.intersects_circle(center, radius):
+        return results
+
+    # 2. Check points in this node
+    for point in self.points:
+        if distance(point, center) <= radius:
+            results.append(point)
+
+    # 3. Recurse into children
+    if self.divided:
+        results += self.nw.range_query(center, radius)
+        results += self.ne.range_query(center, radius)
+        results += self.sw.range_query(center, radius)
+        results += self.se.range_query(center, radius)
+
+    return results
+```
+
+**Complexity Analysis:**
+| Operation | Average | Worst Case |
+|-----------|---------|------------|
+| Point Insert | O(log n) | O(n) - all points in one quadrant |
+| Range Query | O(√n + k) | O(n) - range covers all quadrants |
+| Space | O(n) | O(n · depth) with deep splits |
+| Delete | O(log n) | O(n) |
+
+**Pros:**
+- Dynamic: adapts to uneven distribution (dense cities get more splits)
+- No predetermined grid resolution needed
+- Efficient for in-memory spatial indexing
+- Good for datasets that change frequently
+
+**Cons:**
+- Not cache-friendly (pointer-heavy tree structure)
+- Hard to distribute across machines (tree structure is inherently centralized)
+- Deep recursion for highly clustered data
+- No natural mapping to 1D keys (hard to use with B-tree databases)
+
+---
+
+### 16.2 Geohash (Detailed Step-by-Step)
+
+**What it is**: A geocoding system that encodes geographic coordinates into a short string by interleaving latitude/longitude bits and base32-encoding the result.
+
+**Step-by-Step Encoding of (37.7749, -122.4194) (San Francisco):**
+
+```
+Step 1: Define ranges
+  Latitude range:  [-90, 90]
+  Longitude range: [-180, 180]
+
+Step 2: Binary subdivision of LONGITUDE (-122.4194)
+  [-180, 180] → midpoint 0 → -122.4194 < 0 → bit = 0, range = [-180, 0]
+  [-180, 0]   → midpoint -90 → -122.4194 < -90 → bit = 0, range = [-180, -90]
+  [-180, -90] → midpoint -135 → -122.4194 > -135 → bit = 1, range = [-135, -90]
+  [-135, -90] → midpoint -112.5 → -122.4194 < -112.5 → bit = 0, range = [-135, -112.5]
+  [-135, -112.5] → midpoint -123.75 → -122.4194 > -123.75 → bit = 1, range = [-123.75, -112.5]
+  ... continue for desired precision
+
+  Longitude bits: 0 0 1 0 1 0 0 1 0 0 1 1 0 0 0 ...
+
+Step 3: Binary subdivision of LATITUDE (37.7749)
+  [-90, 90]  → midpoint 0 → 37.7749 > 0 → bit = 1, range = [0, 90]
+  [0, 90]    → midpoint 45 → 37.7749 < 45 → bit = 0, range = [0, 45]
+  [0, 45]    → midpoint 22.5 → 37.7749 > 22.5 → bit = 1, range = [22.5, 45]
+  [22.5, 45] → midpoint 33.75 → 37.7749 > 33.75 → bit = 1, range = [33.75, 45]
+  [33.75, 45] → midpoint 39.375 → 37.7749 < 39.375 → bit = 0, range = [33.75, 39.375]
+  ... continue
+
+  Latitude bits: 1 0 1 1 0 0 1 1 0 1 0 0 1 0 0 ...
+
+Step 4: INTERLEAVE bits (longitude at even positions, latitude at odd)
+  Combined: 01 00 11 01 10 00 01 11 00 01 10 01 10 00 00 ...
+  Grouped (5 bits each): 01001 10110 00011 10001 10011 00000 ...
+
+Step 5: Base32 encode (0-9, b-z excluding a,i,l,o)
+  01001 = 9
+  10110 = q
+  00011 = 3
+  ...
+  Result: "9q8yy" (5-char geohash for SF)
+```
+
+**Precision Levels:**
+| Characters | Cell Width | Cell Height | Use Case |
+|-----------|-----------|------------|----------|
+| 1 | 5,000 km | 5,000 km | Planet-level |
+| 2 | 1,250 km | 625 km | Country |
+| 3 | 156 km | 156 km | State |
+| 4 | 39.1 km | 19.5 km | City |
+| 5 | 4.9 km | 4.9 km | Neighborhood |
+| 6 | 1.2 km | 0.61 km | Street group |
+| 7 | 153 m | 153 m | Block |
+| 8 | 38 m | 19 m | Building |
+
+**Why prefix matching works:**
+- All locations sharing the prefix "9q8y" are within the same ~5km cell
+- Longer shared prefix = closer together
+- DB query: `SELECT * FROM places WHERE geohash LIKE '9q8yy%'` returns all places in that cell
+
+**Edge Case: Boundary Problem**
+```
+┌──────┬──────┐
+│9q8yz │9q8zp │   Points A and B are 10m apart
+│      │      │   but in DIFFERENT geohash cells!
+│   A● │●B    │   They share NO prefix.
+│      │      │
+└──────┴──────┘
+```
+
+**Solution: Query all 8 neighboring cells**
+```python
+def nearby_search(lat, lng, precision=6):
+    center_hash = geohash.encode(lat, lng, precision)
+    neighbors = geohash.neighbors(center_hash)  # 8 surrounding cells
+    all_cells = [center_hash] + neighbors  # 9 cells total
+
+    # Query all 9 cells
+    results = db.query(
+        "SELECT * FROM places WHERE geohash IN %s", all_cells
+    )
+    # Post-filter by exact distance
+    return [p for p in results if haversine(lat, lng, p.lat, p.lng) <= radius]
+```
+
+**Why geohash is DB-friendly:**
+- Stored as a simple string column
+- B-tree index supports prefix queries efficiently
+- `WHERE geohash >= '9q8yy' AND geohash < '9q8yz'` uses index scan
+- Easy to adjust precision by truncating the string
+- Works with ANY database (no special extensions needed)
+
+---
+
+### 16.3 H3 (Uber's Hexagonal Hierarchical Spatial Index)
+
+**Why hexagons are better than squares:**
+```
+Square grid problem:           Hexagon grid solution:
+┌───┬───┬───┐                  ╱╲   ╱╲   ╱╲
+│ d │ 1 │ d │  d = diagonal   ╱  ╲ ╱  ╲ ╱  ╲
+│=√2│   │=√2│  distance       │ 1  │ 1  │ 1  │
+├───┼───┼───┤  varies!        ╲  ╱ ╲  ╱ ╲  ╱
+│ 1 │ ● │ 1 │                  ╲╱ 1 ╲╱ 1 ╲╱
+├───┼───┼───┤                  ╱╲   ╱╲   ╱╲
+│ d │ 1 │ d │                 │ 1  │ 1  │ 1  │
+└───┴───┴───┘                  ╲  ╱ ╲  ╱ ╲  ╱
+
+Square: 4 neighbors at distance 1,     Hexagon: ALL 6 neighbors at
+        4 neighbors at distance √2              uniform distance!
+```
+
+- No diagonal distortion: all 6 neighbors are equidistant
+- Better approximation of circles (hexagon ≈ circle)
+- Fewer edge effects in spatial aggregation
+
+**Resolution levels:**
+| Resolution | Avg Area | Edge Length | Use Case |
+|-----------|----------|-------------|----------|
+| 0 | 4,357,449 km² | 1,108 km | Continental |
+| 4 | 1,770 km² | 22.6 km | Metropolitan |
+| 7 | 5.16 km² | 1.22 km | City district |
+| 8 | 0.74 km² | 461 m | Neighborhood |
+| 9 | 0.105 km² | 174 m | Block-level |
+| 10 | 0.015 km² | 66 m | Building |
+| 12 | 0.0003 km² | 9.4 m | Precise |
+
+**How to use H3:**
+```python
+import h3
+
+# Encode a lat/lng to an H3 cell
+cell = h3.latlng_to_cell(37.7749, -122.4194, resolution=9)
+# Returns: '8928308280fffff'
+
+# Get the center of a cell
+lat, lng = h3.cell_to_latlng(cell)
+
+# K-ring: all cells within k steps
+ring_1 = h3.grid_disk(cell, k=1)  # 7 cells (center + 6 neighbors)
+ring_2 = h3.grid_disk(cell, k=2)  # 19 cells
+ring_3 = h3.grid_disk(cell, k=3)  # 37 cells
+
+# Distance between cells (in grid steps)
+dist = h3.grid_distance(cell_a, cell_b)
+```
+
+**K-ring queries for nearby search:**
+```python
+def find_nearby_drivers(rider_lat, rider_lng, max_k=5):
+    rider_cell = h3.latlng_to_cell(rider_lat, rider_lng, res=9)
+
+    for k in range(1, max_k + 1):
+        cells = h3.grid_disk(rider_cell, k)
+        drivers = redis.sunion([f"drivers:{c}" for c in cells])
+
+        if len(drivers) >= 10:  # Enough candidates
+            return rank_by_eta(drivers, rider_lat, rider_lng)
+
+    return []  # No drivers within max radius
+```
+
+**Why Uber chose H3 over geohash:**
+1. **Uniform distance**: geohash cells have unequal neighbors; H3 cells don't
+2. **Smooth expansion**: k-ring gives clean concentric rings vs. geohash's irregular neighbor patterns
+3. **No boundary artifacts**: H3 cells tessellate without gaps or overlaps
+4. **Hierarchical**: parent/child relationships enable multi-resolution analysis
+5. **Better for ride matching**: "expand search radius" maps naturally to k+1
+
+---
+
+### 16.4 R-tree / PostGIS GiST Index
+
+**How R-tree works:**
+```
+R-tree organizes spatial data using Minimum Bounding Rectangles (MBRs)
+
+Level 2 (Root):
+┌─────────────────────────────────────┐
+│  ┌─────────────┐  ┌──────────────┐ │
+│  │   MBR-A     │  │    MBR-B     │ │
+│  │  (Western)  │  │   (Eastern)  │ │
+│  └─────────────┘  └──────────────┘ │
+└─────────────────────────────────────┘
+
+Level 1:
+MBR-A contains:           MBR-B contains:
+┌─────────┐               ┌─────────┐
+│ ┌──┐┌──┐│               │ ┌──┐┌──┐│
+│ │R1││R2││               │ │R3││R4││
+│ └──┘└──┘│               │ └──┘└──┘│
+│ ┌──┐    │               │ ┌──┐    │
+│ │R3│    │               │ │R5│    │
+│ └──┘    │               │ └──┘    │
+└─────────┘               └─────────┘
+
+Level 0 (Leaf): Each R contains actual point data
+```
+
+**Query execution (ST_DWithin):**
+```sql
+-- Find all restaurants within 2km of a point
+SELECT name, ST_Distance(location, ST_MakePoint(-122.4194, 37.7749)::geography) as dist
+FROM businesses
+WHERE ST_DWithin(
+    location,
+    ST_MakePoint(-122.4194, 37.7749)::geography,
+    2000  -- 2000 meters
+)
+ORDER BY dist;
+```
+
+**How PostGIS uses GiST (Generalized Search Tree):**
+1. GiST is a generalization of B-tree that supports any indexable data type
+2. For spatial data, each node stores an MBR (bounding box)
+3. Query traversal: start at root, only descend into nodes whose MBR intersects the search area
+4. Typically eliminates 95%+ of data without reading it
+
+**When to use which:**
+| Criteria | Quadtree | Geohash | H3 | R-tree/GiST |
+|----------|----------|---------|----|----|
+| Insert | O(log n) | O(1) hash | O(1) hash | O(log n) |
+| Range query | O(√n + k) | O(prefix scan) | O(k-ring cells) | O(log n + k) |
+| Distribution | Dynamic | Fixed grid | Fixed hex grid | Dynamic |
+| Best for | In-memory real-time | DB string indexes | Ride matching, aggregation | PostGIS / complex geometry |
+| Handles polygons | No (points only) | No (points only) | Approximate | Yes (full geometry) |
+| Cache-friendly | Poor | Excellent | Good | Good (B-tree variant) |
+| Distributed | Hard | Easy (shard by prefix) | Easy (shard by cell) | Medium |
 
 ---
 

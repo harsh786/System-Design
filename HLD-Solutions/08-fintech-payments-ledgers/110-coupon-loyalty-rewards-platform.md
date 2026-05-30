@@ -59,6 +59,88 @@
 
 ## 4. Data Modeling
 
+## 4. Data Modeling
+
+### Entity-Relationship Diagram
+
+```mermaid
+erDiagram
+    campaigns ||--o{ coupons : "contains"
+    coupons ||--o{ coupon_codes : "generates"
+    coupons ||--o{ redemptions : "redeemed as"
+    coupon_codes ||--o| redemptions : "used in"
+    loyalty_accounts ||--o{ points_ledger : "logs"
+    loyalty_accounts }o--|| loyalty_tiers : "at tier"
+    earn_rules ||--o{ points_ledger : "triggers"
+    loyalty_accounts ||--|| users : "belongs to"
+
+    campaigns {
+        UUID campaign_id PK
+        UUID tenant_id
+        VARCHAR campaign_name
+        VARCHAR campaign_type
+        VARCHAR status
+        DECIMAL total_budget
+        INTEGER max_redemptions
+    }
+    coupons {
+        UUID coupon_id PK
+        UUID campaign_id FK
+        VARCHAR code
+        VARCHAR discount_type
+        DECIMAL discount_value
+        DECIMAL min_order_value
+        INTEGER global_usage_limit
+        INTEGER per_user_limit
+        BOOLEAN is_stackable
+    }
+    coupon_codes {
+        UUID code_id PK
+        UUID coupon_id FK
+        VARCHAR code
+        UUID assigned_to_user
+        BOOLEAN is_redeemed
+    }
+    redemptions {
+        UUID redemption_id PK
+        UUID coupon_id FK
+        UUID user_id
+        UUID order_id
+        DECIMAL discount_amount
+        VARCHAR status
+    }
+    loyalty_tiers {
+        UUID tier_id PK
+        VARCHAR tier_name
+        INTEGER tier_level
+        INTEGER points_threshold
+        JSONB benefits
+    }
+    loyalty_accounts {
+        UUID account_id PK
+        UUID user_id
+        UUID current_tier_id FK
+        INTEGER points_balance
+        INTEGER lifetime_points_earned
+    }
+    points_ledger {
+        UUID ledger_id PK
+        UUID account_id FK
+        VARCHAR entry_type
+        INTEGER points
+        INTEGER balance_after
+        DATE expiry_date
+        VARCHAR source_type
+    }
+    earn_rules {
+        UUID rule_id PK
+        UUID tenant_id
+        VARCHAR trigger_event
+        VARCHAR points_type
+        INTEGER points_value
+    }
+```
+
 ### Full Database Schemas
 
 ```sql
@@ -1144,3 +1226,97 @@ alerts:
 | Expiry | FIFO (oldest first) | User's choice | Fairness, prevents gaming |
 | A/B test assignment | Consistent hashing | Random | Ensures user always sees same variant |
 | Fraud detection | Real-time scoring | Batch (daily) | Prevent abuse before it happens |
+
+---
+
+## 12. Sequence Diagrams
+
+### Diagram 1: Coupon Redemption with Atomic Decrement
+
+```mermaid
+sequenceDiagram
+    participant User as Customer
+    participant API as Checkout API
+    participant Coupon as Coupon Service
+    participant Redis as Redis (Atomic Counter)
+    participant DB as Coupon DB
+    participant Kafka as Event Bus
+    participant Fraud as Fraud Check
+
+    User->>API: Apply coupon (code=SUMMER20, cart_total=2000)
+    API->>Coupon: Validate coupon (code=SUMMER20, user=U1, cart=2000)
+    
+    Coupon->>DB: GET coupon details (code=SUMMER20)
+    DB-->>Coupon: {id: C1, discount: 20%, max_uses: 1000, min_cart: 500, expires: 2024-06-30}
+    
+    Coupon->>Coupon: Validate: cart ≥ min (2000 ≥ 500 ✓), not expired ✓
+    Coupon->>Fraud: Check abuse (user=U1, coupon=SUMMER20)
+    Fraud-->>Coupon: OK (not in abuse blocklist, first use by this user)
+    
+    Coupon->>Redis: DECR coupon:SUMMER20:remaining (atomic decrement)
+    Note over Redis: Lua script: if remaining > 0 then DECR, return new_value; else return -1
+    Redis-->>Coupon: remaining=456 (was 457, decremented to 456)
+    
+    alt Decrement successful (remaining ≥ 0)
+        Coupon->>DB: INSERT redemption (coupon=C1, user=U1, order_id=pending, reserved_at=now)
+        Coupon-->>API: VALID (discount=20%, amount=400, reservation_id=RES_001, ttl=10min)
+        API-->>User: Coupon applied! -$400 discount
+        
+        Note over User,API: ... User completes checkout within 10 min ...
+        API->>Coupon: Confirm redemption (reservation=RES_001, order_id=ORD_789)
+        Coupon->>DB: UPDATE redemption SET status=CONFIRMED, order_id=ORD_789
+        Coupon->>Kafka: Publish coupon.redeemed {C1, U1, ORD_789}
+    else Already exhausted (remaining < 0)
+        Redis-->>Coupon: -1 (no stock)
+        Coupon-->>API: INVALID (reason=coupon_exhausted)
+        API-->>User: "Sorry, this coupon has been fully claimed"
+    end
+
+    Note over User,Kafka: Atomic DECR prevents overselling (1000 coupons, 1000 redemptions exactly).<br/>Reservation pattern: decrement on apply, confirm on checkout, release on timeout.<br/>If checkout abandoned: INCR to release reservation after TTL.
+```
+
+### Diagram 2: Points Accrual + FIFO Expiry
+
+```mermaid
+sequenceDiagram
+    participant User as Customer
+    participant API as Order Service
+    participant Points as Points Engine
+    participant DB as Points Ledger (Append-only)
+    participant Cron as Expiry Scheduler
+    participant Cache as Balance Cache
+    participant Notify as Notification
+
+    User->>API: Order completed (order_id=ORD_100, total=5000)
+    API->>Points: Accrue points (user=U1, order=ORD_100, amount=5000)
+    Points->>Points: Calculate: 5000 × earn_rate(2 pts/$1) = 10,000 points
+    Points->>DB: INSERT points_entry (user=U1, type=EARN, amount=10000, expiry=2025-01-15, source=ORD_100)
+    Points->>Cache: INCRBY points:U1:available 10000
+    Points->>Notify: "You earned 10,000 points! Balance: 25,000"
+    Points-->>API: Accrued (10,000 points, new_balance=25,000)
+
+    Note over User,Notify: ... Later, user redeems points ...
+
+    User->>API: Redeem 8,000 points at checkout
+    API->>Points: Debit 8,000 points (user=U1)
+    Points->>DB: SELECT earned entries ORDER BY expiry ASC (FIFO: oldest expire first)
+    DB-->>Points: [{id:P1, remaining:5000, expiry:2024-07-01}, {id:P2, remaining:10000, expiry:2024-10-01}, ...]
+    
+    Points->>Points: FIFO debit: P1(5000) + P2(3000 of 10000) = 8000
+    Points->>DB: UPDATE P1 SET remaining=0, fully_used=true
+    Points->>DB: UPDATE P2 SET remaining=7000
+    Points->>DB: INSERT points_entry (type=REDEEM, amount=-8000, refs=[P1,P2])
+    Points->>Cache: DECRBY points:U1:available 8000
+    Points-->>API: Redeemed (8,000 points, remaining=17,000)
+
+    Note over Cron,Notify: ... Nightly expiry job ...
+    Cron->>Points: Run expiry check
+    Points->>DB: SELECT entries WHERE expiry < today AND remaining > 0
+    DB-->>Points: [{id:P3, remaining:2000, expiry:yesterday}]
+    Points->>DB: UPDATE P3 SET remaining=0, expired=true
+    Points->>DB: INSERT points_entry (type=EXPIRE, amount=-2000, ref=P3)
+    Points->>Cache: DECRBY points:U1:available 2000
+    Points->>Notify: "2,000 points expired. Current balance: 15,000"
+
+    Note over User,Notify: FIFO ensures oldest points (closest to expiry) are used first.<br/>Append-only ledger maintains full audit trail.<br/>Materialized balance in cache for O(1) "check balance" queries.
+```

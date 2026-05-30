@@ -56,6 +56,41 @@
 
 ## 4. Data Modeling
 
+### Entity-Relationship Diagram
+
+```mermaid
+erDiagram
+    drivers {
+        UUID driver_id PK
+        UUID user_id FK
+        UUID vehicle_id FK
+        VARCHAR status
+        DECIMAL rating
+        UUID city_id FK
+    }
+    trips {
+        UUID trip_id PK
+        UUID rider_id FK
+        UUID driver_id FK
+        VARCHAR ride_type
+        VARCHAR status
+        DECIMAL estimated_fare
+        DECIMAL actual_fare
+        DECIMAL surge_multiplier
+    }
+    surge_zones {
+        UUID zone_id PK
+        UUID city_id FK
+        VARCHAR h3_index
+        DECIMAL surge_multiplier
+        INTEGER demand_count
+    }
+
+    drivers ||--o{ trips : "drives"
+    trips }o--|| drivers : "assigned to"
+    surge_zones }o--|| drivers : "affects pricing"
+```
+
 ### Driver Location (Redis Geo + In-Memory)
 ```
 # Redis Geo Set - indexed by H3 resolution 7 cell
@@ -1016,3 +1051,324 @@ alerts:
 | ML Models | TensorFlow Serving | ETA prediction, demand forecasting |
 | Monitoring | Prometheus + Grafana | Real-time operational metrics |
 | Map Tiles | Mapbox/HERE | CDN-served vector tiles |
+
+---
+
+## 12. Sequence Diagrams
+
+### 12.1 Ride Request + Driver Matching
+
+```mermaid
+sequenceDiagram
+    participant Rider
+    participant API Gateway
+    participant RideService
+    participant MatchingService
+    participant LocationService
+    participant Redis(GeoIndex)
+    participant Driver
+    participant Kafka
+
+    Rider->>API Gateway: POST /rides {pickup, dropoff, ride_type}
+    API Gateway->>RideService: createRideRequest(rider_id, pickup, dropoff)
+    RideService->>MatchingService: findDriver(pickup_lat_lng, ride_type)
+
+    MatchingService->>LocationService: getNearbyDrivers(lat, lng, radius=2km)
+    LocationService->>Redis(GeoIndex): GEOSEARCH drivers:active BYLONLAT lng lat BYRADIUS 2000 m
+    Redis(GeoIndex)-->>LocationService: [D-1 (800m), D-2 (1.2km), D-5 (1.8km)]
+    LocationService-->>MatchingService: 3 candidates
+
+    Note over MatchingService: Score drivers:<br/>- ETA weight: 0.4<br/>- Rating weight: 0.3<br/>- Acceptance rate: 0.2<br/>- Vehicle match: 0.1
+
+    MatchingService->>Driver: Push: "New ride request" (D-1, highest score)
+    Note over Driver: 15s timeout to accept
+
+    Driver-->>MatchingService: ACCEPT
+    MatchingService->>RideService: assignDriver(ride_id, driver=D-1)
+    RideService->>Kafka: publish("ride.matched", {ride_id, driver_id})
+    RideService-->>API Gateway: {ride_id, driver: D-1, ETA: 4min}
+    API Gateway-->>Rider: Driver assigned! ETA 4 min
+```
+
+### 12.2 Real-Time Location Tracking
+
+```mermaid
+sequenceDiagram
+    participant DriverApp
+    participant WebSocket Gateway
+    participant LocationService
+    participant Redis(GeoIndex)
+    participant Kafka
+    participant ETAService
+    participant RiderApp
+
+    loop Every 3 seconds during active ride
+        DriverApp->>WebSocket Gateway: {lat: 37.7749, lng: -122.4194, ts, heading, speed}
+        WebSocket Gateway->>LocationService: updateLocation(driver_id, coords)
+        LocationService->>Redis(GeoIndex): GEOADD drivers:active lng lat driver_id
+        LocationService->>Kafka: publish("location.update", {driver_id, coords, ride_id})
+    end
+
+    Kafka->>ETAService: consume("location.update")
+    ETAService->>ETAService: recalculate ETA (road network + traffic)
+    ETAService->>WebSocket Gateway: pushToRider(rider_id, {driver_loc, new_ETA})
+    WebSocket Gateway->>RiderApp: {driver: {lat, lng}, ETA: "2 min"}
+
+    Note over RiderApp: Map updates in real-time<br/>Smooth interpolation between points
+```
+
+### 12.3 Surge Pricing Update Cycle
+
+```mermaid
+sequenceDiagram
+    participant Cron(every 2min)
+    participant SurgeService
+    participant Redis
+    participant LocationService
+    participant DemandService
+    participant PricingService
+    participant Kafka
+
+    Cron(every 2min)->>SurgeService: calculateSurge(all_h3_cells)
+
+    loop For each H3 cell at resolution 8
+        SurgeService->>LocationService: getActiveDriverCount(h3_cell)
+        LocationService->>Redis: SCARD drivers:h3:{cell_id}
+        Redis-->>SurgeService: supply = 5
+
+        SurgeService->>DemandService: getRecentRequests(h3_cell, window=5min)
+        DemandService-->>SurgeService: demand = 12
+
+        Note over SurgeService: ratio = demand/supply = 12/5 = 2.4<br/>Apply dampening: surge = 1 + ln(ratio) = 1.88<br/>Cap at 3.0x, floor at 1.0x
+        SurgeService->>Redis: SET surge:h3:{cell_id} 1.88 EX 180
+    end
+
+    SurgeService->>Kafka: publish("surge.updated", {cells_with_multipliers})
+    Kafka->>PricingService: consume → update fare calculations
+    Note over PricingService: Next ride request in this cell<br/>gets fare × 1.88 multiplier
+```
+
+## 13. Algorithm Deep Dives
+
+### 13.1 H3 Geospatial Matching Algorithm
+
+H3 is Uber's open-source hierarchical hexagonal grid system. It divides the Earth into hexagonal cells at multiple resolutions.
+
+#### Why Hexagons?
+- **Uniform adjacency**: Every hex has exactly 6 neighbors (squares have 4 edge + 4 corner = inconsistent distances)
+- **Consistent distance**: Center-to-center distance is uniform for all neighbors
+- **Better approximation of circles**: Hex grids approximate circular search areas better than squares
+
+#### Resolution Levels Used
+| Resolution | Hex Edge Length | Use Case |
+|-----------|----------------|----------|
+| 7 | ~1.2 km | City-level surge zones |
+| 8 | ~460 m | Driver matching (primary) |
+| 9 | ~174 m | Fine-grained pickup spots |
+
+#### Step-by-Step Driver Matching with K-Ring Expansion
+
+**Scenario**: Rider requests pickup at (37.7749, -122.4194) — downtown SF
+
+**Step 1: Convert rider location to H3 cell**
+```
+rider_h3 = h3.latlng_to_cell(37.7749, -122.4194, resolution=8)
+# Result: "8828308281fffff"
+```
+
+**Step 2: Search ring 0 (the rider's own cell, ~460m radius)**
+```
+ring_0 = h3.grid_disk(rider_h3, k=0)  # Just the cell itself
+drivers_in_ring_0 = redis.smembers("drivers:h3:8828308281fffff")
+# Result: [D-1, D-7]  → 2 drivers found
+```
+
+**Step 3: Check if minimum candidates met**
+```
+MIN_CANDIDATES = 5
+if len(drivers_in_ring_0) < MIN_CANDIDATES:
+    # Expand to k=1 (6 surrounding hexagons, ~920m radius)
+    ring_1 = h3.grid_ring(rider_h3, k=1)  # Only the ring, not disk
+    for cell in ring_1:
+        drivers_in_ring_0 += redis.smembers(f"drivers:h3:{cell}")
+# Result: [D-1, D-7, D-3, D-12] → 4 drivers, still < 5
+```
+
+**Step 4: Expand to k=2 (~1.4km radius)**
+```
+ring_2 = h3.grid_ring(rider_h3, k=2)  # 12 hexagons in ring 2
+for cell in ring_2:
+    candidates += redis.smembers(f"drivers:h3:{cell}")
+# Result: [D-1, D-7, D-3, D-12, D-5, D-9, D-22] → 7 drivers ≥ 5 ✓
+```
+
+**Step 5: Score and rank candidates**
+```python
+def score_driver(driver, rider_location):
+    eta = routing_service.get_eta(driver.location, rider_location)
+    score = (
+        0.40 * normalize(1/eta) +           # Lower ETA = higher score
+        0.30 * driver.rating / 5.0 +         # Rating normalized 0-1
+        0.20 * driver.acceptance_rate +       # Historical acceptance
+        0.10 * vehicle_match_bonus            # UberX vs XL vs Black
+    )
+    return score
+
+ranked = sorted(candidates, key=score_driver, reverse=True)
+# D-1: score=0.87, D-3: score=0.82, D-7: score=0.79...
+```
+
+**Step 6: Offer ride with cascading timeout**
+```
+offer_to(D-1, timeout=15s)
+if D-1 declines/times out:
+    offer_to(D-3, timeout=12s)  # Reduce timeout for subsequent offers
+    if D-3 declines:
+        offer_to(D-7, timeout=10s)
+        if all_decline:
+            expand_to_k=3 and retry
+```
+
+**Step 7: Driver location updates maintain the index**
+```python
+# Every 4 seconds, driver app sends GPS
+def on_driver_location_update(driver_id, lat, lng):
+    new_cell = h3.latlng_to_cell(lat, lng, resolution=8)
+    old_cell = redis.get(f"driver:{driver_id}:h3_cell")
+    
+    if new_cell != old_cell:
+        redis.srem(f"drivers:h3:{old_cell}", driver_id)
+        redis.sadd(f"drivers:h3:{new_cell}", driver_id)
+        redis.set(f"driver:{driver_id}:h3_cell", new_cell)
+    
+    # Also update geo index for distance calculations
+    redis.geoadd("drivers:active", lng, lat, driver_id)
+```
+
+#### Performance Characteristics
+- **Lookup time**: O(1) per cell (Redis SET membership)
+- **K-ring expansion**: O(6k) cells per ring level
+- **Typical match**: Found within k=1 in urban areas (< 10ms)
+- **Worst case**: k=4 in suburban areas (~50ms, covers ~3.7km radius)
+
+---
+
+### 13.2 Surge Pricing Algorithm
+
+#### Purpose
+Balance supply and demand in real-time by adjusting prices to incentivize more drivers into high-demand areas.
+
+#### Step-by-Step Calculation
+
+**Step 1: Define geographic zones (H3 resolution 7)**
+Each surge zone is an H3 cell at resolution 7 (~1.2km edge), covering approximately a neighborhood.
+
+**Step 2: Measure supply and demand (every 2 minutes)**
+```python
+def calculate_zone_metrics(h3_cell, time_window=300):  # 5-min window
+    # Supply: available drivers in zone
+    supply = redis.scard(f"drivers:available:h3:{h3_cell}")
+    
+    # Demand: ride requests originating in zone in last 5 min
+    demand = redis.zcount(
+        f"requests:h3:{h3_cell}",
+        min=now() - time_window,
+        max=now()
+    )
+    
+    # Include unfulfilled demand (requests that went unmatched)
+    unfulfilled = redis.get(f"unmatched:h3:{h3_cell}:count") or 0
+    effective_demand = demand + (unfulfilled * 0.5)  # Weight unfulfilled less
+    
+    return supply, effective_demand
+```
+
+**Step 3: Compute raw ratio**
+```python
+# Example: 12 requests in 5 min, 5 available drivers
+raw_ratio = effective_demand / max(supply, 1)  # Avoid div-by-zero
+# raw_ratio = 12 / 5 = 2.4
+```
+
+**Step 4: Apply dampening function (prevent extreme spikes)**
+```python
+import math
+
+def dampened_surge(raw_ratio):
+    if raw_ratio <= 1.0:
+        return 1.0  # No surge when supply meets demand
+    
+    # Logarithmic dampening: grows slower than linear
+    surge = 1.0 + math.log(raw_ratio)
+    # For ratio 2.4: surge = 1 + ln(2.4) = 1 + 0.875 = 1.875
+    
+    # Apply bounds
+    surge = max(1.0, min(surge, 3.0))  # Cap at 3.0x
+    
+    # Round to nearest 0.1 for UX clarity
+    surge = round(surge * 10) / 10  # 1.875 → 1.9
+    
+    return surge
+
+# Result: 1.9x multiplier
+```
+
+**Step 5: Temporal smoothing (avoid flicker)**
+```python
+def smooth_surge(new_surge, h3_cell):
+    prev_surge = redis.get(f"surge:h3:{h3_cell}:prev") or 1.0
+    
+    # Exponential moving average (alpha = 0.3 for gradual changes)
+    alpha = 0.3 if new_surge > prev_surge else 0.5  # Drop faster than rise
+    smoothed = alpha * new_surge + (1 - alpha) * prev_surge
+    
+    # Example: prev=1.5, new=1.9, smoothed = 0.3*1.9 + 0.7*1.5 = 1.62
+    return round(smoothed * 10) / 10
+```
+
+**Step 6: Spatial smoothing (prevent hard boundaries)**
+```python
+def spatial_smooth(h3_cell, local_surge):
+    neighbors = h3.grid_ring(h3_cell, k=1)  # 6 neighboring cells
+    neighbor_surges = [redis.get(f"surge:h3:{n}") or 1.0 for n in neighbors]
+    
+    # Weight: 70% local, 30% average of neighbors
+    avg_neighbor = sum(neighbor_surges) / len(neighbor_surges)
+    final_surge = 0.7 * local_surge + 0.3 * avg_neighbor
+    
+    return round(final_surge * 10) / 10
+```
+
+**Step 7: Apply to fare calculation**
+```python
+def calculate_fare(base_fare, distance_km, duration_min, surge_multiplier):
+    distance_fare = distance_km * RATE_PER_KM  # e.g., $1.50/km
+    time_fare = duration_min * RATE_PER_MIN    # e.g., $0.25/min
+    
+    subtotal = base_fare + distance_fare + time_fare
+    surged_fare = subtotal * surge_multiplier
+    
+    # Example: ($2.50 + $12.00 + $5.00) * 1.9 = $37.05
+    return max(surged_fare, MINIMUM_FARE)
+```
+
+#### Real-World Example Timeline
+```
+Time    Supply  Demand  Ratio   Raw Surge  Smoothed  Displayed
+18:00   20      15      0.75    1.0x       1.0x      1.0x
+18:02   18      22      1.22    1.2x       1.1x      1.1x
+18:04   15      30      2.00    1.7x       1.3x      1.3x  ← Concert ends
+18:06   12      35      2.92    2.1x       1.5x      1.5x
+18:08   10      40      4.00    2.4x       1.8x      1.8x  ← Peak surge
+18:10   14      35      2.50    1.9x       1.8x      1.8x  ← Drivers arrive
+18:12   20      28      1.40    1.3x       1.6x      1.6x  ← Easing
+18:14   25      20      0.80    1.0x       1.3x      1.3x
+18:16   28      18      0.64    1.0x       1.2x      1.2x  ← Trailing
+18:18   30      15      0.50    1.0x       1.1x      1.0x  ← Back to normal
+```
+
+#### Anti-Gaming Measures
+1. **Driver surge chasing**: Limit visibility of surge map (show zone, not exact multiplier)
+2. **Artificial demand**: Rate-limit repeated request/cancel cycles from same user
+3. **Collusion detection**: Flag clusters of drivers who simultaneously go offline in surge zones
+4. **Rider protection**: Show upfront pricing, require explicit surge acceptance above 2.0x

@@ -114,6 +114,51 @@ Monitoring: 5 nodes (Prometheus, Grafana, Cruise Control)
 
 ## 4. Data Modeling
 
+### Entity-Relationship Diagram
+
+```mermaid
+erDiagram
+    BROKER {
+        int broker_id PK
+        string host
+        int port
+        string rack
+    }
+    TOPIC {
+        string name PK
+        int num_partitions
+        int replication_factor
+    }
+    PARTITION {
+        int partition_id PK
+        string topic_name FK
+        int leader_broker FK
+        string isr
+    }
+    CONSUMER_GROUP {
+        string group_id PK
+        string state
+    }
+    CONSUMER_OFFSET {
+        string group_id FK
+        string topic FK
+        int partition FK
+        bigint offset
+    }
+    RECORD_BATCH {
+        bigint base_offset PK
+        int partition_id FK
+        bigint producer_id
+        string compression
+    }
+
+    TOPIC ||--o{ PARTITION : divided_into
+    BROKER ||--o{ PARTITION : leads
+    PARTITION ||--o{ RECORD_BATCH : stores
+    CONSUMER_GROUP ||--o{ CONSUMER_OFFSET : tracks
+    PARTITION ||--o{ CONSUMER_OFFSET : consumed_from
+```
+
 ### Core Data Structures
 
 #### Partition Log (Append-Only Segments)
@@ -903,3 +948,103 @@ kafka_server_log_dir_offline_dirs                                     # Gauge (s
 | Consumer lag spiral | Processing falls further behind | Scale consumers; skip to latest (if acceptable) |
 | Schema incompatibility | Consumers fail to deserialize | Schema Registry compatibility checks prevent this |
 | Broker OOM | Broker crash | Tune heap, max.message.bytes, buffer sizes; restart auto-recovers |
+
+---
+
+## Sequence Diagrams
+
+### 1. Produce with Acknowledgments
+
+```mermaid
+sequenceDiagram
+    participant P as Producer
+    participant PB as Producer Buffer
+    participant Leader as Partition Leader (Broker-1)
+    participant ISR1 as ISR Replica (Broker-2)
+    participant ISR2 as ISR Replica (Broker-3)
+    participant ZK as Controller (KRaft)
+
+    P->>PB: send(topic, key, value)
+    Note over PB: Batch accumulation:<br/>linger.ms=5, batch.size=64KB<br/>Compress batch (lz4)
+
+    PB->>Leader: ProduceRequest {topic, partition, batch} (acks=all)
+    Leader->>Leader: Write to page cache + WAL segment
+
+    par Replicate to ISR
+        Leader->>ISR1: Fetch (follower pull-based replication)
+        Leader->>ISR2: Fetch
+    end
+
+    ISR1->>ISR1: Write to local log
+    ISR1-->>Leader: Fetch response (confirms offset)
+    ISR2->>ISR2: Write to local log
+    ISR2-->>Leader: Fetch response (confirms offset)
+
+    Note over Leader: All ISR confirmed<br/>(min.insync.replicas=2 satisfied)
+    Leader->>Leader: Advance high watermark
+
+    Leader-->>P: ProduceResponse {partition: 0, offset: 12847, error: none}
+
+    Note over P: Idempotent producer:<br/>PID + sequence number<br/>Broker deduplicates retries
+
+    alt Broker failure before ISR ack
+        Leader--xP: Timeout (request.timeout.ms=30s)
+        P->>P: Retry (max.retries=2147483647, idempotent)
+        P->>Leader: Same batch (same PID + seq → deduplicated)
+    end
+```
+
+### 2. Consumer Group Rebalance
+
+```mermaid
+sequenceDiagram
+    participant C1 as Consumer-1
+    participant C2 as Consumer-2
+    participant C3 as Consumer-3 (New)
+    participant GC as Group Coordinator (Broker)
+
+    Note over C1,C2: Stable state: C1=[P0,P1], C2=[P2,P3]
+
+    C3->>GC: JoinGroup {group: order-processors}
+    GC->>GC: Trigger rebalance (new member)
+
+    GC->>C1: Revoke partitions (cooperative: only P1)
+    GC->>C2: Revoke partitions (cooperative: only P3)
+
+    C1->>C1: Commit offsets for P1, stop processing P1
+    C2->>C2: Commit offsets for P3, stop processing P3
+
+    C1->>GC: SyncGroup (still owns P0)
+    C2->>GC: SyncGroup (still owns P2)
+    C3->>GC: SyncGroup (wants assignment)
+
+    Note over GC: Leader (C1) runs assignor:<br/>CooperativeSticky strategy<br/>Minimize partition movement
+
+    GC-->>C1: Assignment [P0] (kept)
+    GC-->>C2: Assignment [P2] (kept)
+    GC-->>C3: Assignment [P1, P3] (new)
+
+    C3->>GC: Fetch offsets for P1, P3
+    GC-->>C3: {P1: offset 5000, P3: offset 8200}
+    C3->>C3: Resume consuming from committed offsets
+
+    Note over C1,C3: Rebalance complete<br/>Downtime only for P1, P3 (moved partitions)<br/>P0, P2 continued processing throughout
+```
+
+### Infrastructure Components
+
+#### Load Balancer
+- **Bootstrap**: DNS round-robin or NLB for initial metadata discovery (bootstrap.servers)
+- **Steady state**: Clients connect directly to partition leaders (no LB in data path after bootstrap)
+- **Admin API**: L7 LB (ALB) in front of Kafka REST Proxy / Schema Registry for HTTP clients
+
+#### API Gateway
+- **Schema Registry**: HTTP API behind gateway with auth for schema CRUD (Avro/Protobuf/JSON Schema)
+- **REST Proxy**: For non-native clients; API gateway provides auth + rate limiting
+- **Connect API**: Kafka Connect REST API behind gateway for connector management (CRUD, status, restart)
+
+#### Cluster Infrastructure
+- **Broker sizing**: 3-node minimum (production); r6i.2xlarge (64GB RAM for page cache, NVMe for log segments)
+- **Network**: 10Gbps minimum between brokers; dedicated NICs for replication vs client traffic
+- **Storage**: NVMe SSDs, XFS filesystem, ~6TB per broker (7 days retention at 500MB/s ingest)
+- **Monitoring**: Cruise Control for partition rebalancing; Burrow for consumer lag monitoring

@@ -56,6 +56,90 @@ Alert volume:
 
 ## 4. Data Modeling — Full Schemas
 
+### Entity-Relationship Diagram
+
+```mermaid
+erDiagram
+    transaction_events ||--|| fraud_scores : "scored"
+    transaction_events ||--o| fraud_cases : "may flag"
+    fraud_cases }o--o{ suspicious_activity_reports : "included in"
+    fraud_rules ||--o{ fraud_scores : "triggers"
+    ml_models ||--o{ fraud_scores : "produces"
+    device_profiles ||--o{ transaction_events : "associated"
+    user_features ||--o{ transaction_events : "enriches"
+    fraud_graph_edges }o--o{ transaction_events : "connects"
+
+    transaction_events {
+        UUID event_id PK
+        UUID transaction_id
+        UUID user_id
+        BIGINT amount
+        VARCHAR channel
+        INET ip_address
+        VARCHAR device_id
+    }
+    fraud_scores {
+        UUID score_id PK
+        UUID transaction_id FK
+        DECIMAL overall_score
+        VARCHAR model_version
+        VARCHAR decision
+        INTEGER scoring_latency_ms
+    }
+    fraud_rules {
+        UUID rule_id PK
+        VARCHAR rule_name
+        VARCHAR rule_category
+        JSONB condition_dsl
+        VARCHAR action
+        BOOLEAN is_active
+    }
+    fraud_cases {
+        UUID case_id PK
+        UUID transaction_id FK
+        UUID user_id
+        VARCHAR priority
+        VARCHAR status
+        VARCHAR resolution
+    }
+    device_profiles {
+        VARCHAR device_id PK
+        VARCHAR fingerprint_hash
+        BOOLEAN is_emulator
+        BOOLEAN is_vpn
+        DECIMAL reputation_score
+    }
+    user_features {
+        UUID user_id PK
+        INTEGER txn_count_1h
+        BIGINT txn_amount_24h
+        INTEGER distinct_devices_30d
+        VARCHAR risk_tier
+    }
+    ml_models {
+        UUID model_id PK
+        VARCHAR model_name
+        VARCHAR model_type
+        VARCHAR version
+        VARCHAR status
+        JSONB metrics
+    }
+    suspicious_activity_reports {
+        UUID sar_id PK
+        UUID user_id
+        BIGINT total_suspicious_amount
+        VARCHAR filing_status
+    }
+    fraud_graph_edges {
+        BIGSERIAL edge_id PK
+        VARCHAR source_type
+        VARCHAR source_id
+        VARCHAR target_type
+        VARCHAR target_id
+        VARCHAR edge_type
+    }
+```
+
 ```sql
 -- Transaction Events (source of truth for scoring)
 CREATE TABLE transaction_events (
@@ -922,3 +1006,131 @@ Trace: Fraud Score Request (total: 45ms)
 | Model governance | Full audit trail: model version, features, decision |
 | Fair lending | Bias monitoring across protected classes |
 | Data retention | 5-year retention with encryption at rest |
+
+---
+
+## 12. Sequence Diagrams
+
+### Diagram 1: Real-Time Transaction Scoring
+
+```mermaid
+sequenceDiagram
+    participant PG as Payment Gateway
+    participant Fraud as Fraud Scoring API
+    participant Features as Feature Store (Redis)
+    participant Rules as Rules Engine
+    participant ML as ML Model (ONNX Runtime)
+    participant Kafka as Event Bus
+    participant DB as Decision Store
+
+    PG->>Fraud: Score transaction (amount=5000, merchant=XYZ, card=****1234)
+    Note over PG,Fraud: SLA: <100ms for decision
+
+    par Feature Enrichment (parallel lookups, 20ms budget)
+        Fraud->>Features: GET user_features (txn_count_1h, avg_amount_30d, device_fingerprint)
+        Features-->>Fraud: {txn_count_1h: 3, avg_amount: 200, device: known}
+        Fraud->>Features: GET card_features (velocity_1h, country_mismatch, bin_risk)
+        Features-->>Fraud: {velocity_1h: 4, country_match: true, bin_risk: low}
+        Fraud->>Features: GET merchant_features (chargeback_rate, category_risk)
+        Features-->>Fraud: {chargeback_rate: 0.02, category: electronics}
+    end
+
+    Fraud->>Rules: Apply deterministic rules (velocity, blocklist, amount threshold)
+    Rules-->>Fraud: Rule results: velocity_flag=true (5000 >> avg 200)
+
+    Fraud->>ML: Score feature_vector [25 features]
+    ML-->>Fraud: fraud_probability=0.73, top_factors=[amount_deviation, velocity]
+
+    Fraud->>Fraud: Combine: rules_score=0.4, ml_score=0.73 → final=0.68
+    Fraud->>Fraud: Decision: 0.68 > REVIEW_THRESHOLD(0.6) → REVIEW (not auto-decline)
+
+    Fraud->>DB: Store decision (txn_id, score=0.68, action=REVIEW, features, model_v=2.3)
+    Fraud->>Kafka: Publish fraud.decision {txn_id, action: REVIEW}
+    Fraud-->>PG: {decision: REVIEW, score: 0.68, reasons: [amount_anomaly, velocity]}
+
+    Note over PG,DB: Total latency: 45ms (within 100ms budget).<br/>REVIEW = hold for manual check or step-up authentication.
+```
+
+### Diagram 2: ML Model Retraining with Feedback Loop
+
+```mermaid
+sequenceDiagram
+    participant Ops as Fraud Analysts
+    participant Label as Labeling Service
+    participant Store as Feature Store (offline)
+    participant Train as Training Pipeline (Sagemaker)
+    participant Eval as Evaluation Service
+    participant Shadow as Shadow Scoring
+    participant Deploy as Model Registry
+    participant Prod as Production Model
+
+    Ops->>Label: Label transaction outcomes (fraud=true/false)
+    Note over Ops,Label: Sources: chargebacks (30d delayed), manual review, customer reports
+    
+    Label->>Store: Store labeled data (features + outcome)
+    Store-->>Train: Training dataset (6 months, 10M transactions, 0.1% fraud)
+    
+    Train->>Train: Train XGBoost + Neural ensemble
+    Train->>Train: Handle class imbalance (SMOTE + cost-sensitive learning)
+    Train->>Eval: Submit candidate model v2.4
+    
+    Eval->>Eval: Evaluate on holdout set (last 2 weeks)
+    Eval->>Eval: Metrics: precision=0.85, recall=0.78, F1=0.81
+    Eval->>Eval: Compare vs production v2.3: F1 improved +0.03
+    Eval->>Eval: Check fairness metrics (demographic parity across segments)
+    Eval->>Eval: Check calibration (predicted 0.7 → actual 70% fraud?)
+    
+    alt Model passes all checks
+        Eval->>Shadow: Deploy v2.4 as shadow model
+        Shadow->>Shadow: Score 100% traffic with v2.4 (no action taken)
+        Shadow->>Shadow: After 7 days: compare decisions vs v2.3
+        Shadow->>Eval: Shadow results: fewer false positives, same catch rate
+        Eval->>Deploy: Promote v2.4 to production
+        Deploy->>Prod: Canary deploy (10% traffic → 50% → 100%)
+    else Model fails evaluation
+        Eval->>Train: Reject: recall dropped on emerging fraud pattern
+        Train->>Train: Investigate, add new features, retrain
+    end
+
+    Note over Ops,Prod: Full cycle: 2-4 weeks. Shadow period prevents regression.<br/>Never deploy without A/B comparison against production model.
+```
+
+### Infrastructure Components
+
+```
+┌─────────────────────────────────────────────────────────────┐
+│ FRAUD DETECTION INFRASTRUCTURE                               │
+├─────────────────────────────────────────────────────────────┤
+│                                                              │
+│ REAL-TIME SCORING PATH (<100ms):                             │
+│ ├── Scoring API: 20 pods (4 CPU, 8GB) — CPU-bound inference │
+│ ├── ONNX Runtime: GPU-free inference (quantized INT8 model)  │
+│ ├── Feature Store: Redis Cluster (12 nodes, 200GB total)     │
+│ │   └── Pre-computed features updated by Flink (real-time)   │
+│ ├── Rules Engine: Drools/custom (in-process, <5ms)           │
+│ └── Circuit breaker: Default APPROVE if scoring unavailable  │
+│                                                              │
+│ STREAM PROCESSING:                                           │
+│ ├── Apache Flink (8 task managers, 32GB each)                │
+│ ├── Jobs: velocity computation, device graph, feature update │
+│ ├── Windows: Sliding (1min, 1hr, 24hr) per entity            │
+│ └── State backend: RocksDB (survives restart)                │
+│                                                              │
+│ ML PLATFORM:                                                 │
+│ ├── SageMaker: Training (GPU instances, spot for cost)       │
+│ ├── MLflow: Experiment tracking, model registry              │
+│ ├── Feature Store (offline): S3 + Athena for training data   │
+│ └── A/B framework: Shadow mode + canary deployment           │
+│                                                              │
+│ GRAPH DATABASE:                                              │
+│ ├── Neo4j/Neptune: Entity relationships (device→user→card)   │
+│ ├── Use: Ring detection, account takeover patterns           │
+│ └── Updated: Near-real-time from Kafka events                │
+│                                                              │
+│ CASE MANAGEMENT:                                             │
+│ ├── Internal tool for fraud analysts                         │
+│ ├── Queue: prioritized by score × amount                     │
+│ └── Feedback: analyst decisions → labeling → retraining      │
+│                                                              │
+└─────────────────────────────────────────────────────────────┘
+```

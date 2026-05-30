@@ -103,6 +103,37 @@ Internal (fan-out events): 7,000 follows/sec × 500B event = 3.5 MB/s
 
 ## 5. Data Modeling
 
+### Entity-Relationship Diagram
+
+```mermaid
+erDiagram
+    FOLLOWING {
+        bigint user_id PK
+        bigint followee_id PK
+        timestamp followed_at
+        tinyint status
+    }
+    FOLLOWERS {
+        bigint user_id PK
+        bigint follower_id PK
+        timestamp followed_at
+        tinyint status
+    }
+    FOLLOW_STATE {
+        bigint follower_id PK
+        bigint followee_id PK
+        tinyint status
+    }
+    PENDING_REQUESTS {
+        bigint user_id PK
+        bigint requester_id PK
+        timestamp requested_at
+    }
+    FOLLOWING ||--|| FOLLOW_STATE : "lookup"
+    FOLLOWERS ||--|| FOLLOW_STATE : "reverse lookup"
+    PENDING_REQUESTS }o--|| FOLLOW_STATE : "becomes"
+```
+
 ### 5.1 Primary Schema (Cassandra / ScyllaDB)
 
 ```sql
@@ -1252,4 +1283,101 @@ alerts:
 | Analytics Store | ClickHouse | Historical follow metrics |
 | Fan-out | Custom service | Hybrid push/pull, < 5s delivery |
 | Suggestions | ML + Graph | 50 candidates/user, 24h refresh |
+
+---
+
+## Sequence Diagrams
+
+### 1. Follow + Fanout List Update
+
+```mermaid
+sequenceDiagram
+    participant U as User A
+    participant API as API Gateway
+    participant FS as Follow Service
+    participant GS as Graph Store (Cassandra)
+    participant RC as Redis Cache
+    participant K as Kafka
+    participant FO as Fanout Service
+    participant NS as Notification Service
+
+    U->>API: POST /follow {target_user_id}
+    API->>FS: follow(follower=user_a, followee=user_b)
+    FS->>GS: checkExisting(user_a, user_b)
+
+    alt Not already following
+        FS->>GS: INSERT following:{user_a} -> user_b
+        FS->>GS: INSERT followers:{user_b} -> user_a
+        FS->>RC: INCR following_count:{user_a}
+        FS->>RC: INCR follower_count:{user_b}
+        FS->>K: publish FollowCreated {follower, followee, timestamp}
+
+        par Update fanout lists
+            K->>FO: addToFanoutList(user_b, user_a)
+            Note over FO: user_a now receives user_b's posts
+            FO->>RC: SADD fanout_targets:{user_b} user_a
+        and Notify followee
+            K->>NS: notify user_b "user_a followed you"
+        and Update suggestions
+            K->>FO: recomputeSuggestions(user_a)
+        end
+
+        FS-->>API: 200 OK {following: true}
+    else Already following
+        FS-->>API: 200 OK {following: true, no_op: true}
+    end
+```
+
+### 2. Block/Mute + Feed Filtering
+
+```mermaid
+sequenceDiagram
+    participant U as User A
+    participant API as API Gateway
+    participant BS as Block Service
+    participant GS as Graph Store
+    participant RC as Redis
+    participant K as Kafka
+    participant FS as Feed Service
+    participant FO as Fanout Service
+
+    U->>API: POST /block {target_user_id: user_b}
+    API->>BS: block(user_a, user_b)
+
+    BS->>GS: INSERT blocks:{user_a} -> user_b
+    BS->>RC: SADD blocked_users:{user_a} user_b
+    BS->>K: publish UserBlocked {blocker: user_a, blocked: user_b}
+
+    par Remove existing relationship
+        K->>GS: DELETE following:{user_a} -> user_b (if exists)
+        K->>GS: DELETE followers:{user_a} <- user_b (if exists)
+        K->>RC: SREM fanout_targets:{user_b} user_a
+        K->>RC: SREM fanout_targets:{user_a} user_b
+    and Purge from feeds
+        K->>FS: removeFromFeed(user_a, all_posts_by_user_b)
+        FS->>RC: ZREM feed:{user_a} [user_b_post_ids]
+    and Update feed filter
+        K->>FO: addToBlockFilter(user_a, user_b)
+        Note over FO: All future fanout checks blocked_users set
+    end
+
+    BS-->>API: 200 OK
+
+    Note over FS: On every feed read, apply filter:
+    Note over FS: SDIFF candidate_posts blocked_users:{viewer}
+```
+
+---
+
+## Infrastructure Components
+
+| Component | Technology | Purpose |
+|-----------|-----------|---------|
+| CDN | CloudFront | Profile images, static follower pages |
+| Load Balancer | AWS NLB + ALB | gRPC (internal) + HTTP (external) routing |
+| API Gateway | Envoy | Rate limiting, auth, circuit breaking |
+| Graph Store | Cassandra (adjacency lists) | Billion-edge follow graph, partition by user |
+| Cache Layer | Redis Cluster (64 shards) | Follower/following sets, counters, block lists |
+| Stream Processing | Kafka + Flink | Follow events, counter sync, spam detection |
+| Batch Compute | Spark GraphX | Weekly PageRank, community detection, who-to-follow |
 

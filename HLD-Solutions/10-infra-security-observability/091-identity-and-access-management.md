@@ -45,6 +45,91 @@
 
 ## 3. Data Modeling
 
+### Entity-Relationship Diagram
+
+```mermaid
+erDiagram
+    USERS {
+        uuid user_id PK
+        uuid org_id
+        string username
+        string email
+        string status
+        string user_type
+    }
+    GROUPS {
+        uuid group_id PK
+        uuid org_id
+        string name
+        uuid parent_group_id FK
+    }
+    GROUP_MEMBERSHIPS {
+        uuid group_id FK
+        uuid user_id FK
+        string membership_type
+    }
+    ROLES {
+        uuid role_id PK
+        uuid org_id
+        string name
+        string role_type
+        jsonb permissions
+    }
+    ROLE_ASSIGNMENTS {
+        uuid assignment_id PK
+        uuid role_id FK
+        string principal_type
+        uuid principal_id
+    }
+    POLICIES {
+        uuid policy_id PK
+        uuid org_id
+        string name
+        string policy_type
+        jsonb statements
+    }
+    POLICY_ATTACHMENTS {
+        uuid attachment_id PK
+        uuid policy_id FK
+        string target_type
+        string target_id
+    }
+    SESSIONS {
+        uuid session_id PK
+        uuid user_id FK
+        string auth_method
+        timestamp expires_at
+    }
+    API_KEYS {
+        uuid key_id PK
+        uuid owner_id FK
+        string name
+        string key_hash
+    }
+    AUDIT_LOG {
+        uuid event_id
+        uuid actor_id
+        string event_type
+        string action
+        string result
+    }
+    MFA_DEVICES {
+        uuid device_id PK
+        uuid user_id FK
+        string device_type
+        string device_name
+    }
+
+    USERS ||--o{ GROUP_MEMBERSHIPS : "belongs to"
+    GROUPS ||--o{ GROUP_MEMBERSHIPS : "contains"
+    GROUPS ||--o| GROUPS : "parent"
+    ROLES ||--o{ ROLE_ASSIGNMENTS : "assigned via"
+    POLICIES ||--o{ POLICY_ATTACHMENTS : "attached via"
+    USERS ||--o{ SESSIONS : "has"
+    USERS ||--o{ API_KEYS : "owns"
+    USERS ||--o{ MFA_DEVICES : "registers"
+```
+
 ### Database Schemas
 
 ```sql
@@ -1291,3 +1376,243 @@ Total: ~8.2s (user interaction time dominant)
 - GDPR: Right to erasure includes all session data, audit pseudonymization
 - SOC2: Immutable audit trail, access reviews, key rotation evidence
 - FedRAMP: FIPS 140-2 crypto, continuous monitoring, incident response SLA
+
+---
+
+## 12. Sequence Diagrams
+
+### Login + MFA + Token Issuance
+
+```mermaid
+sequenceDiagram
+    participant U as User/Client
+    participant GW as API Gateway
+    participant Auth as Auth Service
+    participant MFA as MFA Service
+    participant Store as User Store (DB)
+    participant Cache as Redis (Session)
+    participant HSM as HSM (Key Signing)
+
+    U->>GW: POST /auth/login {email, password}
+    GW->>Auth: Forward credentials
+    Auth->>Store: Lookup user by email
+    Store-->>Auth: User record + hashed password
+    Auth->>Auth: bcrypt.compare(password, hash) [constant-time]
+    alt Invalid credentials
+        Auth->>Store: Increment failed_attempts
+        Auth-->>GW: 401 Unauthorized
+        GW-->>U: 401 + rate-limit headers
+    end
+    Auth->>MFA: Check MFA enrollment for user
+    MFA-->>Auth: MFA required (TOTP enrolled)
+    Auth->>Cache: Store partial session {state: awaiting_mfa, ttl: 5min}
+    Auth-->>GW: 200 {mfa_required: true, session_token}
+    GW-->>U: MFA challenge
+
+    U->>GW: POST /auth/mfa/verify {session_token, totp_code}
+    GW->>Auth: Verify MFA
+    Auth->>Cache: Retrieve partial session
+    Auth->>MFA: Validate TOTP code (time-window ±1)
+    MFA-->>Auth: Valid
+    Auth->>HSM: Sign JWT (RS256, kid rotation)
+    HSM-->>Auth: Signed access_token + refresh_token
+    Auth->>Cache: Store session {user_id, device_fp, refresh_token_hash}
+    Auth->>Store: Record login event (audit)
+    Auth-->>GW: 200 {access_token, refresh_token, expires_in}
+    GW-->>U: Tokens issued
+```
+
+### API Authorization Check
+
+```mermaid
+sequenceDiagram
+    participant C as Client
+    participant GW as API Gateway
+    participant AuthZ as Authorization Service
+    participant PolicyCache as Policy Cache (Redis)
+    participant PolicyStore as Policy Store (DB)
+    participant AuditLog as Audit Log (Kafka)
+
+    C->>GW: GET /api/resource/123 [Bearer token]
+    GW->>GW: Validate JWT signature (cached JWKS)
+    GW->>GW: Check token expiry, extract claims
+    GW->>AuthZ: Authorize(user_id, action:read, resource:123)
+    AuthZ->>PolicyCache: Lookup cached decision (user+action+resource hash)
+    alt Cache hit (TTL < 60s for security)
+        PolicyCache-->>AuthZ: ALLOW/DENY
+    else Cache miss
+        AuthZ->>PolicyStore: Fetch user roles + resource policies
+        PolicyStore-->>AuthZ: Roles[], Policies[]
+        AuthZ->>AuthZ: Evaluate RBAC (role→permissions)
+        AuthZ->>AuthZ: Evaluate ABAC (attributes match conditions)
+        AuthZ->>AuthZ: Combine: deny-overrides strategy
+        AuthZ->>PolicyCache: Cache decision {ttl: 30s}
+    end
+    AuthZ->>AuditLog: Emit decision event (async)
+    AuthZ-->>GW: ALLOW
+    GW->>GW: Forward to upstream service
+    GW-->>C: 200 + resource data
+```
+
+### Token Refresh + Rotation
+
+```mermaid
+sequenceDiagram
+    participant C as Client
+    participant GW as API Gateway
+    participant Auth as Auth Service
+    participant Cache as Redis (Session)
+    participant HSM as HSM
+    participant AuditLog as Audit Log
+
+    C->>GW: POST /auth/refresh {refresh_token}
+    GW->>Auth: Forward refresh request
+    Auth->>Cache: Lookup refresh_token_hash
+    alt Token not found (revoked or expired)
+        Auth-->>GW: 401 Invalid refresh token
+        GW-->>C: 401 → force re-login
+    end
+    Cache-->>Auth: Session {user_id, device_fp, token_family}
+    Auth->>Auth: Validate token_family (detect reuse)
+    alt Refresh token reuse detected (replay attack)
+        Auth->>Cache: Revoke ALL tokens in family
+        Auth->>AuditLog: Security event: token reuse
+        Auth-->>GW: 401 + force re-login all devices
+        GW-->>C: 401 Security violation
+    end
+    Auth->>HSM: Sign new access_token + new refresh_token
+    HSM-->>Auth: New token pair
+    Auth->>Cache: Rotate: invalidate old refresh, store new {ttl: 7d}
+    Auth->>AuditLog: Token rotation event (async)
+    Auth-->>GW: 200 {access_token, refresh_token, expires_in}
+    GW-->>C: New tokens (old refresh now invalid)
+```
+
+## 13. Caching Strategy
+
+### Multi-Layer Cache Architecture
+
+| Layer | What's Cached | TTL | Invalidation |
+|-------|--------------|-----|-------------|
+| Gateway (local) | JWKS public keys | 5 min | Polling + webhook on rotation |
+| Redis Cluster | Session data, refresh tokens | 7 days | Explicit revocation |
+| Redis Cluster | Policy evaluation decisions | 30-60s | Short TTL (security tradeoff) |
+| Redis Cluster | User profile + roles | 2 min | Event-driven (user.updated) |
+| Application (in-memory) | Compiled policy rules | 30s | Watcher on policy store |
+
+### Cache Consistency for Security
+- **Fail-closed on cache miss**: If Redis is unreachable, deny access (never allow stale positive decisions)
+- **Bounded staleness**: Policy cache TTL ≤ 60s ensures revocations propagate within 1 minute
+- **Token revocation**: Maintain a bloom filter of revoked token JTIs (space-efficient, no false negatives on check)
+- **Cache stampede prevention**: Probabilistic early expiration + single-flight for policy reloads
+
+## 14. Async Processing
+
+### Event-Driven Flows
+- **Audit logging**: All auth decisions published to Kafka (async, non-blocking to request path)
+- **Session cleanup**: Background worker expires stale sessions every 5 minutes
+- **Credential stuffing detection**: Async pipeline aggregates login attempts → ML scoring → block IP/device
+- **Key rotation**: Scheduled async job rotates signing keys (new key active, old key valid for token lifetime)
+- **Webhook delivery**: Federation events (SCIM provisioning) delivered async with retry + DLQ
+
+### Exactly-Once Guarantees
+- Audit events use Kafka idempotent producer (sequence numbers per partition)
+- Token revocation propagation uses compare-and-swap on Redis to prevent double-processing
+
+## 15. Infrastructure Components
+
+| Component | Technology | Sizing | HA Strategy |
+|-----------|-----------|--------|-------------|
+| Auth Service | Go microservice | 8 pods, 2 vCPU/4GB each | Multi-AZ, rolling deploys |
+| Policy Engine | OPA sidecar | Co-located with Auth pods | Bundle sync from S3 |
+| Session Store | Redis Cluster (6 nodes) | 64GB total | 3 masters + 3 replicas, auto-failover |
+| User Store | PostgreSQL (RDS) | db.r6g.2xlarge | Multi-AZ, read replicas |
+| HSM | AWS CloudHSM | 2 HSMs in cluster | Cross-AZ, automatic failover |
+| Audit Pipeline | Kafka (MSK) | 6 brokers, 3 AZ | Replication factor 3 |
+| API Gateway | Kong/Envoy | 6 pods | Stateless, multi-AZ |
+| Monitoring | Datadog + PagerDuty | - | - |
+
+### Deployment Topology
+- Primary region: us-east-1 (active)
+- DR region: us-west-2 (warm standby, async replication of user store)
+- Global: CloudFront for JWKS distribution (low-latency verification worldwide)
+
+## 16. Deep Dive: RBAC/ABAC Policy Evaluation Engine
+
+### Policy Language (Cedar-Style)
+
+```
+// Cedar-like policy definition
+permit(
+    principal in Group::"engineering",
+    action in [Action::"read", Action::"write"],
+    resource in Folder::"project-alpha"
+) when {
+    context.ip_address.isInRange("10.0.0.0/8") &&
+    context.time.hour >= 9 && context.time.hour <= 18 &&
+    resource.classification != "top-secret"
+};
+
+forbid(
+    principal,
+    action,
+    resource
+) when {
+    principal.risk_score > 80
+} unless {
+    context.has_step_up_auth == true
+};
+```
+
+### Policy Evaluation Algorithm (Step-by-Step)
+
+```
+FUNCTION evaluate_request(principal, action, resource, context):
+    // Step 1: Gather all applicable policies
+    applicable_policies = []
+    FOR policy IN policy_store:
+        IF matches_scope(policy, principal, action, resource):
+            applicable_policies.append(policy)
+    
+    // Step 2: Evaluate each policy's conditions
+    permits = []
+    forbids = []
+    FOR policy IN applicable_policies:
+        result = evaluate_conditions(policy.when, policy.unless, context)
+        IF result == SATISFIED:
+            IF policy.effect == PERMIT:
+                permits.append(policy)
+            ELSE:
+                forbids.append(policy)
+    
+    // Step 3: Combine using deny-overrides (default-deny)
+    IF forbids is not empty:
+        RETURN DENY (reason: first forbid policy ID)
+    IF permits is not empty:
+        RETURN ALLOW (reason: first permit policy ID)
+    RETURN DENY (reason: no applicable permit policy)
+```
+
+### Decision Tree Optimization
+
+```
+Step 1: Index policies by (action, resource_type) → O(1) lookup vs O(n) scan
+Step 2: Pre-compile "when" conditions into bytecode (evaluation in ~50μs)
+Step 3: Short-circuit: if any FORBID matches, skip remaining PERMIT evaluation
+Step 4: Cache compiled decision trees per (role, resource_type) pair
+```
+
+### Policy Evaluation Caching Strategy
+
+| Cache Key | Format | TTL | Rationale |
+|-----------|--------|-----|-----------|
+| Exact decision | `hash(principal, action, resource, context_subset)` | 30s | Fast repeat requests |
+| Role→permissions | `role:{role_id}:perms` | 2 min | Avoid DB lookup per request |
+| Resource→policies | `resource_type:{type}:policies` | 5 min | Policies change infrequently |
+| Compiled bytecode | In-memory per pod | Until policy update | Avoid recompilation |
+
+### Consistency Guarantees
+- Policy updates are **serialized** through a single-leader write path
+- Version vector attached to each policy bundle → clients reject stale bundles
+- On policy update: broadcast invalidation to all AuthZ pods via Redis Pub/Sub (< 500ms propagation)
+- **Fail-closed**: Any evaluation error → DENY (never fail-open for security systems)

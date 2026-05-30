@@ -50,6 +50,100 @@ Compute:
 
 ## 4. Data Modeling — Full Schemas
 
+### Entity-Relationship Diagram
+
+```mermaid
+erDiagram
+    products ||--o{ prices : "has"
+    customers ||--o{ subscriptions : "subscribes"
+    subscriptions ||--o{ subscription_items : "contains"
+    subscription_items }o--|| prices : "uses"
+    subscription_items ||--o{ usage_events : "meters"
+    subscriptions ||--o{ invoices : "generates"
+    invoices ||--o{ invoice_line_items : "contains"
+    invoices ||--o{ dunning_attempts : "retries"
+    invoice_line_items ||--o{ revenue_schedules : "recognizes"
+    revenue_schedules ||--o{ revenue_entries : "records"
+
+    products {
+        UUID product_id PK
+        UUID merchant_id
+        VARCHAR name
+        BOOLEAN is_active
+    }
+    prices {
+        UUID price_id PK
+        UUID product_id FK
+        VARCHAR pricing_model
+        VARCHAR billing_period
+        BIGINT unit_amount
+    }
+    customers {
+        UUID customer_id PK
+        UUID merchant_id
+        VARCHAR email
+        CHAR currency
+        BIGINT balance
+    }
+    subscriptions {
+        UUID subscription_id PK
+        UUID customer_id FK
+        VARCHAR status
+        TIMESTAMPTZ current_period_start
+        TIMESTAMPTZ current_period_end
+        BOOLEAN cancel_at_period_end
+    }
+    subscription_items {
+        UUID item_id PK
+        UUID subscription_id FK
+        UUID price_id FK
+        INTEGER quantity
+    }
+    usage_events {
+        UUID event_id PK
+        UUID subscription_item_id FK
+        BIGINT quantity
+        VARCHAR idempotency_key
+        TIMESTAMPTZ timestamp
+    }
+    invoices {
+        UUID invoice_id PK
+        UUID customer_id FK
+        UUID subscription_id FK
+        VARCHAR status
+        BIGINT total
+        BIGINT amount_due
+    }
+    invoice_line_items {
+        UUID line_item_id PK
+        UUID invoice_id FK
+        BIGINT quantity
+        BIGINT amount
+        BOOLEAN proration
+    }
+    dunning_attempts {
+        UUID attempt_id PK
+        UUID invoice_id FK
+        SMALLINT attempt_number
+        VARCHAR status
+        VARCHAR failure_code
+    }
+    revenue_schedules {
+        UUID schedule_id PK
+        UUID invoice_line_item_id FK
+        BIGINT total_amount
+        BIGINT recognized_amount
+        VARCHAR recognition_method
+    }
+    revenue_entries {
+        BIGSERIAL entry_id PK
+        UUID schedule_id FK
+        DATE period
+        BIGINT amount
+        VARCHAR entry_type
+    }
+```
+
 ```sql
 -- Products & Pricing
 CREATE TABLE products (
@@ -1168,3 +1262,91 @@ def calculate_proration(old_price, new_price, change_date,
 - **Payment collection**: Rate-limited to PSP capacity, spread over hours
 - **Database**: Shard by merchant_id (multi-tenant isolation)
 - **Flink**: Horizontal scaling by adding task managers
+
+---
+
+## 12. Sequence Diagrams
+
+### Diagram 1: Invoice Generation Cycle
+
+```mermaid
+sequenceDiagram
+    participant Cron as Billing Clock
+    participant BillGen as Invoice Generator
+    participant Usage as Usage Aggregator
+    participant Meter as Metering Store (Flink)
+    participant DB as Billing DB
+    participant Tax as Tax Service
+    participant Kafka as Event Bus
+    participant PDF as PDF Renderer
+
+    Cron->>BillGen: Trigger billing run (period=2024-01, customer_batch=1/100)
+    BillGen->>DB: SELECT subscriptions WHERE billing_date=today AND batch=1
+    DB-->>BillGen: 5000 subscriptions to invoice
+    
+    loop For each subscription (parallelized by customer_id)
+        BillGen->>DB: GET line items (fixed recurring charges)
+        BillGen->>Usage: GET usage for period (API calls, storage, bandwidth)
+        Usage->>Meter: Query aggregated usage (customer=C1, period=Jan)
+        Meter-->>Usage: {api_calls: 1.2M, storage_gb: 50, bandwidth_gb: 200}
+        Usage-->>BillGen: Rated usage: [{item: API, qty: 1.2M, unit_price: 0.001, total: 1200}]
+        
+        BillGen->>BillGen: Apply pricing tiers (first 100K free, then $0.001/call)
+        BillGen->>BillGen: Apply discounts/credits (loyalty: -10%)
+        BillGen->>Tax: Calculate tax (jurisdiction=CA, amount=subtotal)
+        Tax-->>BillGen: {tax: 108.00, breakdown: [{type: state_sales, rate: 0.09}]}
+        
+        BillGen->>DB: INSERT invoice (customer=C1, total=1308, status=OPEN)
+        BillGen->>DB: INSERT invoice_line_items (5 items)
+        BillGen->>Kafka: Publish invoice.created {invoice_id, customer_id, amount}
+    end
+    
+    Kafka-->>PDF: Generate PDF (async, non-blocking)
+    Kafka-->>BillGen: Trigger payment collection (after invoice finalized)
+
+    Note over Cron,PDF: Idempotency: billing_period + customer_id = unique.<br/>Re-running same period produces same invoice (no duplicates).
+```
+
+### Diagram 2: Dunning / Retry on Failed Payment
+
+```mermaid
+sequenceDiagram
+    participant Sched as Dunning Scheduler
+    participant Dunning as Dunning Engine
+    participant DB as Billing DB
+    participant PG as Payment Gateway
+    participant Notify as Notification Service
+    participant Sub as Subscription Manager
+
+    Sched->>Dunning: Process failed invoices (attempt payment collection)
+    Dunning->>DB: SELECT invoices WHERE status=PAYMENT_FAILED AND next_retry <= now()
+    DB-->>Dunning: 200 invoices to retry
+    
+    loop For each invoice (rate-limited to PSP capacity)
+        Dunning->>DB: GET payment method (card on file for customer)
+        Dunning->>PG: Charge $150 (card=****4242, idempotency_key=INV_001_attempt_3)
+        
+        alt Payment succeeds
+            PG-->>Dunning: SUCCESS (charge_id=CH_789)
+            Dunning->>DB: UPDATE invoice SET status=PAID, paid_at=now()
+            Dunning->>Notify: Send receipt email
+        else Payment fails (soft decline: insufficient funds)
+            PG-->>Dunning: FAILED (reason=insufficient_funds)
+            Dunning->>Dunning: Calculate next retry (exponential backoff)
+            Note over Dunning: Retry schedule: Day 1, 3, 5, 7, 14 (smart timing: payday = 1st/15th)
+            Dunning->>DB: UPDATE invoice SET attempts=4, next_retry=+2days
+            Dunning->>Notify: Email: "Payment failed, please update card"
+        else Payment fails (hard decline: card expired)
+            PG-->>Dunning: FAILED (reason=card_expired, do_not_retry=true)
+            Dunning->>Notify: Email: "Card expired, update within 7 days"
+            Dunning->>DB: UPDATE invoice SET status=REQUIRES_ACTION
+        end
+    end
+    
+    Dunning->>DB: SELECT invoices WHERE attempts >= MAX_RETRIES
+    Dunning->>Sub: Cancel subscriptions (grace period expired)
+    Sub->>DB: UPDATE subscription SET status=CANCELLED, reason=non_payment
+    Sub->>Notify: Email: "Subscription cancelled due to non-payment"
+
+    Note over Sched,Sub: Smart dunning: retry on likely payday dates, send reminders before cancel.<br/>Each retry uses unique idempotency_key suffix (attempt number) to prevent double-charge.
+```

@@ -760,6 +760,60 @@ class ReadOptimizations:
 
 ## 8. Database Schema
 
+### Entity-Relationship Diagram
+
+```mermaid
+erDiagram
+    WAL_ENTRIES {
+        bigint log_index PK
+        bigint term
+        string command_type
+        bytea command_data
+    }
+    RAFT_STATE {
+        string key PK
+        bytea value
+    }
+    SNAPSHOTS {
+        bigint snapshot_id PK
+        bigint last_included_index
+        bigint last_included_term
+    }
+    ZNODES {
+        string path PK
+        bytea data
+        bigint version
+        string ephemeral_owner
+    }
+    SESSIONS {
+        string session_id PK
+        int timeout_ms
+        bigint last_heartbeat
+    }
+    EPHEMERAL_NODES {
+        string session_id FK
+        string node_path FK
+    }
+    WATCHES {
+        string session_id FK
+        string path FK
+        string event_type
+        boolean persistent
+    }
+    ACLS {
+        string path FK
+        string scheme
+        string id
+        int permissions
+    }
+
+    SESSIONS ||--o{ EPHEMERAL_NODES : "owns"
+    ZNODES ||--o{ EPHEMERAL_NODES : "linked"
+    SESSIONS ||--o{ WATCHES : "subscribes"
+    ZNODES ||--o{ WATCHES : "watched"
+    ZNODES ||--o{ ACLS : "protected by"
+```
+
 ### WAL Log Storage (Custom)
 
 ```sql
@@ -962,3 +1016,232 @@ Read scaling:
 - Linearizable reads (with leader confirmation or lease)
 - Sequential consistency for sessions (FIFO ordering)
 - Watches deliver events in commit order
+
+---
+
+## Sequence Diagrams
+
+### Lock Acquire + Fencing Token
+
+```mermaid
+sequenceDiagram
+    participant C1 as Client 1
+    participant LB as Load Balancer
+    participant Leader as Lock Service (Leader)
+    participant Follower as Lock Service (Follower)
+    participant Store as Raft Log (persistent)
+    participant Resource as Protected Resource (DB)
+
+    C1->>LB: AcquireLock(lock_name="/payments/batch-job")
+    LB->>Leader: Route to current Raft leader
+    Leader->>Leader: Check lock state: UNLOCKED
+    Leader->>Store: Append to Raft log: {LOCK, "/payments/batch-job", client1, fencing_token=42}
+    Leader->>Follower: Replicate log entry
+    Follower-->>Leader: ACK (quorum: 2/3 nodes confirmed)
+    Leader->>Leader: Commit: lock granted, fencing_token=42
+    Leader-->>C1: LockGranted {fencing_token: 42, lease_ttl: 30s}
+
+    C1->>Resource: Write(data, fencing_token=42)
+    Resource->>Resource: Validate fencing_token >= last_seen_token
+    Resource-->>C1: Write accepted
+
+    Note over C1,Leader: Client must renew lease before TTL expires
+    loop Heartbeat every 10s
+        C1->>Leader: KeepAlive(lock, session_id)
+        Leader-->>C1: Lease extended (new ttl: 30s)
+    end
+```
+
+### Lock Release + Notify Waiters
+
+```mermaid
+sequenceDiagram
+    participant C1 as Client 1 (lock holder)
+    participant C2 as Client 2 (waiting)
+    participant C3 as Client 3 (waiting)
+    participant Leader as Lock Service (Leader)
+    participant Store as Raft Log
+    participant WatchMgr as Watch Manager
+
+    C2->>Leader: AcquireLock("/payments/batch-job", wait=true)
+    Leader->>Leader: Lock held by C1, add C2 to wait queue (FIFO)
+    Leader-->>C2: Queued (position: 1)
+
+    C3->>Leader: AcquireLock("/payments/batch-job", wait=true)
+    Leader->>Leader: Add C3 to wait queue
+    Leader-->>C3: Queued (position: 2)
+
+    C1->>Leader: ReleaseLock("/payments/batch-job")
+    Leader->>Store: Append: {UNLOCK, "/payments/batch-job", client1}
+    Leader->>Store: Append: {LOCK, "/payments/batch-job", client2, fencing_token=43}
+    Leader->>Leader: Commit both entries (atomic)
+    Leader-->>C1: Lock released
+
+    Leader->>WatchMgr: Lock owner changed
+    WatchMgr->>C2: LockGranted {fencing_token: 43, lease_ttl: 30s}
+    Note over C3: C3 remains in queue (position: 1 now)
+```
+
+### Leader Election via Raft
+
+```mermaid
+sequenceDiagram
+    participant N1 as Node 1 (Follower)
+    participant N2 as Node 2 (Follower)
+    participant N3 as Node 3 (old Leader - crashed)
+    participant Client as Lock Clients
+
+    Note over N3: Node 3 crashes (leader lost)
+    N1->>N1: Election timeout fires (randomized: 150-300ms)
+    N1->>N1: Increment term (term=5), become Candidate
+    N1->>N1: Vote for self
+
+    par RequestVote
+        N1->>N2: RequestVote(term=5, lastLogIndex=100, lastLogTerm=4)
+        N1->>N3: RequestVote(term=5, ...) [no response - crashed]
+    end
+
+    N2->>N2: Check: term=5 > my term=4, log up-to-date ✓
+    N2-->>N1: VoteGranted(term=5)
+
+    N1->>N1: Received majority (2/3 votes) → become Leader
+    N1->>N2: AppendEntries(heartbeat, term=5)
+    N1->>Client: Redirect: I am new leader (node 1)
+
+    Note over N1: New leader begins serving lock requests
+    Note over N1: Uncommitted entries from old leader: re-replicate or discard
+```
+
+## Caching Strategy
+
+| Layer | What's Cached | TTL | Invalidation |
+|-------|--------------|-----|-------------|
+| Client-side lock state | Lock handle + fencing token | Lease duration | Lease expiry / explicit release |
+| Leader identity | Current leader address | Until leader change | Watch on leader node |
+| Lock metadata | Lock owner, queue position | N/A (authoritative) | Raft log is source of truth |
+| Session→locks mapping | Redis (for fast revocation) | Session TTL | Session expiry |
+
+**Important**: Lock state is NEVER cached in a way that could serve stale data. All lock operations go through the Raft leader for linearizability.
+
+## Async Processing
+
+- **Session expiry detection**: Background goroutine checks session heartbeats, expires stale sessions → releases their locks
+- **Watch notifications**: Delivered async via streaming gRPC (non-blocking to lock operations)
+- **Lock queue fairness**: FIFO queue processing is async but ordered (no starvation)
+- **Metrics emission**: Lock acquire/release counters published async to Prometheus
+- **Log compaction**: Background snapshots of Raft state machine (prevents unbounded log growth)
+
+## Infrastructure Components
+
+| Component | Technology | Sizing | HA Strategy |
+|-----------|-----------|--------|-------------|
+| Lock Service | Go + Raft (etcd/custom) | 3 or 5 nodes | Raft consensus (tolerates ⌊(n-1)/2⌋ failures) |
+| Raft Log | Local SSD (fsync per entry) | NVMe, 100GB | WAL + periodic snapshots |
+| Client Library | Language-specific SDK | Embedded | Session keepalive, auto-reconnect |
+| Load Balancer | L4 (TCP) | - | Routes to leader (or any node → redirect) |
+| Monitoring | Prometheus + Grafana | - | Alert on leader election frequency |
+
+### Deployment Topology
+- **3-node cluster**: Tolerates 1 failure (minimum for production)
+- **5-node cluster**: Tolerates 2 failures (recommended for critical locks)
+- **Cross-AZ**: Each node in separate AZ (survive AZ failure)
+- **NOT cross-region**: Raft latency degrades with geographic distance (use multi-region only with witness nodes)
+
+## Deep Dive: Raft Consensus for Lock Service
+
+### Why Raft for Locks
+Locks require **linearizability**: once a lock is granted, all subsequent reads must see it as held. Raft provides this through:
+1. Single leader handles all writes (no conflicts)
+2. Log replication ensures durability (survives minority failures)
+3. Leader completeness: new leaders have ALL committed entries
+
+### Raft Step-by-Step: Lock Acquire
+
+```
+Step 1: Client sends AcquireLock to leader
+Step 2: Leader creates log entry {term=T, index=I, cmd=LOCK(key, client, token)}
+Step 3: Leader appends to local log (not yet committed)
+Step 4: Leader sends AppendEntries RPC to all followers:
+         {term=T, prevLogIndex=I-1, prevLogTerm=T', entries=[entry], leaderCommit=C}
+Step 5: Each follower:
+         - Checks prevLogIndex/prevLogTerm match (log consistency check)
+         - If match: append entry, reply success
+         - If mismatch: reply failure (leader decrements nextIndex, retries)
+Step 6: Leader waits for majority (⌊n/2⌋ + 1) success replies
+Step 7: Leader advances commitIndex to I
+Step 8: Leader applies entry to state machine (lock table)
+Step 9: Leader responds to client: LOCK_GRANTED(fencing_token=42)
+Step 10: Next heartbeat: followers learn new commitIndex, apply to their state machines
+```
+
+### Linearizable Reads (ReadIndex)
+```
+Problem: Stale reads if leader was deposed but doesn't know yet
+
+Solution (ReadIndex):
+  1. Leader records current commitIndex as readIndex
+  2. Leader sends heartbeat to confirm it's still leader (majority must respond)
+  3. Leader waits until state machine advances past readIndex
+  4. Leader serves the read from state machine
+
+Alternative (LeaseRead - faster but less safe):
+  - Leader assumes it remains leader for election_timeout/2 after last heartbeat
+  - Serves reads without confirming leadership (faster, but clock-dependent)
+```
+
+### Split-Brain Prevention
+```
+Scenario: Network partition splits 5-node cluster into [A,B] and [C,D,E]
+- [C,D,E] (majority) elects new leader → continues serving locks
+- [A,B] (minority) old leader cannot commit (needs 3/5 ACKs)
+  → Any lock operations on old leader will TIMEOUT (not return stale success)
+  → Clients detect timeout, reconnect to new leader
+
+Key insight: Raft's majority requirement means AT MOST ONE partition can make progress.
+Split-brain is IMPOSSIBLE as long as quorum rules are followed.
+```
+
+## Deep Dive: Fencing Tokens
+
+### Why Fencing Tokens Are Necessary
+
+```
+Problem: Lock holder pauses (GC, network), lease expires, new holder gets lock.
+Old holder resumes, THINKS it still holds lock → writes to resource → CORRUPTION.
+
+Timeline:
+  T=0:  Client A acquires lock (fencing_token=42)
+  T=25: Client A pauses (long GC)
+  T=30: Lease expires, lock auto-released
+  T=31: Client B acquires lock (fencing_token=43)
+  T=32: Client B writes to DB with token=43
+  T=35: Client A resumes, writes to DB with token=42 ← MUST BE REJECTED!
+```
+
+### How Fencing Tokens Prevent Split-Brain
+
+```
+Fencing token: Monotonically increasing integer assigned with each lock grant.
+
+Resource-side enforcement:
+  FUNCTION write_with_fence(data, fencing_token):
+    current_max_token = resource.get_max_token(lock_name)
+    IF fencing_token < current_max_token:
+      REJECT("stale lock holder, token %d < %d", fencing_token, current_max_token)
+    ELSE:
+      resource.set_max_token(lock_name, fencing_token)
+      resource.write(data)
+      RETURN success
+
+Key properties:
+  1. Tokens are STRICTLY monotonically increasing (never reused)
+  2. Resource validates token on EVERY write (not just lock service)
+  3. Even if lock service has a bug, resource-side check prevents corruption
+  4. Works across network partitions (token is carried with every request)
+```
+
+### Implementation Requirements
+- Fencing token stored IN the Raft log (survives leader changes)
+- Token generation: simple increment (no need for UUID/timestamp)
+- Resource MUST participate: if resource doesn't check tokens, fencing is useless
+- Token comparison must be on the resource side (not the lock service)

@@ -60,6 +60,69 @@
 
 ## 4. Data Modeling
 
+### Entity-Relationship Diagram
+
+```mermaid
+erDiagram
+    TITLES {
+        uuid title_id PK
+        enum title_type
+        varchar name
+        smallint release_year
+        varchar maturity_rating
+    }
+    SEASONS {
+        uuid season_id PK
+        uuid title_id FK
+        smallint season_number
+    }
+    EPISODES {
+        uuid episode_id PK
+        uuid season_id FK
+        uuid title_id FK
+        smallint episode_number
+        int runtime_minutes
+    }
+    ENCODINGS {
+        uuid encoding_id PK
+        uuid content_id FK
+        varchar resolution
+        varchar codec
+        float vmaf_score
+    }
+    ACCOUNTS {
+        uuid account_id PK
+        varchar email
+        enum plan_type
+        enum billing_status
+    }
+    PROFILES {
+        uuid profile_id PK
+        uuid account_id FK
+        varchar name
+        boolean is_kids
+    }
+    WATCH_HISTORY {
+        uuid profile_id PK
+        uuid content_id PK
+        float progress_pct
+        boolean completed
+    }
+    TITLE_REGIONS {
+        uuid title_id PK
+        varchar region_code PK
+        enum license_type
+    }
+
+    TITLES ||--o{ SEASONS : contains
+    SEASONS ||--o{ EPISODES : contains
+    TITLES ||--o{ TITLE_REGIONS : "available in"
+    TITLES ||--o{ ENCODINGS : "encoded as"
+    EPISODES ||--o{ ENCODINGS : "encoded as"
+    ACCOUNTS ||--o{ PROFILES : has
+    PROFILES ||--o{ WATCH_HISTORY : tracks
+```
+
 ### Content Catalog (PostgreSQL + Elasticsearch)
 ```sql
 CREATE TABLE titles (
@@ -1021,3 +1084,159 @@ alerts:
 - **Recommendation service down**: Serve cached recommendations (stale but available)
 - **License service down**: Grace period on existing licenses; degrade gracefully
 - **Database failure**: CockroachDB survives node loss; read replicas for reads
+
+---
+
+## Sequence Diagrams
+
+### 1. Content Playback Start + CDN Selection
+
+```mermaid
+sequenceDiagram
+    participant C as Client App
+    participant API as Play API
+    participant Steering as Steering Service
+    participant License as License/DRM Service
+    participant OCA as Open Connect Appliance
+    participant Origin as Origin (S3)
+
+    C->>API: POST /playback/start {title_id, profile_id}
+    API->>API: Validate entitlement + parental controls
+    API->>Steering: Get optimal OCA for client IP + ISP
+    Steering->>Steering: Score OCAs (latency, load, capacity, health)
+    Steering-->>API: Ranked OCA list [oca1, oca2, oca3]
+
+    API->>License: Request playback license
+    License->>License: Generate Widevine/FairPlay license keys
+    License-->>API: Encrypted license + session_id
+
+    API-->>C: Manifest URLs (per OCA), license, session binding
+
+    C->>OCA: GET manifest.mpd (closest OCA)
+    alt OCA has content cached
+        OCA-->>C: Manifest + first segments
+    else OCA cache miss
+        OCA->>Origin: Fetch content
+        Origin-->>OCA: Content segments
+        OCA->>OCA: Cache locally
+        OCA-->>C: Segments
+    end
+
+    loop Adaptive streaming
+        C->>C: Bandwidth estimation
+        C->>OCA: GET segment at quality_level
+        alt OCA unhealthy (timeout/error)
+            C->>Steering: Report OCA failure
+            Steering-->>C: Redirect to OCA2
+            C->>OCA: Switch to backup OCA
+        end
+    end
+```
+
+### 2. Recommendation Generation Pipeline
+
+```mermaid
+sequenceDiagram
+    participant Sched as Scheduler (Daily)
+    participant Spark as Spark Cluster
+    participant ViewDB as Viewing History DB
+    participant CatalogDB as Content Catalog
+    participant ML as ML Model Serving
+    participant Cache as Redis/EVCache
+    participant API as Recommendation API
+    participant C as Client
+
+    Sched->>Spark: Trigger daily recommendation batch
+    Spark->>ViewDB: Read all viewing events (last 30 days)
+    Spark->>CatalogDB: Read content metadata + tags
+    Spark->>Spark: Collaborative filtering (user-user, item-item)
+    Spark->>Spark: Content-based features (genre, actor, director)
+    Spark->>ML: Generate embeddings per user-profile
+    ML-->>Spark: User taste vectors
+
+    Spark->>Spark: Score all eligible titles per profile
+    Spark->>Spark: Apply diversity rules (genre spread, recency)
+    Spark->>Cache: Write top-N recs per profile (TTL: 24h)
+    Note over Spark,Cache: Batch complete for ~200M profiles
+
+    C->>API: GET /recommendations/{profile_id}
+    API->>Cache: Lookup pre-computed recs
+    alt Cache hit
+        Cache-->>API: Ranked title list
+    else Cache miss (new user / expired)
+        API->>ML: Real-time inference (cold-start model)
+        ML-->>API: Fallback recommendations
+    end
+    API->>API: Apply real-time signals (continue watching, trending)
+    API-->>C: Personalized rows with artwork variants
+```
+
+### 3. License / DRM Validation Flow
+
+```mermaid
+sequenceDiagram
+    participant C as Client (CDM)
+    participant API as Play API
+    participant License as License Service
+    participant KMS as Key Management Service
+    participant Policy as Policy Engine
+    participant DB as License DB
+    participant Audit as Audit Log
+
+    C->>API: POST /license/acquire {title_id, device_info, challenge}
+    API->>Policy: Check entitlement (subscription tier, geo, device count)
+    alt Not entitled
+        Policy-->>API: DENY (reason: geo-block / tier)
+        API-->>C: 403 Forbidden
+    else Entitled
+        Policy-->>API: ALLOW (output_protections: HDCP 2.2, max_resolution: 4K)
+    end
+
+    API->>License: Generate license (challenge, policy constraints)
+    License->>KMS: Retrieve content encryption keys
+    KMS-->>License: AES-128 keys (per title+quality)
+    License->>License: Build Widevine/FairPlay/PlayReady license blob
+    License->>License: Set rental window (48h), lease duration (5min renewable)
+    License->>DB: Store license grant (device_id, title, expiry, session)
+    License->>Audit: Log license issuance
+
+    License-->>API: Signed license response
+    API-->>C: License blob
+
+    loop Every 5 minutes (lease renewal)
+        C->>API: POST /license/renew {session_id, heartbeat}
+        API->>DB: Check session validity + concurrent stream count
+        alt Concurrent limit exceeded
+            API-->>C: LICENSE_REVOKED
+            Note over C: Playback stops
+        else OK
+            API->>DB: Extend lease
+            API-->>C: Renewed
+        end
+    end
+```
+
+---
+
+## Expanded Async Processing
+
+### Async Pipeline Architecture
+
+Netflix's async processing underpins several critical non-real-time workflows:
+
+**Content Ingestion Pipeline (Async)**:
+1. Studio uploads mezzanine file → S3 event triggers Step Function
+2. Step Function orchestrates: quality validation → audio normalization → per-title encoding analysis → parallel transcode (100+ renditions) → packaging (DASH/HLS) → DRM encryption → QC validation → catalog publish
+3. Each stage writes to SQS between steps; failures retry with exponential backoff
+4. Entire pipeline: 4-8 hours per title; fully async with status callbacks
+
+**Viewing Event Processing**:
+- Client sends playback events (start, pause, seek, stop, quality changes) → Kafka
+- Stream processing (Apache Flink): sessionization, engagement scoring, A/B metric computation
+- Sink to: data warehouse (BigQuery), real-time dashboards, recommendation feature store
+- Throughput: ~500K events/second globally
+
+**Artwork Personalization (Async Batch)**:
+- For each title × user cluster: select optimal artwork variant
+- Multi-armed bandit offline computation on Spark
+- Results cached in EVCache; refreshed every 6 hours

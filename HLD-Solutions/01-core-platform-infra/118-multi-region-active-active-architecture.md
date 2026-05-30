@@ -72,6 +72,52 @@ Cross-region links: 2 × 10Gbps dedicated (redundant)
 
 ## 4. Data Modeling
 
+### Entity-Relationship Diagram
+
+```mermaid
+erDiagram
+    USERS {
+        uuid user_id PK
+        string email
+        string home_region
+        bigint hlc_timestamp
+    }
+    ORDERS {
+        uuid order_id PK
+        uuid user_id FK
+        string status
+        decimal total_amount
+        string origin_region
+        jsonb vector_clock
+    }
+    INVENTORY {
+        string sku_id PK
+        string region PK
+        bigint quantity_pos
+        bigint quantity_neg
+        bigint reserved
+    }
+    SESSIONS {
+        uuid session_id PK
+        uuid user_id FK
+        string origin_region
+        timestamp expires_at
+    }
+    REPLICATION_LOG {
+        bigint sequence_id PK
+        string origin_region PK
+        string entity_type
+        uuid entity_id
+        string operation
+        bigint hlc_timestamp
+    }
+
+    USERS ||--o{ ORDERS : places
+    USERS ||--o{ SESSIONS : has
+    ORDERS ||--o{ REPLICATION_LOG : replicated_via
+    USERS ||--o{ REPLICATION_LOG : replicated_via
+```
+
 ### User Schema (Geo-Partitioned)
 ```sql
 CREATE TABLE users (
@@ -1192,3 +1238,103 @@ Multi-Region Health Dashboard:
 - Single global lock/counter (creates hotspot region)
 - Assuming network is reliable between regions
 - Ignoring data residency until after architecture is set
+
+---
+
+## Sequence Diagrams
+
+### 1. Cross-Region Write Replication
+
+```mermaid
+sequenceDiagram
+    participant Client
+    participant LB_US as LB (US-East)
+    participant App_US as App Server (US)
+    participant DB_US as DB Primary (US)
+    participant Repl as Replication Stream
+    participant DB_EU as DB Primary (EU)
+    participant App_EU as App Server (EU)
+
+    Client->>LB_US: POST /api/orders (routed by geo-DNS)
+    LB_US->>App_US: Forward
+    App_US->>DB_US: INSERT order (local write, synchronous)
+    DB_US-->>App_US: Write confirmed (local commit)
+    App_US-->>Client: 201 Created {order_id, region: us-east}
+
+    Note over DB_US,DB_EU: Async replication (target: <500ms lag)
+
+    DB_US--)Repl: WAL stream / Change Data Capture
+    Repl->>Repl: Conflict resolution (last-writer-wins by timestamp)
+
+    alt No conflict
+        Repl->>DB_EU: Apply changes
+        DB_EU-->>Repl: ACK
+    else Conflict detected (concurrent write to same key)
+        Repl->>Repl: Apply resolution strategy:<br/>1. LWW for user preferences<br/>2. CRDT merge for counters<br/>3. App-level resolver for orders
+        Repl->>DB_EU: Apply resolved state
+        Repl--)App_US: Notify conflict (for audit log)
+    end
+
+    Note over App_EU: EU reads see order within ~500ms<br/>User pinned to US for 5s after write (read-your-writes)
+```
+
+### 2. Regional Failover Flow
+
+```mermaid
+sequenceDiagram
+    participant DNS as Global DNS (Route53)
+    participant HC as Health Checker (Multi-Region)
+    participant US as US-East Region
+    participant EU as EU-West Region
+    participant Client
+
+    loop Every 10 seconds
+        HC->>US: Health check (/healthz + deep check)
+        US-->>HC: 200 OK
+        HC->>EU: Health check
+        EU-->>HC: 200 OK
+    end
+
+    Note over US: Region failure (network partition)
+    HC->>US: Health check
+    US--xHC: Timeout (30s)
+    HC->>US: Retry health check
+    US--xHC: Timeout
+
+    HC->>HC: Confirm failure (3 consecutive failures)<br/>Automated decision (< 60s total detection)
+
+    HC->>DNS: Update DNS: remove US from active set
+    DNS->>DNS: TTL 60s; propagation begins
+
+    Client->>DNS: Resolve api.example.com
+    DNS-->>Client: EU-West IP only (US removed)
+
+    Client->>EU: POST /api/orders
+    EU->>EU: Accept write (EU is now sole active region)
+
+    Note over EU: EU handles full global traffic<br/>Auto-scale triggered (2x capacity)
+
+    Note over US: US recovers after 10 minutes
+    HC->>US: Health check passes
+    HC->>HC: Wait for replication catch-up<br/>Verify EU→US replication lag < 100ms
+    HC->>DNS: Gradually add US back (weighted: 10% → 50% → 100%)
+```
+
+### Infrastructure Components
+
+#### Load Balancer
+- **Global**: AWS Global Accelerator / Cloudflare Anycast for geo-proximity routing
+- **Regional**: L7 ALB per region; weighted routing for gradual failover (canary region re-entry)
+- **Algorithm**: Latency-based routing with failover; health-check driven automatic DNS updates
+- **Session affinity**: Region-sticky cookies (5s TTL after writes) for read-your-writes consistency
+
+#### API Gateway
+- **Per-region deployment**: Independent API Gateway clusters in each region
+- **Shared config**: Gateway configuration synced via Git (GitOps) across regions
+- **Rate limiting**: Per-region rate limits (independent); global rate limits via async reconciliation (same as rate limiter pattern)
+- **Request routing**: Region-aware routing headers (X-Region, X-Failover-From) for observability
+
+#### CDN
+- **Multi-origin**: CDN configured with regional origins; automatic failover on origin health failure
+- **Cache partitioning**: Shared cache keys across regions for static content; region-specific keys for personalized content
+- **Purge propagation**: Global purge API that fans out to all regional edge PoPs (< 5s propagation)

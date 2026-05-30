@@ -888,6 +888,38 @@ class WANGossipFederation:
 
 ## 5. Data Model
 
+### Entity-Relationship Diagram
+
+```mermaid
+erDiagram
+    SERVICE_INSTANCES {
+        string instance_id PK
+        string service_name
+        inet address
+        int port
+        string health_status
+        string datacenter
+        int weight
+    }
+    REGISTRY_CHANGES {
+        bigint id PK
+        string change_type
+        string instance_id FK
+        string service_name
+        bigint lamport_clock
+    }
+    HEALTH_CHECK_RESULTS {
+        bigint id PK
+        string instance_id FK
+        string status
+        int response_time_ms
+        timestamp checked_at
+    }
+
+    SERVICE_INSTANCES ||--o{ REGISTRY_CHANGES : "tracked by"
+    SERVICE_INSTANCES ||--o{ HEALTH_CHECK_RESULTS : "checked via"
+```
+
 ### Registry Data (In-Memory + WAL)
 
 ```sql
@@ -1198,3 +1230,167 @@ class ServiceRegistryClient:
 - Tag-based routing: route `canary` tag percentage of traffic
 - Graceful drain period before deregistration
 - Health check passes before receiving traffic (readiness vs liveness)
+
+---
+
+## Sequence Diagrams
+
+### Service Registration + Health Check
+
+```mermaid
+sequenceDiagram
+    participant Svc as Service Instance (startup)
+    participant SDK as Discovery SDK (sidecar/library)
+    participant Registry as Service Registry (Consul/etcd)
+    participant HealthChk as Health Checker
+    participant Peers as Other Registry Nodes
+
+    Svc->>SDK: Register(service="payments", port=8080, tags=["v2","prod"])
+    SDK->>Registry: PUT /v1/agent/service/register {id, address, port, health_check}
+    Registry->>Registry: Add to service catalog (local state)
+    Registry->>Peers: Replicate via Raft/Gossip (consistency depends on mode)
+    Peers-->>Registry: ACK replication
+    Registry-->>SDK: 200 OK (registered)
+
+    loop Health check (every 10s)
+        HealthChk->>Svc: GET /health (or TCP check, or gRPC health)
+        alt Healthy
+            Svc-->>HealthChk: 200 OK
+            HealthChk->>Registry: Mark instance: passing
+        else Unhealthy (3 consecutive failures)
+            Svc-->>HealthChk: 503 or timeout
+            HealthChk->>Registry: Mark instance: critical
+            Registry->>Registry: Remove from active set (stop routing traffic)
+            Registry->>Peers: Propagate deregistration
+        end
+    end
+
+    Note over Svc: On graceful shutdown: explicit deregister
+    Svc->>SDK: Deregister()
+    SDK->>Registry: PUT /v1/agent/service/deregister/{id}
+```
+
+### Service Lookup + Client-Side Load Balancing
+
+```mermaid
+sequenceDiagram
+    participant Caller as Calling Service
+    participant SDK as Discovery SDK
+    participant Cache as Local Cache (DNS/in-memory)
+    participant Registry as Service Registry
+    participant LB as Client-Side LB
+    participant Target1 as payments-1 (healthy)
+    participant Target2 as payments-2 (healthy)
+    participant Target3 as payments-3 (draining)
+
+    Caller->>SDK: Resolve("payments")
+    SDK->>Cache: Check local endpoint cache
+    alt Cache fresh (updated < 5s ago via watch)
+        Cache-->>SDK: Endpoints [payments-1, payments-2]
+    else Cache stale or empty
+        SDK->>Registry: GET /v1/health/service/payments?passing=true
+        Registry-->>SDK: [{id:1, addr:10.0.1.5, port:8080}, {id:2, addr:10.0.2.3, port:8080}]
+        SDK->>Cache: Update cache
+        SDK->>Registry: Establish watch (blocking query / gRPC stream)
+    end
+    SDK-->>Caller: Healthy endpoints list
+
+    Caller->>LB: Select endpoint (strategy: weighted round-robin)
+    LB->>LB: Apply weights (based on latency, error rate, active connections)
+    LB->>LB: Exclude: payments-3 (draining, weight=0)
+    LB-->>Caller: Selected: payments-1
+
+    Caller->>Target1: HTTP/gRPC request
+    alt Request succeeds
+        Target1-->>Caller: 200 OK
+        LB->>LB: Update success stats for payments-1
+    else Request fails (5xx or timeout)
+        Target1-->>Caller: 503
+        LB->>LB: Mark payments-1 unhealthy (circuit breaker: 3 failures)
+        Caller->>LB: Retry on different endpoint
+        LB-->>Caller: Selected: payments-2
+        Caller->>Target2: Retry request
+        Target2-->>Caller: 200 OK
+    end
+```
+
+## Async Processing
+
+- **Gossip protocol**: Anti-entropy background sync between registry nodes (AP mode)
+- **Health check execution**: Async, non-blocking; results batched and flushed every 1s
+- **Watch notifications**: Long-poll / streaming push to all subscribers on change
+- **Stale instance cleanup**: Background reaper removes instances with expired TTL (no heartbeat for 3x interval)
+- **DNS TTL refresh**: Async update of DNS records when service instances change
+
+### Consistency Models
+- **CP mode (Raft)**: Strongly consistent reads from leader; used for critical service lookups
+- **AP mode (Gossip)**: Eventually consistent; used for non-critical lookups where availability > consistency
+- **Client SDK**: Caches last-known-good endpoints; service calls succeed even if registry is temporarily down
+
+## Infrastructure Components
+
+| Component | Technology | Sizing | HA Strategy |
+|-----------|-----------|--------|-------------|
+| Service Registry | Consul / etcd / Eureka | 3-5 nodes (Raft quorum) | Multi-AZ, Raft consensus |
+| Health Checkers | Co-located agents | 1 per node (DaemonSet) | Local checks, no network dependency |
+| DNS Interface | Consul DNS / CoreDNS | Embedded | Caching resolver on every node |
+| Client SDK | Language-specific library | In-process | Local cache, reconnect with backoff |
+| API Gateway | Envoy / Kong | 4 pods | Integrates with registry for routing |
+| Control Plane | Custom (config management) | 2 pods | Manages service metadata |
+
+### HA & Failure Modes
+- **Registry node failure**: Raft elects new leader (< 5s); clients use cached endpoints during election
+- **Network partition**: Minority partition returns stale data (in AP mode) or errors (in CP mode)
+- **Health check false positive**: Requires 3 consecutive failures before deregistration (debounce)
+- **Thundering herd on recovery**: Rate-limit re-registration; stagger health check intervals
+
+## Deep Dive: Consistency & Protocol Internals
+
+### Gossip Protocol (Serf/SWIM-based)
+```
+Failure detection via SWIM protocol:
+  1. Node A randomly picks node B, sends PING
+  2. If B responds: B is alive, done
+  3. If no response within timeout:
+     A asks K random nodes to PING B (indirect probe)
+  4. If any indirect probe succeeds: B is alive (network issue between A and B)
+  5. If all indirect probes fail: B is suspected
+  6. After suspicion timeout: B is declared dead
+  
+Properties:
+  - Detection time: O(log N) protocol rounds
+  - Bandwidth: O(N) per node per protocol period
+  - False positive rate: tunable via K (indirect probes) and timeout
+```
+
+### Client-Side Load Balancing Algorithms
+```
+Weighted Round-Robin with Health Feedback:
+  FUNCTION select_endpoint(endpoints):
+    FOR each endpoint IN endpoints:
+      endpoint.effective_weight = endpoint.base_weight * health_score(endpoint)
+    
+    total_weight = sum(e.effective_weight for e in endpoints)
+    random_point = random() * total_weight
+    
+    cumulative = 0
+    FOR each endpoint IN endpoints:
+      cumulative += endpoint.effective_weight
+      IF cumulative >= random_point:
+        RETURN endpoint
+
+  FUNCTION health_score(endpoint):
+    // Based on recent request history (sliding window: 30s)
+    success_rate = successes / total_requests
+    latency_factor = baseline_p50 / endpoint_p50  // slower = lower score
+    RETURN success_rate * latency_factor  // Range: [0, 1]
+```
+
+### Zone-Aware Routing
+```
+Prefer same-AZ endpoints to minimize cross-AZ latency:
+  1. Filter endpoints in same AZ as caller
+  2. If >= 2 healthy same-AZ endpoints: route only within AZ
+  3. If < 2 healthy same-AZ: fall back to cross-AZ (with preference weighting)
+  4. Never route to endpoints in degraded AZs (informed by registry health)
+```

@@ -56,6 +56,46 @@ Index partitions: 1,000,000+
 
 ## 3. Data Modeling
 
+### Entity-Relationship Diagram
+
+```mermaid
+erDiagram
+    BUCKET_METADATA {
+        string bucket_name PK
+        string owner_account_id FK
+        string region
+        bool versioning_enabled
+    }
+    OBJECT_METADATA {
+        string bucket_name PK
+        string object_key PK
+        string version_id PK
+        int size
+        string storage_class
+        string etag
+    }
+    DATA_LOCATOR {
+        string placement_group_id PK
+        string coding_scheme
+    }
+    STRIPE_LOCATION {
+        string node_id PK
+        string disk_id
+        int offset
+        int length
+    }
+    LIFECYCLE_RULE {
+        string rule_id PK
+        string bucket_name FK
+        int expiration_days
+        string transition_class
+    }
+    BUCKET_METADATA ||--o{ OBJECT_METADATA : contains
+    BUCKET_METADATA ||--o{ LIFECYCLE_RULE : defines
+    OBJECT_METADATA ||--|| DATA_LOCATOR : references
+    DATA_LOCATOR ||--|{ STRIPE_LOCATION : has
+```
+
 ### Object Metadata (Distributed KV Store)
 
 ```python
@@ -1176,3 +1216,278 @@ Capacity:
 - **Cross-region replication lag**: Async replication means temporary inconsistency across regions
 - **Cost of erasure coding repairs**: Network-intensive; schedule during off-peak
 - **Encryption key management**: Customer-managed keys add complexity but required for compliance
+
+---
+
+## Sequence Diagrams
+
+### PUT Object - Multipart Upload Flow
+
+```mermaid
+sequenceDiagram
+    participant C as Client
+    participant API as API Gateway
+    participant MS as Metadata Service
+    participant PS as Placement Service
+    participant DN1 as DataNode-1
+    participant DN2 as DataNode-2
+    participant DN3 as DataNode-3
+
+    C->>API: InitiateMultipartUpload(bucket, key)
+    API->>MS: Create upload record (upload_id)
+    MS-->>API: upload_id
+    API-->>C: upload_id
+
+    loop For each part (1..N)
+        C->>API: UploadPart(upload_id, part_num, data)
+        API->>PS: GetPlacementGroup(object_hash + part_num)
+        PS-->>API: [DN1, DN2, DN3] (erasure coded targets)
+        API->>DN1: Write data shard (k=6 data blocks)
+        API->>DN2: Write parity shard (m=3 parity blocks)
+        API->>DN3: Write parity shard
+        DN1-->>API: ACK + ETag
+        DN2-->>API: ACK
+        DN3-->>API: ACK
+        API->>MS: Record part metadata (ETag, size, locations)
+        API-->>C: ETag for part
+    end
+
+    C->>API: CompleteMultipartUpload(upload_id, part_list)
+    API->>MS: Validate all parts present + assemble manifest
+    MS->>MS: Create final object metadata (composite ETag)
+    MS-->>API: Object created
+    API-->>C: 200 OK + final ETag
+```
+
+### GET Object with Erasure Code Reconstruction
+
+```mermaid
+sequenceDiagram
+    participant C as Client
+    participant API as API Gateway
+    participant MS as Metadata Service
+    participant Cache as CDN/Edge Cache
+    participant DN1 as DataNode-1 (healthy)
+    participant DN2 as DataNode-2 (healthy)
+    participant DN3 as DataNode-3 (FAILED)
+
+    C->>Cache: GET /bucket/key
+    Cache-->>C: MISS (or expired)
+    C->>API: GET /bucket/key
+    API->>MS: Lookup object metadata
+    MS-->>API: {locations: [DN1,DN2,DN3], encoding: RS(6,3)}
+    
+    par Read data shards
+        API->>DN1: Read shards [0,1,2]
+        API->>DN2: Read shards [3,4,5]
+        API->>DN3: Read parity [6,7,8]
+    end
+    
+    DN1-->>API: shards [0,1,2] ✓
+    DN2-->>API: shards [3,4,5] ✓
+    DN3--xAPI: TIMEOUT (node failed)
+    
+    Note over API: Have 6 shards (need k=6 minimum) → decode possible
+    API->>API: Reed-Solomon decode (reconstruct from any 6 of 9 shards)
+    API-->>C: 200 OK + object data (streamed)
+    API->>Cache: Populate edge cache (TTL based on policy)
+    
+    Note over API: Background: trigger repair for DN3's shards
+    API->>PS: ScheduleRepair(object_id, failed_node=DN3)
+```
+
+### Lifecycle Transition to Glacier
+
+```mermaid
+sequenceDiagram
+    participant Cron as Lifecycle Scanner
+    participant MS as Metadata Service
+    participant HOT as Hot Storage (S3 Standard)
+    participant COLD as Cold Storage (Glacier)
+    participant Notify as Notification Service
+
+    Cron->>MS: Query objects WHERE last_access < 90d AND tier='STANDARD'
+    MS-->>Cron: [obj1, obj2, ... obj10000] (batch)
+    
+    loop For each batch of 1000
+        Cron->>Cron: Validate no legal hold / lock
+        Cron->>HOT: Read object data
+        HOT-->>Cron: Object bytes
+        Cron->>COLD: Archive(object_id, data, vault_id)
+        COLD-->>Cron: archive_id + retrieval_config
+        Cron->>MS: Update tier='GLACIER', archive_id, remove hot_locations
+        Cron->>HOT: Delete hot copy (after confirmation)
+        HOT-->>Cron: Deleted
+        Cron->>MS: Update storage_class_transition_log
+    end
+    
+    Cron->>Notify: Publish transition report (count, bytes_saved)
+    Notify-->>Cron: Notification sent
+```
+
+## Caching Strategy
+
+| Layer | Technology | What's Cached | TTL | Eviction |
+|-------|-----------|---------------|-----|----------|
+| Edge/CDN | CloudFront/Akamai | Immutable objects (versioned keys) | 24h-365d | Version change invalidation |
+| API Gateway | Local LRU | Auth tokens, bucket policies | 5 min | LRU + policy change event |
+| Metadata | Redis Cluster | Object metadata (key→location mapping) | 1h | Write-through on PUT/DELETE |
+| Block cache | Local NVMe on DataNodes | Hot data blocks (read amplification) | LFU-based | Size-bounded (10% of node) |
+| Client-side | SDK in-memory | ListObjects results, HEAD responses | 60s | TTL expiry |
+
+**Cache Invalidation Strategy:**
+- Versioned objects: Cache forever (immutable content-addressable)
+- Non-versioned: Event-driven invalidation via SQS on PUT/DELETE
+- Metadata: Write-through ensures consistency; async propagation to edge (50ms p99)
+- Negative caching: Cache 404s for 5s to prevent repeated NameNode lookups on non-existent keys
+
+## Algorithm Deep Dive: Erasure Coding (Reed-Solomon)
+
+### What is Erasure Coding?
+
+Erasure coding splits data into `k` data fragments and generates `m` parity (redundancy) fragments such that the original data can be reconstructed from **any k of (k+m)** fragments. This provides fault tolerance equivalent to `m` replica failures with far less storage overhead than full replication.
+
+### Why 6+3 (RS(6,3)) Encoding for Object Storage?
+
+| Strategy | Storage Overhead | Tolerates | Durability (annual) |
+|----------|-----------------|-----------|---------------------|
+| 3x Replication | 200% | 2 failures | 99.99% |
+| RS(6,3) | 50% | 3 failures | 99.999999% (8 nines) |
+| RS(10,4) | 40% | 4 failures | 99.9999999999% |
+
+RS(6,3) is the sweet spot: 50% overhead (vs 200% for 3x replication) while tolerating 3 simultaneous failures with higher durability.
+
+### Step-by-Step Reed-Solomon Encoding
+
+**Example: Encoding a 6-byte data block `[D0, D1, D2, D3, D4, D5]`**
+
+**Step 1: Represent data as a polynomial over GF(2^8)**
+
+Each byte becomes a coefficient in a polynomial of degree k-1:
+```
+f(x) = D0 + D1·x + D2·x² + D3·x³ + D4·x⁴ + D5·x⁵
+```
+
+All arithmetic is in Galois Field GF(2^8) — addition = XOR, multiplication via lookup tables.
+
+**Step 2: Generate encoding matrix (Vandermonde or Cauchy)**
+
+```
+Encoding Matrix (9×6):
+┌ 1  0  0  0  0  0 ┐   ← Identity (data shards pass through)
+│ 0  1  0  0  0  0 │
+│ 0  0  1  0  0  0 │
+│ 0  0  0  1  0  0 │
+│ 0  0  0  0  1  0 │
+│ 0  0  0  0  0  1 │
+│ 1  1  1  1  1  1 │   ← Parity row 1: evaluate f(1)
+│ 1  2  4  8  16 32│   ← Parity row 2: evaluate f(2) [powers of 2 in GF]
+└ 1  3  5  15 17 51┘   ← Parity row 3: evaluate f(3) [powers of 3 in GF]
+```
+
+**Step 3: Matrix multiplication → produce 9 shards**
+
+```
+[S0..S8] = EncodingMatrix × [D0..D5]
+
+S0-S5 = D0-D5 (data shards, unchanged)
+S6 = D0 ⊕ D1 ⊕ D2 ⊕ D3 ⊕ D4 ⊕ D5 (simple XOR parity)
+S7 = Σ Di·2^i in GF(2^8)
+S8 = Σ Di·3^i in GF(2^8)
+```
+
+**Step 4: Distribute shards across nodes**
+
+```
+Shard 0 → Node A (Rack 1)
+Shard 1 → Node B (Rack 1)
+Shard 2 → Node C (Rack 2)
+Shard 3 → Node D (Rack 2)
+Shard 4 → Node E (Rack 3)
+Shard 5 → Node F (Rack 3)
+Shard 6 → Node G (Rack 1)  [parity]
+Shard 7 → Node H (Rack 2)  [parity]
+Shard 8 → Node I (Rack 3)  [parity]
+```
+
+### Data Recovery (Decoding)
+
+**Scenario: Nodes C, F, and I fail (shards 2, 5, 8 lost)**
+
+**Step 1:** Identify surviving shards: {S0, S1, S3, S4, S6, S7} (6 shards — exactly k)
+
+**Step 2:** Extract corresponding rows from encoding matrix:
+```
+Sub-matrix (6×6):
+Row 0: [1, 0, 0, 0, 0, 0]  (for S0)
+Row 1: [0, 1, 0, 0, 0, 0]  (for S1)
+Row 3: [0, 0, 0, 1, 0, 0]  (for S3)
+Row 4: [0, 0, 0, 0, 1, 0]  (for S4)
+Row 6: [1, 1, 1, 1, 1, 1]  (for S6)
+Row 7: [1, 2, 4, 8, 16, 32] (for S7)
+```
+
+**Step 3:** Compute inverse of sub-matrix in GF(2^8) using Gaussian elimination
+
+**Step 4:** Multiply inverse by surviving shards to recover original data:
+```
+[D0..D5] = SubMatrix⁻¹ × [S0, S1, S3, S4, S6, S7]
+```
+
+**Complexity Analysis:**
+- Encoding: O(k × m × block_size) — parallelizable per stripe
+- Decoding: O(k² + k × block_size) — matrix inversion O(k²) dominates for small blocks
+- In practice: SIMD-optimized GF multiplication → 2-4 GB/s per core
+
+### Consistent Hashing for Object Placement
+
+**Problem:** Distribute billions of objects across thousands of nodes with minimal redistribution when nodes join/leave.
+
+**Step 1: Hash Ring Construction**
+
+```
+Ring space: 0 to 2^128 - 1 (MD5 or SHA-based)
+
+Physical Nodes: A, B, C, D (4 nodes)
+Virtual Nodes per physical: 150 (total 600 points on ring)
+
+A_001 → hash("A_001") = 0x0A3F...  → position 423
+A_002 → hash("A_002") = 0x7B21...  → position 31521
+...
+B_001 → hash("B_001") = 0x1C8E...  → position 7310
+```
+
+**Step 2: Object Placement**
+
+```
+object_key = "photos/user123/vacation.jpg"
+hash(object_key) = 0x4E7A... → position 20090
+
+Walk clockwise → first virtual node encountered = B_042 → Physical Node B
+Continue clockwise for replicas: next distinct physical = C_017, then A_089
+Placement: [B, C, A]
+```
+
+**Step 3: Node Addition (Node E joins)**
+
+```
+Before: Objects in range (D_last, A_first] → all go to A
+After:  E's virtual nodes land between D and A
+        Only objects in (D_last, E_first] move from A to E
+        
+Result: ~1/N of data moves (only from adjacent nodes)
+        With 150 vnodes, load variance < 5%
+```
+
+**Step 4: Weighted Placement**
+
+```
+Node with 8TB disk → 200 virtual nodes
+Node with 4TB disk → 100 virtual nodes
+New SSD node (fast) → 250 virtual nodes (higher weight)
+```
+
+**Why 150 virtual nodes?**
+- <50: Uneven distribution (>20% variance)
+- 150: Good balance (~5% variance, manageable memory)
+- >500: Memory overhead for ring state becomes significant at 10K+ nodes

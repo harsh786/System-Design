@@ -51,6 +51,60 @@ Compute Resources:
 
 ## 4. Data Modeling
 
+### Entity-Relationship Diagram
+
+```mermaid
+erDiagram
+    CONNECTORS {
+        uuid connector_id PK
+        uuid tenant_id
+        varchar connector_type
+        varchar sync_mode
+        varchar status
+    }
+    SYNC_RUNS {
+        uuid run_id PK
+        uuid connector_id FK
+        varchar status
+        bigint rows_extracted
+        bigint rows_loaded
+    }
+    TRANSFORMATION_MODELS {
+        uuid model_id PK
+        uuid tenant_id
+        uuid project_id
+        varchar model_type
+        varchar materialization
+    }
+    DATA_QUALITY_RULES {
+        uuid rule_id PK
+        uuid tenant_id
+        uuid target_id FK
+        varchar rule_type
+        varchar severity
+    }
+    PIPELINE_DAGS {
+        uuid dag_id PK
+        uuid tenant_id
+        varchar name
+        varchar schedule_cron
+        varchar status
+    }
+    COLUMN_LINEAGE {
+        uuid lineage_id PK
+        uuid model_id FK
+        varchar source_column
+        varchar target_column
+    }
+
+    CONNECTORS ||--o{ SYNC_RUNS : produces
+    TRANSFORMATION_MODELS ||--o{ COLUMN_LINEAGE : tracks
+    PIPELINE_DAGS ||--o{ CONNECTORS : orchestrates
+    PIPELINE_DAGS ||--o{ TRANSFORMATION_MODELS : orchestrates
+    DATA_QUALITY_RULES }o--|| CONNECTORS : validates
+    DATA_QUALITY_RULES }o--|| TRANSFORMATION_MODELS : validates
+```
+
 ### Connector Configuration Schema
 ```sql
 CREATE TABLE connectors (
@@ -1310,3 +1364,133 @@ monitoring:
 - Connector pooling: share connections across tables from same source
 - Transformation caching: skip unchanged models via content hash comparison
 - Auto-pause idle connectors after configurable inactivity period
+
+---
+
+## 12. Sequence Diagrams
+
+### Diagram 1: CDC Capture + Transformation + Load
+
+```mermaid
+sequenceDiagram
+    participant DB as Source DB (PostgreSQL)
+    participant CDC as Debezium Connector
+    participant Kafka as Kafka (CDC Topic)
+    participant Transform as dbt Transform
+    participant Staging as Staging (Snowflake RAW)
+    participant DWH as Warehouse (Analytics)
+    participant Monitor as Pipeline Monitor
+
+    DB->>DB: Transaction: INSERT INTO orders (id=1001)
+    DB->>CDC: WAL event (LSN: 0/16B3748)
+    CDC->>CDC: Deserialize WAL → structured change event
+    CDC->>Kafka: Produce {op:"c", after:{id:1001,...}, source:{lsn:"0/16B3748"}}
+    Kafka-->>CDC: ACK (offset 50234)
+    CDC->>CDC: Commit LSN offset to Kafka (exactly-once via txn)
+
+    Note over Kafka,Staging: Micro-batch load (every 5 min)
+
+    Staging->>Kafka: Consume batch (offsets 50200-50300)
+    Staging->>Staging: Write raw JSON to _raw_orders table
+    Staging->>Kafka: Commit consumer offset (exactly-once via staging txn)
+
+    Note over Transform: dbt run triggered by new data signal
+
+    Transform->>Staging: SELECT from _raw_orders (incremental: where loaded_at > last_run)
+    Transform->>Transform: Apply transformations (dedup, cast, validate)
+    Transform->>Transform: SCD Type 2 merge (detect changed dimensions)
+    Transform->>DWH: MERGE INTO dim_customers (insert new, close old versions)
+    Transform->>DWH: INSERT INTO fact_orders (new records only)
+    Transform->>Monitor: Emit metrics (rows_processed, duration, freshness_lag)
+
+    Monitor->>Monitor: Check freshness SLA (lag < 15min?)
+    alt SLA breached
+        Monitor->>Monitor: Alert on-call (PagerDuty)
+    end
+```
+
+### Diagram 2: Schema Evolution Handling
+
+```mermaid
+sequenceDiagram
+    participant Dev as Developer
+    participant Source as Source DB
+    participant CDC as CDC Connector
+    participant Registry as Schema Registry
+    participant Pipeline as ETL Pipeline
+    participant DWH as Data Warehouse
+    participant Alert as Alert System
+
+    Dev->>Source: ALTER TABLE orders ADD COLUMN discount DECIMAL(5,2)
+    Source->>CDC: DDL change detected in WAL
+
+    CDC->>Registry: Register new schema version (v3: +discount field)
+    Registry->>Registry: Compatibility check (BACKWARD mode)
+    
+    alt Compatible (new optional field with default)
+        Registry-->>CDC: Schema v3 registered (id=47)
+        CDC->>CDC: Continue producing with schema_id=47
+        
+        Pipeline->>Registry: Fetch schema v3 (on first message with id=47)
+        Pipeline->>Pipeline: Auto-evolve: add nullable column to staging
+        Pipeline->>DWH: ALTER TABLE stg_orders ADD COLUMN discount DECIMAL(5,2)
+        Pipeline->>Pipeline: Continue processing (old rows: discount=NULL)
+    else Incompatible (breaking change)
+        Registry-->>CDC: REJECTED (compatibility violation)
+        CDC->>CDC: Pause connector (cannot serialize)
+        CDC->>Alert: Schema incompatibility detected
+        Alert->>Dev: "Breaking schema change on orders table"
+        
+        Note over Dev: Manual resolution required
+        Dev->>Registry: Update compatibility mode or fix schema
+        Dev->>CDC: Resume connector
+    end
+
+    Note over Pipeline: Column removal detected (source dropped 'legacy_field')
+    Pipeline->>Pipeline: Soft-delete: mark column deprecated (keep 30 days)
+    Pipeline->>DWH: Column remains but stops receiving updates
+    Pipeline->>Alert: Deprecation notice to downstream consumers
+```
+
+### Caching Strategy
+
+| Layer | Cached Data | Strategy | Benefit |
+|-------|------------|----------|---------|
+| Connector state | LSN/offset checkpoints | Persistent in Kafka | Exactly-once resume |
+| Schema cache | Deserialized schemas | Local LRU per worker | Avoid registry calls per message |
+| Transformation cache | dbt model content hash | Skip unchanged models | 80% faster incremental runs |
+| Lookup tables | Dimension snapshots for enrichment | Redis with 5min TTL | Avoid warehouse queries during transform |
+| Query results | Freshness metadata | In-memory per connector | Fast SLA checks without DB round-trips |
+
+### Infrastructure Components
+
+```
+┌──────────────────────────────────────────────────────────┐
+│ Source Connectivity                                        │
+│  ├── Debezium connectors (Kafka Connect cluster, 6 nodes)│
+│  ├── REST API extractors (containerized, auto-scaling)   │
+│  ├── File watchers (S3 event notifications → Lambda)     │
+│  └── SSH tunnels / PrivateLink (secure source access)    │
+├──────────────────────────────────────────────────────────┤
+│ Streaming / Buffering                                     │
+│  ├── Kafka cluster (6 brokers, 3 AZ, 7-day retention)   │
+│  ├── Schema Registry (3-node, HA)                        │
+│  └── Dead Letter Queue (per connector)                   │
+├──────────────────────────────────────────────────────────┤
+│ Compute / Transform                                       │
+│  ├── dbt Cloud / dbt-core on Kubernetes                  │
+│  ├── Spark for heavy transformations (EMR/Dataproc)      │
+│  └── Airflow (DAG orchestration, 3 schedulers)           │
+├──────────────────────────────────────────────────────────┤
+│ Destination                                               │
+│  ├── Snowflake / BigQuery / Redshift (warehouse)         │
+│  ├── Delta Lake (lakehouse for raw + transformed)        │
+│  └── Elasticsearch (for operational search use cases)    │
+├──────────────────────────────────────────────────────────┤
+│ Observability                                             │
+│  ├── Datadog (metrics, logs, traces)                     │
+│  ├── Monte Carlo / Great Expectations (data quality)     │
+│  └── PagerDuty (alerting on SLA breach)                  │
+└──────────────────────────────────────────────────────────┘
+```
+

@@ -60,6 +60,89 @@
 
 ## 4. Data Modeling
 
+### Entity-Relationship Diagram
+
+```mermaid
+erDiagram
+    earning_events }o--|| earner_balances : "updates"
+    earner_balances ||--o{ balance_ledger : "logged in"
+    earner_balances ||--o{ payouts : "triggers"
+    payouts }o--|| payout_destinations : "paid to"
+    payouts }o--o| payout_batches : "grouped in"
+    payouts ||--o| reconciliation_entries : "reconciled"
+    earner_balances ||--o{ payout_holds : "may have"
+    earner_balances ||--|| tax_records : "tracked for tax"
+
+    earning_events {
+        UUID event_id PK
+        UUID earner_id FK
+        VARCHAR earning_type
+        DECIMAL amount
+        VARCHAR source_type
+        VARCHAR status
+    }
+    earner_balances {
+        UUID earner_id PK
+        DECIMAL available_balance
+        DECIMAL pending_balance
+        DECIMAL held_balance
+        DECIMAL lifetime_earnings
+        BIGINT version
+    }
+    balance_ledger {
+        UUID ledger_id PK
+        UUID earner_id FK
+        VARCHAR entry_type
+        DECIMAL debit
+        DECIMAL credit
+        DECIMAL balance_after
+    }
+    payouts {
+        UUID payout_id PK
+        UUID earner_id FK
+        DECIMAL amount
+        VARCHAR payout_method
+        UUID destination_id FK
+        VARCHAR status
+        UUID batch_id FK
+    }
+    payout_destinations {
+        UUID destination_id PK
+        UUID earner_id FK
+        VARCHAR method_type
+        BOOLEAN is_verified
+        BOOLEAN is_default
+    }
+    payout_batches {
+        UUID batch_id PK
+        VARCHAR batch_type
+        VARCHAR status
+        DECIMAL total_amount
+        INTEGER total_count
+    }
+    payout_holds {
+        UUID hold_id PK
+        UUID earner_id FK
+        VARCHAR hold_type
+        DECIMAL hold_amount
+        VARCHAR status
+    }
+    tax_records {
+        UUID tax_record_id PK
+        UUID earner_id FK
+        INTEGER tax_year
+        DECIMAL net_earnings
+        BOOLEAN threshold_reached
+    }
+    reconciliation_entries {
+        UUID recon_id PK
+        UUID payout_id FK
+        DECIMAL expected_amount
+        DECIMAL actual_amount
+        VARCHAR match_status
+    }
+```
+
 ### Full Database Schemas
 
 ```sql
@@ -1078,3 +1161,165 @@ alerts:
 | Instant payouts | Visa Direct / Mastercard Send | Internal ledger transfer | Real card push for actual bank deposit |
 | FX | Multi-provider routing | Single provider | Better rates through competition |
 | Idempotency | Redis + DB unique constraint | DB-only | Speed of check without DB roundtrip |
+
+---
+
+## 12. Sequence Diagrams
+
+### Diagram 1: Batch Payout Calculation + Execution
+
+```mermaid
+sequenceDiagram
+    participant Cron as Payout Scheduler
+    participant Calc as Payout Calculator
+    participant DB as Payout DB
+    participant Ledger as Ledger
+    participant Queue as Execution Queue
+    participant Exec as Payout Executor
+    participant Bank as Bank (ACH/NEFT)
+    participant Kafka as Event Bus
+
+    Cron->>Calc: Trigger weekly payout run (creators batch, cutoff=Sunday 23:59)
+    Calc->>DB: SELECT earnings WHERE status=PENDING AND created_at < cutoff GROUP BY creator_id
+    DB-->>Calc: 50,000 creators with pending earnings
+    
+    loop For each creator (parallelized)
+        Calc->>Calc: Sum earnings - platform_fee - tax_withholding
+        Calc->>Calc: Check minimum payout threshold ($25)
+        Calc->>DB: INSERT payout (creator=C1, gross=500, fee=75, tax=42.50, net=382.50, idem_key=PAY_C1_W3)
+        Calc->>Ledger: DR: creator_payable $382.50, CR: pending_bank_transfer $382.50
+    end
+    
+    Calc->>Queue: Enqueue 45,000 payouts (5,000 below threshold, deferred)
+    Calc->>Kafka: Publish payout.batch_created {batch_id=B_001, count=45000, total=$2.1M}
+    
+    Queue->>Exec: Process payouts (rate-limited: 1000/minute to bank API)
+    
+    loop For each payout (sequential within bank, parallel across banks)
+        Exec->>Bank: POST /transfers (amount=382.50, account=creator_bank_acc, ref=PAY_C1_W3)
+        Bank-->>Exec: Accepted (bank_ref=ACH_789, settlement=T+1)
+        Exec->>DB: UPDATE payout SET status=SUBMITTED, bank_ref=ACH_789
+        Exec->>Ledger: DR: pending_bank_transfer, CR: bank_settlement
+    end
+    
+    Exec->>Kafka: Publish payout.batch_submitted {batch=B_001, submitted=45000}
+
+    Note over Cron,Kafka: Idempotency: creator_id + week_number = unique payout.<br/>Re-running same batch produces same payouts (safe to retry entire batch).
+```
+
+### Diagram 2: Failed Payout Retry + Reconciliation
+
+```mermaid
+sequenceDiagram
+    participant Bank as Bank
+    participant Webhook as Bank Webhook Handler
+    participant DB as Payout DB
+    participant Ledger as Ledger
+    participant Retry as Retry Engine
+    participant Recon as Reconciliation
+    participant Notify as Notification
+    participant Creator as Creator
+
+    Bank->>Webhook: Callback: transfer FAILED (ref=PAY_C1_W3, reason=invalid_account)
+    Webhook->>Webhook: Verify webhook signature (HMAC)
+    Webhook->>DB: UPDATE payout SET status=FAILED, failure_reason=invalid_account
+    Webhook->>Ledger: Reverse: DR: bank_settlement, CR: pending_bank_transfer
+    Webhook->>Notify: Alert creator: "Payout failed - please update bank details"
+    Notify-->>Creator: Email + Push: "Update your bank account to receive $382.50"
+    
+    Creator->>DB: Update bank account details (new_account=ACC_456)
+    
+    Retry->>DB: SELECT failed payouts WHERE bank_details_updated=true
+    DB-->>Retry: PAY_C1_W3 (amount=382.50, new_account=ACC_456)
+    Retry->>Bank: POST /transfers (amount=382.50, account=ACC_456, ref=PAY_C1_W3_R1)
+    Bank-->>Retry: Accepted (bank_ref=ACH_999)
+    Retry->>DB: UPDATE payout SET status=SUBMITTED, attempt=2, bank_ref=ACH_999
+    
+    Note over Bank,Creator: After 3 failed attempts → hold funds, require support intervention
+    
+    Recon->>Bank: GET /statements (date=yesterday)
+    Bank-->>Recon: Statement: 44,500 successful, 500 returned
+    Recon->>DB: SELECT payouts WHERE status=SUBMITTED AND date=yesterday
+    Recon->>Recon: Match: bank statement ↔ internal records
+    Recon->>Recon: Flag: 2 payouts in DB but not in statement (investigate!)
+    Recon->>Ledger: Verify: SUM(payouts) == SUM(bank_debits)
+    Recon->>Kafka: Publish reconciliation.complete {matched: 44500, breaks: 2}
+
+    Note over Bank,Recon: T+1 reconciliation catches: silent failures, duplicate sends,<br/>amount mismatches. Every cent must be accounted for.
+```
+
+### Caching Strategy
+
+```
+PAYOUT SYSTEM CACHING
+
+1. CREATOR BALANCE CACHE (Write-through)
+   Key: creator:{id}:pending_balance
+   Updated: On every earning event (ride completed, content monetized)
+   Pattern: Increment in Redis MULTI + DB in same transaction
+   Used for: Dashboard "available balance" display
+   CRITICAL: Stale balance → creator expects payout they can't receive
+
+2. BANK ACCOUNT VALIDATION CACHE
+   Key: bank_valid:{routing}:{account_hash}
+   TTL: 30 days (bank accounts don't change often)
+   Content: validation_result, last_successful_transfer
+   Saves: Redundant bank API validation calls
+
+3. FX RATE CACHE (for international payouts)
+   Key: fx:{from}:{to}:rate
+   TTL: 30 seconds (rates are volatile)
+   DANGER: Stale rate on large batch = significant loss
+   Mitigation: Lock rate at batch start, hard-fail if rate changes >1%
+
+4. PAYOUT STATUS CACHE
+   Key: payout:{id}:status
+   TTL: Until terminal state (succeeded/failed)
+   Used for: Creator checking "where's my money" (high-frequency polling)
+
+WHERE EVENTUAL CONSISTENCY IS DANGEROUS:
+- Balance → creator sees higher amount → upset when payout is less
+- FX rate → wrong conversion → platform absorbs loss or creator shortchanged
+WHERE ACCEPTABLE:
+- Dashboard analytics (total earned this month) — seconds of lag fine
+- Payout history list — eventual consistency OK
+```
+
+### Infrastructure Components
+
+```
+┌─────────────────────────────────────────────────────────────┐
+│ PAYOUT SYSTEM INFRASTRUCTURE                                 │
+├─────────────────────────────────────────────────────────────┤
+│                                                              │
+│ COMPUTE:                                                     │
+│ ├── Payout Calculator: Batch jobs (high-CPU, runs weekly)    │
+│ ├── Payout Executor: Rate-limited workers (bank API limits)  │
+│ ├── Webhook receivers: Highly available (bank callbacks)     │
+│ └── Reconciliation: Daily batch (compare bank ↔ internal)    │
+│                                                              │
+│ DATABASE:                                                     │
+│ ├── PostgreSQL: Payouts, earnings, creator accounts          │
+│ ├── Partitioned by payout_date (monthly)                     │
+│ └── Strong consistency (serializable for balance operations) │
+│                                                              │
+│ QUEUE/MESSAGING:                                             │
+│ ├── Kafka: Events (earning.created, payout.submitted, etc.)  │
+│ ├── SQS/Redis Queue: Payout execution queue (rate-limited)   │
+│ └── Dead letter queue: Failed payouts for investigation      │
+│                                                              │
+│ BANKING INTEGRATIONS:                                        │
+│ ├── ACH (US): NACHA file generation, batch submission        │
+│ ├── NEFT/IMPS (India): Real-time + batch                     │
+│ ├── SEPA (EU): XML ISO 20022 format                          │
+│ ├── Visa Direct / Mastercard Send: Instant (card push)       │
+│ └── Multi-provider routing: cheapest rail per destination     │
+│                                                              │
+│ MONITORING:                                                   │
+│ ├── Payout success rate by bank/rail (alert < 95%)           │
+│ ├── Reconciliation breaks dashboard                          │
+│ ├── Creator complaint correlation with failed payouts        │
+│ └── Cost per payout by rail (optimize routing)               │
+│                                                              │
+└─────────────────────────────────────────────────────────────┘
+```

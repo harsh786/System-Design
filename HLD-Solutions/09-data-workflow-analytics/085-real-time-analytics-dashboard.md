@@ -59,6 +59,58 @@
 
 ## 4. Data Modeling
 
+### Entity-Relationship Diagram
+
+```mermaid
+erDiagram
+    EVENTS {
+        uuid event_id PK
+        string event_type
+        datetime timestamp
+        uuid tenant_id
+        string user_id
+        decimal revenue
+    }
+    DASHBOARDS {
+        uuid dashboard_id PK
+        uuid tenant_id
+        varchar title
+        uuid created_by
+        boolean is_public
+    }
+    WIDGETS {
+        uuid widget_id PK
+        uuid dashboard_id FK
+        varchar title
+        varchar widget_type
+        jsonb query
+    }
+    ALERT_RULES {
+        uuid alert_id PK
+        uuid tenant_id
+        varchar name
+        varchar severity
+        varchar state
+    }
+    ALERT_HISTORY {
+        bigint history_id PK
+        uuid alert_id FK
+        varchar state_change
+        double value
+    }
+    SAVED_QUERIES {
+        uuid query_id PK
+        uuid tenant_id
+        varchar name
+        text query
+    }
+
+    DASHBOARDS ||--o{ WIDGETS : contains
+    ALERT_RULES ||--o{ ALERT_HISTORY : fires
+    EVENTS }o--o{ WIDGETS : queried-by
+    EVENTS }o--o{ ALERT_RULES : evaluated-by
+```
+
 ### ClickHouse Schemas
 
 ```sql
@@ -1179,3 +1231,92 @@ groups:
 ---
 
 *Total lines: 500+ | Covers all 11 standard sections with full depth*
+
+---
+
+## 12. Sequence Diagrams
+
+### Diagram 1: Event Ingestion + Windowed Aggregation
+
+```mermaid
+sequenceDiagram
+    participant App as Application SDK
+    participant LB as Load Balancer
+    participant Ingest as Ingestion Service
+    participant Kafka
+    participant Flink as Flink Job
+    participant CH as ClickHouse
+    participant Cache as Redis Cache
+
+    App->>App: Buffer events locally (max 100 or 5s)
+    App->>LB: POST /v1/events (batch of 50 events, gzip)
+    LB->>Ingest: Route to healthy instance
+
+    Ingest->>Ingest: Validate schema, enrich (timestamp, geo)
+    Ingest->>Kafka: Produce to events topic (partition by tenant_id)
+    Kafka-->>Ingest: ACK (acks=1 for low latency)
+    Ingest-->>App: 202 Accepted
+
+    Flink->>Kafka: Consume events (consumer group: analytics-v1)
+    Flink->>Flink: Assign event timestamps (event-time processing)
+    Flink->>Flink: Window: tumbling 1-min, sliding 5-min
+
+    Note over Flink: Watermark advances (allows 30s late data)
+
+    Flink->>Flink: Aggregate per window: COUNT, SUM, P99
+    Flink->>CH: INSERT aggregated rows (batch 10K rows)
+    Flink->>Cache: SET latest aggregates (TTL=60s)
+
+    Note over Flink: Late event arrives (within allowed lateness)
+    Flink->>Flink: Update window, emit retraction + new result
+    Flink->>CH: UPDATE aggregate row (idempotent via ReplacingMergeTree)
+    Flink->>Cache: Invalidate affected keys
+```
+
+### Diagram 2: Dashboard Query with Cache
+
+```mermaid
+sequenceDiagram
+    participant User
+    participant UI as Dashboard UI
+    participant GW as Query Gateway
+    participant Cache as Redis (L1)
+    participant QE as Query Engine
+    participant CH as ClickHouse
+    participant PreAgg as Pre-Aggregation Table
+
+    User->>UI: Load dashboard (5 widgets, time range: last 1h)
+    UI->>GW: POST /query (batch: 5 queries, tenant_id in JWT)
+
+    loop For each query widget
+        GW->>GW: Generate cache key: SHA256(query + time_bucket + tenant)
+        GW->>Cache: GET cache_key
+        
+        alt Cache HIT (TTL not expired)
+            Cache-->>GW: Cached result
+        else Cache MISS
+            GW->>QE: Execute query (tenant_id injected as filter)
+            QE->>QE: Determine optimal table (raw vs pre-agg)
+            
+            alt Time range > 1h AND granularity >= 1min
+                QE->>PreAgg: SELECT from 1min_rollup
+            else
+                QE->>CH: SELECT from raw events (PREWHERE tenant_id = X)
+            end
+            
+            CH-->>QE: Result rows
+            QE-->>GW: Formatted result
+            GW->>Cache: SET cache_key (TTL based on time range freshness)
+        end
+    end
+
+    GW-->>UI: {results: [widget1, widget2, ...], cache_hits: 3/5}
+    UI->>UI: Render charts (WebSocket for live updates)
+
+    Note over UI: Auto-refresh every 10s for "live" widgets
+    UI->>GW: GET /query/stream (WebSocket, widget_ids)
+    GW->>Cache: Subscribe to invalidation channel
+    Cache-->>GW: New data available
+    GW-->>UI: Push updated widget data
+```
+

@@ -81,6 +81,54 @@ With shuffle sharding: each customer's traffic spread across 5 cells
 
 ## 4. Data Modeling
 
+### Entity-Relationship Diagram
+
+```mermaid
+erDiagram
+    CELLS {
+        string cell_id PK
+        string region
+        string status
+        int capacity_limit
+        float health_score
+    }
+    CELL_ASSIGNMENTS {
+        string partition_key PK
+        string cell_id FK
+        bigint version
+    }
+    CELL_HEALTH {
+        string cell_id FK
+        timestamp timestamp PK
+        float error_rate
+        float p99_latency_ms
+    }
+    DEPLOYMENTS {
+        uuid deployment_id PK
+        string version
+        string status
+        int cells_total
+    }
+    DEPLOYMENT_CELL_STATUS {
+        uuid deployment_id FK
+        string cell_id FK
+        string status
+    }
+    MIGRATIONS {
+        uuid migration_id PK
+        string partition_key FK
+        string source_cell FK
+        string target_cell FK
+        string status
+    }
+
+    CELLS ||--o{ CELL_ASSIGNMENTS : hosts
+    CELLS ||--o{ CELL_HEALTH : monitored_by
+    DEPLOYMENTS ||--o{ DEPLOYMENT_CELL_STATUS : tracks
+    CELLS ||--o{ DEPLOYMENT_CELL_STATUS : deployed_to
+    CELLS ||--o{ MIGRATIONS : source_or_target
+```
+
 ### Routing Table Schema
 ```sql
 CREATE TABLE cell_assignments (
@@ -799,3 +847,127 @@ Cell-Based vs Microservices:
 5. Minimize Cross-Cell: Every cross-cell call is a failure domain
    coupling. Design data models to keep requests cell-local.
 ```
+
+---
+
+## Sequence Diagrams
+
+### 1. Request Routing to Cell
+
+```mermaid
+sequenceDiagram
+    participant Client
+    participant DNS as Global DNS
+    participant Router as Cell Router (Global)
+    participant Map as Cell Mapping Service
+    participant Cache as Router Cache
+    participant CellA as Cell-A (US)
+    participant CellB as Cell-B (EU)
+
+    Client->>DNS: Resolve api.example.com
+    DNS-->>Client: Cell Router IP (anycast)
+
+    Client->>Router: POST /api/orders {user_id: U123}
+
+    Router->>Cache: Lookup cell for user U123
+    alt Cache hit
+        Cache-->>Router: Cell-A
+    else Cache miss
+        Router->>Map: GetCell(user_id: U123)
+        Map->>Map: hash(U123) → cell assignment table
+        Map-->>Router: {cell: Cell-A, region: US-East}
+        Router->>Cache: Store mapping (TTL 5min)
+    end
+
+    Router->>CellA: Forward request (X-Cell-Id: A, X-User-Id: U123)
+    Note over CellA: Self-contained cell:<br/>Own LB, App servers, DB, Cache, Queue
+
+    CellA->>CellA: Process entirely within cell
+    CellA-->>Router: 201 Created
+    Router-->>Client: 201 Created (X-Served-By: Cell-A)
+
+    Note over Router: If Cell-A unhealthy → overflow to Cell-B<br/>Cross-cell only for disaster recovery
+```
+
+### 2. Cell Failover Flow
+
+```mermaid
+sequenceDiagram
+    participant HC as Health Checker (Global)
+    participant Router as Cell Router
+    participant CellA as Cell-A (Failing)
+    participant CellB as Cell-B (Healthy)
+    participant Migration as Cell Migration Service
+    participant DB_A as Cell-A DB
+    participant DB_B as Cell-B DB
+
+    loop Every 5 seconds
+        HC->>CellA: Deep health check (DB + App + Queue)
+        CellA-->>HC: Degraded (DB latency > 5s)
+    end
+
+    HC->>HC: Cell-A unhealthy (3 consecutive failures)
+    HC->>Router: Mark Cell-A as DRAINING
+
+    Note over Router: New requests for Cell-A users → queue (30s buffer)
+
+    HC->>Migration: Initiate cell migration for Cell-A users
+    Migration->>DB_A: Snapshot affected user data (last consistent point)
+    DB_A-->>Migration: Snapshot ready
+
+    Migration->>DB_B: Restore user data into Cell-B
+    DB_B-->>Migration: Restore complete
+
+    Migration->>Migration: Verify data integrity (checksums)
+    Migration->>Router: Update cell mapping: Cell-A users → Cell-B
+
+    Router->>Router: Drain queued requests → Cell-B
+    Router->>CellB: Forward queued + new requests
+    CellB-->>Router: Processing normally
+
+    Note over Router: Total failover time: 30-60s<br/>Blast radius: only Cell-A users affected<br/>Other cells completely unaffected
+
+    HC->>HC: Monitor Cell-A recovery
+    Note over Migration: When Cell-A recovers:<br/>Gradual migration back (10% → 50% → 100%)<br/>Or rebalance across all cells
+```
+
+### Caching Strategy
+
+#### Multi-Tier Caching (Per Cell)
+- **L1 (Application)**: In-process LRU cache per app instance; 256MB; TTL 60s; cell-local data only
+- **L2 (Redis Cluster)**: Per-cell Redis cluster (not shared across cells); 32GB; full cell user data
+- **L3 (CDN)**: Edge caching for static assets; cell-aware cache keys to prevent cross-cell cache pollution
+
+#### Cache Eviction Policies
+- **L1**: LFU with 60s TTL; bounded by memory (evict at 80% capacity)
+- **L2**: allkeys-lfu; maxmemory = 80% of available RAM; no cross-cell cache sharing
+- **Cell mapping cache** (at router): LRU with 5min TTL; 10M entries (one per active user)
+
+#### Cache Invalidation
+- **Intra-cell**: Standard pub/sub invalidation within cell's own Redis
+- **Cell migration**: Full cache flush for migrating users; pre-warm in destination cell before cutover
+- **Router cache**: Invalidated by cell mapping service on any rebalance or failover event
+
+#### Thundering Herd Prevention
+- **Cell isolation**: Each cell handles its own thundering herd independently (blast radius contained)
+- **Single-flight per cell**: Redis-based distributed lock for cache population within cell
+- **Router-level coalescing**: Multiple requests for same user during failover queued (not forwarded individually)
+
+### Infrastructure Components
+
+#### Load Balancer
+- **Global tier**: Anycast + GeoDNS routes to nearest Cell Router
+- **Cell Router**: L7 LB that inspects request (user_id header/token) to determine target cell
+- **Per-cell LB**: Each cell has independent L4/L7 LB stack (fully isolated)
+
+#### API Gateway
+- **Global gateway**: Thin layer for authentication only; passes `X-Cell-Id` after cell determination
+- **Per-cell gateway**: Full API gateway features (rate limiting, transformation) within each cell
+- **No cross-cell API calls**: Design principle — if request needs data from another cell, it's a design smell
+
+#### Cell Infrastructure (Each Cell Contains)
+- Independent Kubernetes cluster (or VM fleet)
+- Own database cluster (Postgres/DynamoDB) with local replicas
+- Own message queue (Kafka/SQS) — no cross-cell message passing
+- Own Redis cluster, monitoring stack, and deployment pipeline
+- Cell capacity: 10K-100K users (right-sized to limit blast radius)

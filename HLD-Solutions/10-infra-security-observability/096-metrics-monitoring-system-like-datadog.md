@@ -807,6 +807,74 @@ class AutoDiscovery:
 
 ## 8. Database Schema
 
+### Entity-Relationship Diagram
+
+```mermaid
+erDiagram
+    METRIC_METADATA {
+        bigint metric_id PK
+        string metric_name
+        string metric_type
+        bigint tenant_id
+    }
+    SERIES {
+        bigint series_id PK
+        bigint metric_id FK
+        bigint tags_hash
+        bigint tenant_id
+    }
+    TAG_POSTINGS {
+        string tag_key
+        string tag_value
+        bigint series_id FK
+        bigint tenant_id
+    }
+    CHUNKS {
+        bigint chunk_id PK
+        bigint series_id FK
+        bigint start_time
+        bigint end_time
+        int point_count
+    }
+    ROLLUPS {
+        bigint series_id FK
+        bigint timestamp
+        int resolution
+        double avg_value
+    }
+    DASHBOARDS {
+        uuid id PK
+        bigint tenant_id
+        string title
+        jsonb widgets
+    }
+    MONITORS {
+        uuid id PK
+        bigint tenant_id
+        string name
+        string type
+        string status
+    }
+    MONITOR_STATE {
+        uuid monitor_id FK
+        string group_key
+        string status
+    }
+    ALERT_EVENTS {
+        uuid id PK
+        uuid monitor_id FK
+        bigint tenant_id
+        string status
+    }
+
+    METRIC_METADATA ||--o{ SERIES : "has"
+    SERIES ||--o{ TAG_POSTINGS : "indexed by"
+    SERIES ||--o{ CHUNKS : "stores"
+    SERIES ||--o{ ROLLUPS : "aggregated into"
+    MONITORS ||--o{ MONITOR_STATE : "tracks"
+    MONITORS ||--o{ ALERT_EVENTS : "fires"
+```
+
 ### Time-Series Storage (Custom Engine)
 
 ```sql
@@ -1098,3 +1166,159 @@ redis:
 - TSDB snapshots to object storage every 6 hours
 - Alert configuration replicated to standby region
 - RTO: 5 minutes for alerting, 30 minutes for full dashboard access
+
+---
+
+## Sequence Diagrams
+
+### Metric Write Path + Pre-Aggregation
+
+```mermaid
+sequenceDiagram
+    participant Agent as Host Agent (DogStatsD)
+    participant Agg as Local Aggregator
+    participant Ingest as Intake Service
+    participant PreAgg as Pre-Aggregation (Flink/Kafka Streams)
+    participant TSDB as Time-Series DB
+    participant Index as Inverted Index (tags)
+
+    Agent->>Agent: Collect metrics every 10s (CPU, mem, custom)
+    Agent->>Agg: Batch metrics locally (flush every 10s)
+    Agg->>Agg: Local pre-aggregation (count, sum, min, max, avg per interval)
+    Agg->>Ingest: POST /intake {series: [{metric, points, tags}]}
+    Ingest->>Ingest: Validate, normalize tags, apply rate limits
+    Ingest->>PreAgg: Publish to Kafka (partitioned by metric_name)
+
+    PreAgg->>PreAgg: Windowed aggregation (1min rollups from 10s data)
+    PreAgg->>TSDB: Write compressed chunk (Gorilla encoding)
+    PreAgg->>Index: Update inverted index (tag → series_id mapping)
+
+    Note over TSDB: Storage tiers: hot (SSD, 48h) → warm (HDD, 15d) → cold (S3, 15mo)
+```
+
+### Alert Evaluation + Notification
+
+```mermaid
+sequenceDiagram
+    participant Scheduler as Alert Scheduler
+    participant Eval as Alert Evaluator
+    participant TSDB as Time-Series DB
+    participant StateStore as Alert State (Redis)
+    participant Router as Notification Router
+    participant PD as PagerDuty
+    participant Slack as Slack
+
+    Scheduler->>Eval: Trigger evaluation (every 30s per monitor)
+    Eval->>TSDB: Query: avg(cpu.usage){host:web-*} last 5min
+    TSDB-->>Eval: Result: 87.3%
+    Eval->>Eval: Compare against threshold (> 80% for 5min)
+    Eval->>StateStore: Get current alert state
+    StateStore-->>Eval: State: WARN (since 3min ago)
+
+    alt Threshold exceeded for full duration
+        Eval->>StateStore: Transition: WARN → ALERT
+        Eval->>Router: Fire alert {monitor_id, severity: critical, value: 87.3%}
+        Router->>Router: Apply routing rules (team, severity, time-of-day)
+        par PagerDuty notification
+            Router->>PD: Create incident (critical, on-call: Alice)
+        and Slack notification
+            Router->>Slack: Post to #alerts-infra channel
+        end
+    else Below threshold (recovery)
+        Eval->>StateStore: Transition: ALERT → OK
+        Eval->>Router: Fire recovery notification
+    end
+
+    Note over Eval: De-duplication: same alert won't re-fire within 60s window
+```
+
+## Caching Strategy
+
+| Layer | What's Cached | TTL | Invalidation |
+|-------|--------------|-----|-------------|
+| Query cache (Redis) | Frequent dashboard queries | 30s | Time-based expiry |
+| Metadata cache | Tag→series_id mappings | 5 min | LRU eviction |
+| Chunk cache (memcached) | Recent TSDB chunks | 2 hours | Eviction on write |
+| Dashboard cache | Rendered dashboard JSON | 10s | On edit |
+| Alert state | Current alert states | Persistent | Explicit state transitions |
+
+### Cache Design Principles
+- Write path: NO caching (must be durable immediately)
+- Read path: Aggressive caching (dashboards are read-heavy, same query repeated)
+- Tag cardinality tracking: Cache high-cardinality tag warnings to prevent metric explosion
+
+## Deep Dive: TSDB Storage Engine
+
+### Gorilla Compression (Facebook, 2015)
+
+Time-series data has high compressibility because consecutive points have similar timestamps and values.
+
+**Timestamp Compression (Delta-of-Delta):**
+```
+Raw timestamps:     1000, 1010, 1020, 1030, 1040
+Deltas:             -, 10, 10, 10, 10
+Delta-of-deltas:    -, -, 0, 0, 0
+
+Encoding:
+- DoD == 0: encode as single '0' bit
+- DoD in [-63, 64]: encode as '10' + 7 bits
+- DoD in [-255, 256]: encode as '110' + 9 bits
+- DoD in [-2047, 2048]: encode as '1110' + 12 bits
+- Otherwise: encode as '1111' + 32 bits
+
+Result: Regular 10s intervals → 1 bit per timestamp (vs 64 bits raw)
+```
+
+**Value Compression (XOR encoding):**
+```
+Raw values:  72.5, 72.6, 72.4, 72.7, 72.5
+XOR with previous:
+  72.5 XOR 72.6 → small number of different bits
+
+Encoding:
+- XOR == 0 (same value): encode as single '0' bit
+- XOR != 0, leading/trailing zeros fit previous: '10' + meaningful bits only
+- Otherwise: '11' + leading zeros count (5 bits) + block length (6 bits) + meaningful bits
+
+Result: Slowly changing metrics → 1-2 bits per value (vs 64 bits raw)
+Compression ratio: ~12x (1.37 bytes per data point on average)
+```
+
+### Inverted Index for Labels
+
+```
+Structure (like a search engine):
+  tag "host:web-01" → series_ids [1, 5, 42, 100, ...]
+  tag "service:api" → series_ids [1, 2, 3, 42, ...]
+  tag "env:prod"    → series_ids [1, 2, 5, 42, 100, ...]
+
+Query: {host:web-01, service:api}
+  → INTERSECT posting lists: [1, 5, 42, 100] ∩ [1, 2, 3, 42] = [1, 42]
+  → Fetch chunks for series 1 and 42
+
+Optimization:
+  - Posting lists sorted → merge-intersect in O(n+m)
+  - Roaring bitmaps for dense posting lists (better than sorted arrays)
+  - Bloom filter per chunk to skip chunks without matching series
+```
+
+### Downsampling Strategy
+
+```
+Retention policy:
+  Raw (10s resolution):  48 hours  → hot tier (NVMe SSD)
+  1-minute rollups:      15 days   → warm tier (SSD)
+  5-minute rollups:      3 months  → cold tier (HDD)
+  1-hour rollups:        15 months → archive (S3)
+
+Rollup aggregations stored per interval:
+  {min, max, sum, count, avg, p50, p95, p99}
+
+Background job: runs hourly, reads raw → computes rollups → writes to next tier → deletes raw
+```
+
+### Write Path Guarantees
+- Write-Ahead Log (WAL) ensures no data loss on crash
+- Batched writes: accumulate 2 hours of data in memory, flush as immutable chunk
+- Replication: each chunk written to 3 nodes (quorum write: 2/3 must ACK)
+- Out-of-order writes: accepted within a 5-minute grace window, merged on compaction

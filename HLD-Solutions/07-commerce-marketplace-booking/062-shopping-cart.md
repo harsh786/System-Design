@@ -55,6 +55,48 @@
 
 ## 4. Data Modeling
 
+### Entity-Relationship Diagram
+
+```mermaid
+erDiagram
+    users {
+        UUID user_id PK
+    }
+    carts {
+        UUID cart_id PK
+        UUID user_id FK
+        VARCHAR session_id
+        VARCHAR status
+        DECIMAL subtotal
+        INTEGER item_count
+    }
+    cart_items {
+        UUID item_id PK
+        UUID cart_id FK
+        UUID product_id FK
+        UUID seller_id FK
+        INTEGER quantity
+        DECIMAL unit_price_at_add
+    }
+    cart_coupons {
+        UUID cart_id FK
+        VARCHAR coupon_code
+        VARCHAR discount_type
+        DECIMAL applied_discount
+    }
+    saved_for_later {
+        UUID id PK
+        UUID user_id FK
+        UUID product_id FK
+        DECIMAL price_at_save
+    }
+
+    users ||--o{ carts : "owns"
+    carts ||--o{ cart_items : "contains"
+    carts ||--o{ cart_coupons : "applies"
+    users ||--o{ saved_for_later : "saves"
+```
+
 ### Cart Schema (DynamoDB - Primary Store)
 ```
 Table: carts
@@ -1250,3 +1292,97 @@ alerts:
 | Cart Core | Go | Performance-critical cart mutations |
 | ML Pipeline | SageMaker | Recovery prediction model serving |
 | Monitoring | Prometheus + Grafana | Real-time operational metrics |
+
+---
+
+## 12. Sequence Diagrams
+
+### 12.1 Add Item + Price Validation + Inventory Hold
+
+```mermaid
+sequenceDiagram
+    participant User
+    participant API Gateway
+    participant CartService
+    participant PricingService
+    participant InventoryService
+    participant Redis
+    participant DynamoDB
+
+    User->>API Gateway: POST /cart/items {sku: SKU-100, qty: 1}
+    API Gateway->>CartService: addItem(user_id, sku, qty)
+
+    CartService->>PricingService: getPrice(SKU-100)
+    PricingService-->>CartService: {price: 49.99, promo: "10OFF", final: 44.99}
+
+    CartService->>InventoryService: softHold(SKU-100, qty=1, ttl=15min)
+    InventoryService->>Redis: DECR inventory:SKU-100:soft_hold
+    Redis-->>InventoryService: remaining = 42
+    InventoryService-->>CartService: {held: true, expires_at: T+15min}
+
+    CartService->>Redis: HSET cart:{user_id} SKU-100 {qty,price,hold_expiry}
+    CartService->>DynamoDB: PUT (backup for durability)
+    CartService-->>API Gateway: 200 {item_added, cart_total: 44.99}
+    API Gateway-->>User: Item added to cart
+
+    Note over Redis: Soft hold auto-releases after 15min<br/>Background job reconciles holds
+```
+
+### 12.2 Cart Merge on Login
+
+```mermaid
+sequenceDiagram
+    participant User
+    participant API Gateway
+    participant AuthService
+    participant CartService
+    participant Redis
+    participant DynamoDB
+
+    User->>API Gateway: POST /auth/login {email, password}
+    API Gateway->>AuthService: authenticate(credentials)
+    AuthService-->>API Gateway: {token, user_id: U-500}
+
+    API Gateway->>CartService: mergeCart(guest_session_id, user_id=U-500)
+
+    CartService->>Redis: HGETALL cart:guest:{session_id}
+    Redis-->>CartService: guest_cart = [{SKU-100, qty:1}, {SKU-200, qty:2}]
+
+    CartService->>DynamoDB: GET cart:U-500
+    DynamoDB-->>CartService: saved_cart = [{SKU-300, qty:1}]
+
+    Note over CartService: Merge strategy:<br/>1. Union of items<br/>2. Guest qty wins on conflict<br/>3. Re-validate prices
+
+    CartService->>Redis: HSET cart:U-500 (merged 3 items)
+    CartService->>DynamoDB: PUT cart:U-500 (merged)
+    CartService->>Redis: DEL cart:guest:{session_id}
+    CartService-->>API Gateway: {merged_cart: 3 items, total: 139.97}
+    API Gateway-->>User: Welcome back! Cart has 3 items
+```
+
+## 13. Infrastructure & Deployment
+
+### 13.1 Compute & Storage
+| Layer | Technology | Spec |
+|-------|-----------|------|
+| Application | EKS (Kubernetes) | 3 node groups, spot + on-demand mix |
+| Primary Cache | Redis Cluster | 6 nodes (3 primary + 3 replica), r6g.xlarge |
+| Durable Store | DynamoDB | On-demand capacity, global tables for multi-region |
+| Session Store | ElastiCache Redis | Separate cluster for session/guest carts |
+| CDN | CloudFront | Cart widget JS/CSS at edge |
+
+### 13.2 Networking & Security
+- **VPC**: Private subnets for Redis/DynamoDB, public for ALB
+- **WAF**: Rate limit 100 cart ops/min per user, block cart-bombing
+- **Encryption**: AES-256 at rest (DynamoDB), TLS 1.3 in transit
+- **IAM**: Least-privilege roles per microservice
+
+### 13.3 Auto-Scaling
+- **HPA**: Scale cart pods at 70% CPU or 1000 RPS per pod
+- **Redis**: Cluster mode with automatic resharding on memory pressure
+- **DynamoDB**: Auto-scaling on consumed WCU/RCU with 70% target
+
+### 13.4 Disaster Recovery
+- **RPO**: 0 (synchronous Redis replication within AZ)
+- **RTO**: < 30s (Redis sentinel failover)
+- **Multi-Region**: DynamoDB global tables, active-active for reads

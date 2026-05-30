@@ -56,6 +56,59 @@ Peak bandwidth: ~120 GB/s
 
 ## 3. Data Modeling
 
+### Entity-Relationship Diagram
+
+```mermaid
+erDiagram
+    FILES {
+        uuid file_id PK
+        bigint user_id FK
+        uuid parent_folder_id FK
+        string file_name
+        bigint file_size
+        int version
+    }
+    FILE_CHUNKS {
+        uuid chunk_id PK
+        uuid file_id FK
+        int chunk_index
+        string chunk_hash
+        string storage_ref
+    }
+    FILE_VERSIONS {
+        uuid version_id PK
+        uuid file_id FK
+        int version_number
+        bigint file_size
+        bigint modified_by
+    }
+    SHARING_ACLS {
+        uuid acl_id PK
+        uuid resource_id FK
+        string grantee_type
+        string permission
+        string share_link
+    }
+    DEVICE_SYNC_STATE {
+        uuid device_id PK
+        bigint user_id FK
+        bigint cursor
+        timestamp last_sync_at
+    }
+    CHANGE_JOURNAL {
+        bigserial journal_id PK
+        bigint user_id FK
+        uuid file_id FK
+        string change_type
+        timestamp timestamp
+    }
+    FILES ||--o{ FILE_CHUNKS : "split into"
+    FILES ||--o{ FILE_VERSIONS : "has versions"
+    FILES ||--o{ SHARING_ACLS : "shared via"
+    FILES ||--o{ CHANGE_JOURNAL : "tracked in"
+    DEVICE_SYNC_STATE }o--|| CHANGE_JOURNAL : "reads from"
+```
+
 ### File Metadata (PostgreSQL with Sharding)
 
 ```sql
@@ -1138,3 +1191,236 @@ Warning:
 - Metadata DB failure → read replica promotion
 - Block storage failure → erasure coding recovery
 - Client crash during upload → resume from last confirmed chunk
+
+---
+
+## Sequence Diagrams
+
+### File Sync with Delta Upload
+
+```mermaid
+sequenceDiagram
+    participant C as Desktop Client
+    participant FS as File Watcher
+    participant CE as Chunking Engine
+    participant API as Sync API
+    participant MS as Metadata Service
+    participant BS as Block Store
+    participant NS as Notification Service
+    participant C2 as Other Client
+
+    FS->>C: File modified event (inotify/FSEvents)
+    C->>CE: Compute CDC chunks (Rabin fingerprint)
+    CE-->>C: [chunk_hashes: h1,h2,h3_NEW,h4,h5_NEW]
+    C->>API: CheckChunks([h1,h2,h3_NEW,h4,h5_NEW])
+    API->>BS: Lookup hashes in block index
+    BS-->>API: {h1:exists, h2:exists, h3_NEW:missing, h4:exists, h5_NEW:missing}
+    API-->>C: Need upload: [h3_NEW, h5_NEW]
+
+    par Upload only changed chunks
+        C->>API: PutChunk(h3_NEW, data3)
+        C->>API: PutChunk(h5_NEW, data5)
+    end
+    API->>BS: Store chunks
+    BS-->>API: Stored
+
+    C->>API: CommitFile(path, version, chunk_list=[h1,h2,h3_NEW,h4,h5_NEW])
+    API->>MS: Update file record (new version, new chunk manifest)
+    MS-->>API: version_id=7
+    API-->>C: Committed (v7)
+
+    API->>NS: Publish change event (user_id, file_path, v7)
+    NS->>C2: Push notification (SSE/WebSocket)
+    C2->>API: GetFileMetadata(path, since=v6)
+    API-->>C2: Diff: replace chunks [h3→h3_NEW, h5→h5_NEW]
+    C2->>BS: Download h3_NEW, h5_NEW
+    C2->>C2: Reassemble file locally
+```
+
+### Conflict Resolution
+
+```mermaid
+sequenceDiagram
+    participant CA as Client A (offline edit)
+    participant CB as Client B (offline edit)
+    participant API as Sync Server
+    participant MS as Metadata Service
+    participant CR as Conflict Resolver
+
+    Note over CA,CB: Both clients edit same file while offline
+    CA->>CA: Edit file → local version v6-A
+    CB->>CB: Edit file → local version v6-B
+
+    CA->>API: CommitFile(path, base=v5, chunks_A)
+    API->>MS: Check current version
+    MS-->>API: current=v5 (no conflict)
+    API->>MS: Commit as v6
+    API-->>CA: Success (v6)
+
+    CB->>API: CommitFile(path, base=v5, chunks_B)
+    API->>MS: Check current version
+    MS-->>API: current=v6 (CONFLICT: base=v5 < current=v6)
+    API->>CR: ResolveConflict(base=v5, theirs=v6, mine=chunks_B)
+    
+    alt Auto-mergeable (non-overlapping edits)
+        CR->>CR: Three-way merge (chunk-level)
+        CR-->>API: Merged result
+        API->>MS: Commit as v7 (merged)
+        API-->>CB: Success (v7, auto-merged)
+    else Conflicting edits (same chunks modified)
+        CR-->>API: Cannot auto-merge
+        API->>MS: Save as "file (conflicted copy - Client B).ext"
+        API-->>CB: Conflict detected → conflicted copy created
+        API->>CA: Notify: conflict copy exists
+    end
+```
+
+### Shared Folder Collaboration
+
+```mermaid
+sequenceDiagram
+    participant Owner as Owner Client
+    participant API as API Gateway
+    participant ACL as Permission Service
+    participant MS as Metadata Service
+    participant NS as Notification Service
+    participant Member as Member Client
+    participant Email as Email Service
+
+    Owner->>API: ShareFolder(folder_id, user_B, permission=EDIT)
+    API->>ACL: AddPermission(folder_id, user_B, EDIT)
+    ACL->>ACL: Validate: owner has share rights
+    ACL->>MS: Create shared_folder_membership record
+    MS-->>ACL: Created
+    ACL-->>API: Permission granted
+    API->>Email: Send invite email to user_B
+    API->>NS: Push share notification to user_B
+
+    Member->>API: AcceptShare(folder_id)
+    API->>ACL: Verify invite exists
+    ACL-->>API: Valid
+    API->>MS: Mount folder in Member's namespace
+    MS-->>API: Mounted at /Shared/FolderName
+    API-->>Member: Folder synced (initial file list)
+    Member->>API: Sync full folder contents
+
+    Note over Member: Member edits a file
+    Member->>API: CommitFile(shared_folder/doc.txt, v1, chunks)
+    API->>ACL: CheckPermission(user_B, folder_id, WRITE)
+    ACL-->>API: ALLOWED
+    API->>MS: Commit file change
+    API->>NS: Notify all folder members
+    NS->>Owner: File changed by Member
+```
+
+## Algorithm Deep Dive: Content-Defined Chunking (CDC) with Rabin Fingerprint
+
+### Problem
+
+Fixed-size chunking (e.g., 4MB blocks) causes cascading changes: inserting 1 byte at offset 0 shifts ALL chunk boundaries, forcing re-upload of the entire file.
+
+### Solution: Rabin Fingerprint Rolling Hash
+
+Content-Defined Chunking uses a rolling hash to find chunk boundaries based on **content patterns** rather than fixed positions. Inserting data only affects the chunk where the insertion occurs.
+
+### Step-by-Step Algorithm
+
+**Step 1: Configure Parameters**
+
+```
+Window size (w): 48 bytes (sliding window for fingerprint)
+Target chunk size: 8 KB (average)
+Min chunk size: 2 KB (prevent tiny chunks)
+Max chunk size: 64 KB (bound worst case)
+Mask: 0x0000000000001FFF (13 low bits = 1 → average 2^13 = 8KB chunks)
+```
+
+**Step 2: Rabin Fingerprint Computation**
+
+The Rabin fingerprint is a polynomial hash over GF(2):
+```
+fp(B[0..w-1]) = (B[0]·x^(w-1) + B[1]·x^(w-2) + ... + B[w-1]) mod P
+
+Where P is an irreducible polynomial (e.g., degree-64 polynomial)
+```
+
+**Rolling property (O(1) per byte):**
+```
+When window slides from B[i..i+w-1] to B[i+1..i+w]:
+fp_new = (fp_old · x - B[i] · x^w + B[i+w]) mod P
+
+Key insight: Only need to subtract outgoing byte's contribution and add incoming byte
+```
+
+**Step 3: Chunk Boundary Detection**
+
+```python
+def find_chunks(data):
+    chunks = []
+    chunk_start = 0
+    fp = 0  # rolling fingerprint
+    
+    for i in range(len(data)):
+        fp = roll_fingerprint(fp, data, i, window=48)
+        chunk_len = i - chunk_start
+        
+        if chunk_len < MIN_CHUNK:
+            continue  # enforce minimum
+        
+        if chunk_len >= MAX_CHUNK:
+            # Force boundary at max size
+            chunks.append(data[chunk_start:i])
+            chunk_start = i
+            fp = 0
+            continue
+            
+        if (fp & MASK) == 0:  # 13 low bits all zero → boundary!
+            chunks.append(data[chunk_start:i])
+            chunk_start = i
+            fp = 0
+    
+    chunks.append(data[chunk_start:])  # final chunk
+    return chunks
+```
+
+**Step 4: Example**
+
+```
+File: "The quick brown fox jumps over the lazy dog..."
+                                  ^
+                          Insert "very " here
+
+BEFORE insertion:
+  Chunk boundaries at positions: [0, 8234, 16501, 24889, ...]
+  
+AFTER insertion ("...over the very lazy dog..."):
+  Position 8234 boundary: UNCHANGED (content before hasn't changed)
+  Near insertion: one chunk boundary shifts
+  Position 16501+5 boundary: UNCHANGED (same content pattern)
+  
+Result: Only 1-2 chunks change → upload ~16KB instead of entire file
+```
+
+### Complexity Analysis
+
+| Operation | Complexity | Notes |
+|-----------|-----------|-------|
+| Initial chunking | O(n) | Single pass, O(1) per byte with rolling hash |
+| Rolling hash update | O(1) | Subtract old byte, add new byte |
+| Chunk hash (SHA-256) | O(chunk_size) | ~8KB average |
+| Dedup lookup | O(1) | Hash table / Bloom filter |
+| Total for n-byte file | O(n) | Linear in file size |
+
+### Delta Sync Algorithm
+
+After CDC identifies changed chunks, delta sync minimizes transfer:
+
+```
+1. Client computes: new_chunks = CDC(modified_file)
+2. Client sends: chunk_hashes to server
+3. Server responds: "already_have" vs "need_upload"
+4. Client uploads: only new/modified chunks (typically 1-5% of file)
+5. Server stores: new chunk manifest [h1, h2, h3_NEW, h4, h5_NEW]
+
+Bandwidth saving: For a 100MB file with 1KB edit → upload ~8-16KB (0.01%)
+```

@@ -80,6 +80,45 @@
 
 ## 4. Data Modeling
 
+### Entity-Relationship Diagram
+
+```mermaid
+erDiagram
+    MEETINGS {
+        uuid meeting_id PK
+        uuid host_user_id FK
+        varchar title
+        varchar meeting_type
+        varchar status
+        timestamp scheduled_start
+    }
+    MEETING_PARTICIPANTS {
+        uuid meeting_id PK
+        uuid user_id PK
+        timestamp join_time PK
+        varchar role
+        varchar connection_quality
+    }
+    RECORDINGS {
+        uuid recording_id PK
+        uuid meeting_id FK
+        varchar recording_type
+        varchar status
+        bigint file_size_bytes
+    }
+    MEETING_CHAT {
+        uuid meeting_id PK
+        timeuuid message_id PK
+        uuid sender_id FK
+        text content
+        text recipient
+    }
+
+    MEETINGS ||--o{ MEETING_PARTICIPANTS : "has"
+    MEETINGS ||--o{ RECORDINGS : "produces"
+    MEETINGS ||--o{ MEETING_CHAT : "contains"
+```
+
 ### 4.1 Database Selection
 
 | Workload | Database | Justification |
@@ -1114,3 +1153,177 @@ zoom_cdn_cache_hit_ratio{region}                            # Gauge
 | Abuse prevention | Rate limiting, meeting bomb detection, automatic mute/remove |
 | Data sovereignty | Regional media processing, no data leaving region |
 | Compliance | SOC 2, HIPAA (healthcare), FedRAMP (government) |
+
+---
+
+## Sequence Diagrams
+
+### 1. Meeting Join + WebRTC Setup
+
+```mermaid
+sequenceDiagram
+    participant C as Client
+    participant API as API Gateway
+    participant MS as Meeting Service
+    participant SS as Signal Server
+    participant MM as Media Manager
+    participant SFU as SFU (Media Server)
+    participant TURN as TURN Server
+    participant P as Other Participants
+
+    C->>API: POST /meetings/{id}/join {display_name, token}
+    API->>MS: Validate meeting (password, waiting room, capacity)
+    
+    alt Waiting room enabled
+        MS-->>C: {status: waiting_room}
+        Note over MS,C: Host must admit participant
+        MS->>C: Admitted event
+    end
+
+    MS->>MM: Allocate media resources
+    MM->>MM: Select optimal SFU (geo, load, codec support)
+    MM-->>C: {sfu_endpoint, ice_servers, session_token}
+
+    C->>SS: WebSocket connect (signaling)
+    C->>C: Create PeerConnection, gather ICE candidates
+    C->>SS: SDP Offer {audio: opus, video: VP8/H.264, simulcast: 3 layers}
+    SS->>SFU: Forward offer
+    SFU->>SFU: Allocate ports, prepare for simulcast receive
+    SFU-->>SS: SDP Answer
+    SS-->>C: SDP Answer
+
+    par ICE Connectivity
+        C->>SFU: ICE candidates (STUN)
+        SFU-->>C: ICE candidates
+        Note over C,SFU: ICE connectivity check (STUN binding)
+    end
+
+    alt Direct UDP works
+        C->>SFU: DTLS handshake + SRTP key exchange
+    else Firewall blocks UDP
+        C->>TURN: Allocate relay (TCP/443 fallback)
+        C->>SFU: Media via TURN relay
+    end
+
+    C->>SFU: Send video (3 simulcast layers: 720p, 360p, 180p)
+    SFU->>P: Forward appropriate layer (based on subscriber bandwidth)
+
+    MS->>P: participant.joined event (WebSocket)
+```
+
+### 2. Screen Share Initiation
+
+```mermaid
+sequenceDiagram
+    participant C as Presenter
+    participant SS as Signal Server
+    participant SFU as SFU
+    participant MS as Meeting Service
+    participant P as Participants (N)
+
+    C->>C: getDisplayMedia() → screen capture stream
+    C->>SS: Notify: screen_share.start {stream_id}
+    SS->>MS: Update meeting state (active_screen_share: user_id)
+    MS->>MS: Check concurrent screen share policy
+
+    alt Another user already sharing
+        MS-->>C: Error: screen share slot occupied
+    else Slot available
+        MS-->>SS: Approved
+        SS-->>C: screen_share.approved
+
+        C->>SFU: Add screen share track (separate stream)<br/>Codec: VP8/AV1 (optimized for screen content)
+        C->>SFU: Configure screen share encoding<br/>{maxBitrate: 2.5Mbps, maxFramerate: 15fps, content_hint: "detail"}
+
+        SFU->>SFU: Create screen share subscription for all participants
+        
+        par Notify participants
+            MS->>P: screen_share.started {user_id, stream_id}
+        and Start forwarding
+            SFU->>P: Forward screen share stream<br/>(high resolution, lower framerate)
+        end
+
+        P->>P: Display screen share in main view<br/>Speaker video moves to thumbnail
+
+        Note over C,SFU: Screen share uses separate<br/>encoding pipeline (content-mode)<br/>Higher resolution, lower FPS
+    end
+
+    C->>SS: screen_share.stop
+    SS->>MS: Clear active screen share
+    SFU->>SFU: Remove screen track
+    MS->>P: screen_share.stopped
+```
+
+### 3. Recording Start + Processing
+
+```mermaid
+sequenceDiagram
+    participant H as Host
+    participant API as API Gateway
+    participant MS as Meeting Service
+    participant RS as Recording Service
+    participant SFU as SFU
+    participant S3 as Object Storage (S3)
+    participant Q as Kafka
+    participant TP as Transcoding Pipeline
+    participant NS as Notification Service
+    participant P as Participants
+
+    H->>API: POST /meetings/{id}/recording/start
+    API->>MS: Validate host permissions
+    MS->>P: recording.started (consent notification)
+    MS->>RS: Initialize recording session
+
+    RS->>SFU: Subscribe to composite stream (all participants)
+    SFU->>RS: Forward mixed audio + active speaker video
+
+    loop Recording duration
+        RS->>RS: Mux audio/video into segments (10s chunks)
+        RS->>S3: Upload segment {meeting_id}/{segment_n}.webm
+    end
+
+    H->>API: POST /meetings/{id}/recording/stop
+    API->>MS: Stop recording
+    MS->>RS: Finalize recording
+    RS->>S3: Upload final segment + manifest
+
+    RS->>Q: Publish recording.complete {meeting_id, segments, duration}
+
+    par Async post-processing
+        Q->>TP: Transcode to MP4 (H.264 + AAC)
+        TP->>S3: Upload transcoded file
+    and
+        Q->>TP: Generate transcript (Whisper ASR)
+        TP->>S3: Upload transcript (.vtt)
+    and
+        Q->>TP: Generate summary + chapters (LLM)
+        TP->>S3: Upload meeting summary
+    end
+
+    TP->>Q: Publish processing.complete
+    Q->>NS: Notify host
+    NS->>H: Email: "Your recording is ready" {download_url}
+```
+
+### Async Processing Architecture
+
+| Pipeline Stage | Technology | Input | Output | SLA |
+|---------------|-----------|-------|--------|-----|
+| Recording Ingest | Custom (Rust) | SFU media streams | 10s WebM segments to S3 | Real-time |
+| Transcoding | FFmpeg workers (K8s) | WebM segments | MP4 (H.264 + AAC) | < 2x duration |
+| Transcription | Whisper (GPU workers) | Audio track | VTT subtitles + full text | < 1x duration |
+| AI Summary | LLM Pipeline | Transcript | Meeting notes, action items | < 60s |
+| Thumbnail Generation | FFmpeg | Video track | Preview thumbnails (every 30s) | < 30s |
+
+**Kafka Topics:**
+- `recording.segments` — raw segment uploads (high throughput)
+- `recording.complete` — triggers post-processing pipeline
+- `transcoding.tasks` — individual transcode jobs
+- `transcription.tasks` — ASR jobs routed to GPU workers
+- `processing.complete` — final notification trigger
+
+**Worker Scaling:**
+- Transcode workers: Scale on queue depth (target: < 100 pending jobs)
+- GPU workers (transcription): Spot instances, scale 0→N on demand
+- Dead letter queue for failed jobs (3 retries with exponential backoff)
+

@@ -57,6 +57,92 @@ Place → Validate → Risk Check → Route → Exchange ACK → Partial Fill �
 
 ## 4. Data Modeling
 
+## 4. Data Modeling
+
+### Entity-Relationship Diagram
+
+```mermaid
+erDiagram
+    instruments ||--o{ orders : "for"
+    instruments ||--o{ trades : "executed"
+    instruments ||--o{ positions : "held as"
+    instruments ||--o{ holdings : "settled as"
+    instruments ||--|| margin_requirements : "requires"
+    orders ||--o{ trades : "fills"
+    orders }o--|| client_margins : "deducts from"
+    client_margins ||--o{ positions : "covers"
+    client_margins ||--o{ holdings : "values"
+    instruments ||--o{ gtt_orders : "triggers on"
+
+    instruments {
+        BIGINT instrument_id PK
+        VARCHAR exchange
+        VARCHAR symbol
+        VARCHAR instrument_type
+        VARCHAR segment
+        DECIMAL tick_size
+        BOOLEAN is_tradeable
+    }
+    orders {
+        UUID order_id PK
+        UUID client_id FK
+        BIGINT instrument_id FK
+        VARCHAR order_type
+        VARCHAR transaction_type
+        INT quantity
+        DECIMAL price
+        VARCHAR status
+    }
+    trades {
+        UUID trade_id PK
+        UUID order_id FK
+        UUID client_id
+        BIGINT instrument_id FK
+        INT quantity
+        DECIMAL price
+        DECIMAL total_charges
+        DATE settlement_date
+    }
+    positions {
+        UUID position_id PK
+        UUID client_id FK
+        BIGINT instrument_id FK
+        VARCHAR product_type
+        INT quantity
+        DECIMAL realized_pnl
+        DECIMAL unrealized_pnl
+    }
+    holdings {
+        UUID holding_id PK
+        UUID client_id FK
+        BIGINT instrument_id FK
+        INT quantity
+        DECIMAL average_price
+        DECIMAL pnl
+    }
+    client_margins {
+        UUID client_id PK
+        DECIMAL available_cash
+        DECIMAL used_margin
+        DECIMAL available_margin
+        DECIMAL collateral_margin
+    }
+    margin_requirements {
+        BIGINT instrument_id PK
+        DECIMAL var_margin
+        DECIMAL span_margin
+        DECIMAL total_margin_pct
+    }
+    gtt_orders {
+        UUID gtt_id PK
+        UUID client_id FK
+        BIGINT instrument_id FK
+        VARCHAR trigger_type
+        JSONB trigger_conditions
+        VARCHAR status
+    }
+```
+
 ### Full Database Schemas
 
 ```sql
@@ -939,3 +1025,149 @@ alerts:
 | Exchange protocol | FIX 4.2 / OUCH | Proprietary binary | Industry standard, multi-exchange |
 | Time-series (ticks) | TimescaleDB | InfluxDB/QuestDB | SQL compatibility, good compression |
 | WebSocket gateway | Custom (Rust/C++) | Socket.IO | Performance for 2M connections |
+
+---
+
+## 12. Sequence Diagrams
+
+### Diagram 1: Order Placement + Exchange Routing
+
+```mermaid
+sequenceDiagram
+    participant Trader as Trader App
+    participant GW as API Gateway
+    participant OMS as Order Management System
+    participant Risk as Risk/Margin Engine
+    participant FIX as FIX Gateway
+    participant Exchange as Exchange (NSE/NYSE)
+    participant Pos as Position Store (Redis)
+    participant Kafka as Event Bus
+
+    Trader->>GW: POST /orders (symbol=RELIANCE, side=BUY, qty=100, price=2450, type=LIMIT)
+    GW->>OMS: Validate + create order (order_id=ORD_001)
+    OMS->>Risk: Pre-trade check (margin available? position limit? circuit limit?)
+    Risk->>Pos: GET available_margin for account
+    Pos-->>Risk: available_margin=500000, used=200000
+    Risk->>Risk: Required margin = 100 × 2450 × 20% (VAR) = ₹49,000
+    Risk-->>OMS: APPROVED (margin blocked=₹49,000)
+    
+    OMS->>OMS: Persist order (status=NEW)
+    OMS->>FIX: Send NewOrderSingle (FIX 4.2) to exchange
+    FIX->>Exchange: FIX message (35=D, ClOrdID=ORD_001, Symbol=RELIANCE, Side=1, Price=2450, Qty=100)
+    Exchange-->>FIX: ExecutionReport (35=8, OrdStatus=0 [New], ExecType=0)
+    FIX-->>OMS: Order acknowledged by exchange
+    OMS->>Kafka: Publish order.acknowledged {ORD_001}
+    
+    Note over Exchange,FIX: ... Time passes, order matches on exchange ...
+    
+    Exchange-->>FIX: ExecutionReport (OrdStatus=2 [Filled], LastPx=2448, LastQty=100)
+    FIX-->>OMS: Fill received (price=2448, qty=100)
+    OMS->>Pos: Update position (RELIANCE: +100 @ avg 2448)
+    OMS->>Risk: Release excess margin (blocked at 2450, filled at 2448)
+    OMS->>Kafka: Publish order.filled {ORD_001, price=2448, qty=100}
+    Kafka-->>Trader: Push: "Order filled: BUY 100 RELIANCE @ ₹2,448"
+
+    Note over Trader,Kafka: FIX protocol ensures exactly-once delivery with sequence numbers.<br/>If FIX session drops, resync with ResendRequest (gap fill).
+```
+
+### Diagram 2: Real-Time P&L Calculation
+
+```mermaid
+sequenceDiagram
+    participant MD as Market Data Feed
+    participant Tick as Tick Processor
+    participant Pos as Position Store (Redis)
+    participant PnL as P&L Engine
+    participant WS as WebSocket Gateway
+    participant Trader as Trader App
+
+    MD->>Tick: Market tick (RELIANCE: LTP=2455, bid=2454, ask=2456)
+    Tick->>Tick: Validate tick (within circuit limits, reasonable spread)
+    Tick->>Pos: GET all positions with RELIANCE exposure
+    Pos-->>Tick: [{account: A1, qty: 100, avg_price: 2448}, {account: A2, qty: -50, avg_price: 2460}]
+    
+    Tick->>PnL: Calculate unrealized P&L for each position
+    PnL->>PnL: A1: (2455 - 2448) × 100 = +₹700 (profit)
+    PnL->>PnL: A2: (2460 - 2455) × 50 = +₹250 (short position profit)
+    PnL->>Pos: UPDATE pnl cache (A1:RELIANCE:unrealized=+700)
+    
+    PnL->>WS: Push P&L updates to connected clients
+    WS->>WS: Conflate: batch updates per client (max 5 updates/sec)
+    WS-->>Trader: WebSocket: {symbol: RELIANCE, ltp: 2455, pnl: +700, pnl_pct: +0.29%}
+
+    Note over MD,Trader: At 500K ticks/sec across 5000 symbols, P&L engine must be O(1) per tick.<br/>Position lookup by symbol (reverse index) avoids scanning all accounts.<br/>Conflation prevents flooding slow clients.
+```
+
+### Caching Strategy
+
+```
+STOCK BROKERAGE CACHING
+
+1. POSITION CACHE (Redis — PRIMARY store for real-time)
+   Key: pos:{account}:{symbol}
+   Content: qty, avg_price, unrealized_pnl, last_updated
+   Updated: On every fill (synchronous, write-through to DB async)
+   WHY REDIS IS PRIMARY: 500K ticks/sec × position lookups = must be sub-ms
+   DB is backup (async write, used for reconciliation + recovery)
+
+2. MARKET DATA CACHE (Local memory + Redis)
+   Key: md:{symbol}:ltp
+   TTL: None (overwritten continuously)
+   Local: Each service caches latest tick in-process (zero network hop)
+   Redis: For services that don't subscribe to multicast directly
+
+3. MARGIN/RISK CACHE
+   Key: margin:{account}
+   Content: available, used, blocked_by_orders
+   Updated: On every fill + every order placement
+   CRITICAL: Stale margin → allow order that creates naked exposure
+
+4. ORDER BOOK DEPTH CACHE (for client display)
+   Key: depth:{symbol}:l2
+   Content: Top 5 bid/ask levels
+   TTL: None (overwritten every tick)
+   Conflated: Only keep latest snapshot (not every micro-update)
+
+EVENTUAL CONSISTENCY DANGER:
+- Stale position after fill → wrong P&L shown → trader makes bad decision
+- Stale margin → allow prohibited order → broker takes loss
+- Market data delay → stale quotes → "I thought price was X!" complaints
+```
+
+### Infrastructure Components
+
+```
+┌─────────────────────────────────────────────────────────────┐
+│ STOCK BROKERAGE INFRASTRUCTURE                               │
+├─────────────────────────────────────────────────────────────┤
+│                                                              │
+│ EXCHANGE CONNECTIVITY:                                       │
+│ ├── FIX Engine: Custom C++/Rust (sub-ms message processing)  │
+│ ├── Co-location: Servers in exchange datacenter              │
+│ ├── Redundant connections: 2 FIX sessions per exchange       │
+│ └── Sequence number management: persistent, gap-fill capable │
+│                                                              │
+│ REAL-TIME DATA:                                              │
+│ ├── Market Data: Multicast UDP feed from exchange            │
+│ ├── Tick processing: Flink (stateless, horizontal scale)     │
+│ ├── WebSocket gateway: Custom Rust (2M+ concurrent conns)    │
+│ └── Conflation engine: Per-client rate limiting              │
+│                                                              │
+│ POSITION & RISK:                                             │
+│ ├── Redis Cluster: 24 nodes (positions, margins, P&L)        │
+│ ├── Risk engine: In-memory, recalculates on every fill       │
+│ └── Margin call engine: Triggers at threshold (auto-square)  │
+│                                                              │
+│ STORAGE:                                                     │
+│ ├── PostgreSQL: Orders, trades, account master               │
+│ ├── TimescaleDB: Tick history (compressed, 90-day hot)       │
+│ └── S3 + Parquet: Historical data (years of tick data)       │
+│                                                              │
+│ COMPLIANCE:                                                   │
+│ ├── Order audit trail: Every state change logged             │
+│ ├── Best execution reporting (MiFID II / SEBI)              │
+│ ├── Client money segregation (pool vs individual)            │
+│ └── Risk reporting to exchange (end-of-day)                  │
+│                                                              │
+└─────────────────────────────────────────────────────────────┘
+```

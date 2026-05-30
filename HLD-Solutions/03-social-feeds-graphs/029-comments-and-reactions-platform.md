@@ -98,6 +98,50 @@ WebSocket connections: 50M concurrent × 1KB/min avg = 50 GB/min = 6.7 Gbps
 
 ## 5. Data Modeling
 
+### Entity-Relationship Diagram
+
+```mermaid
+erDiagram
+    COMMENTS_BY_CONTENT {
+        uuid site_id PK
+        text content_id PK
+        timeuuid comment_id PK
+        timeuuid parent_id FK
+        bigint user_id FK
+        text body
+        text status
+    }
+    COMMENTS_BY_USER {
+        bigint user_id PK
+        timeuuid comment_id PK
+        uuid site_id FK
+        text content_id
+    }
+    THREAD_REPLIES {
+        timeuuid root_id PK
+        timeuuid comment_id PK
+        timeuuid parent_id FK
+        tinyint depth
+        text path
+    }
+    REACTIONS {
+        text entity_type PK
+        text entity_id PK
+        bigint user_id PK
+        text reaction_type
+    }
+    REACTION_COUNTS {
+        text entity_type PK
+        text entity_id PK
+        text reaction_type PK
+        counter count
+    }
+    COMMENTS_BY_CONTENT ||--o{ THREAD_REPLIES : "has replies"
+    COMMENTS_BY_CONTENT ||--o{ REACTIONS : "receives"
+    COMMENTS_BY_CONTENT ||--o{ COMMENTS_BY_USER : "indexed by user"
+    REACTIONS }o--|| REACTION_COUNTS : "aggregated in"
+```
+
 ### 5.1 Comment Schema (ScyllaDB - Primary Store)
 
 ```sql
@@ -1295,4 +1339,117 @@ alerts:
 | Config/Admin | PostgreSQL | Tenant management |
 | Media | S3 + CDN | 100 TB images/GIFs |
 | Widget | CDN Edge | <300ms first paint |
+
+---
+
+## Sequence Diagrams
+
+### 1. Nested Comment Post + Tree Update
+
+```mermaid
+sequenceDiagram
+    participant U as User
+    participant API as API Gateway
+    participant CS as Comment Service
+    participant DB as Cassandra
+    participant K as Kafka
+    participant MS as Moderation Service
+    participant RC as Redis Cache
+    participant WS as WebSocket Gateway
+    participant V as Other Viewers
+
+    U->>API: POST /comments {entity_id, parent_id, body}
+    API->>CS: createComment(user_id, entity_id, parent_id, body)
+    CS->>DB: INSERT comment {id, entity_id, parent_id, path, depth, created_at}
+    Note over CS: path = parent.path + "/" + comment_id (materialized path)
+    CS->>K: publish CommentCreated {comment_id, entity_id, parent_id}
+
+    par Moderation
+        K->>MS: checkContent(body)
+        alt Toxic/spam detected
+            MS->>DB: UPDATE comment SET state=hidden
+            MS-->>U: "Comment under review"
+        end
+    and Cache invalidation
+        K->>RC: DEL comment_tree:{entity_id}
+        K->>RC: INCR comment_count:{entity_id}
+    and Real-time broadcast
+        K->>WS: broadcast to entity_id channel
+        WS->>V: new comment event (for live threads)
+    end
+
+    CS-->>API: 201 Created {comment_id, path, depth}
+    API-->>U: comment rendered in tree
+```
+
+### 2. Reaction Counter Aggregation
+
+```mermaid
+sequenceDiagram
+    participant U as User
+    participant API as API Gateway
+    participant RS as Reaction Service
+    participant RC as Redis
+    participant K as Kafka
+    participant FL as Flink (Aggregator)
+    participant DB as Cassandra
+    participant WS as WebSocket Gateway
+
+    U->>API: POST /reactions {entity_id, type: "love"}
+    API->>RS: addReaction(user_id, entity_id, reaction_type)
+    RS->>RC: SISMEMBER reactions:{entity_id}:{type} user_id
+
+    alt Already reacted with same type
+        RS-->>API: 409 Conflict (already reacted)
+    else New reaction
+        RS->>RC: SADD reactions:{entity_id}:{type} user_id
+        RS->>RC: HINCRBY reaction_counts:{entity_id} {type} 1
+
+        alt Changing reaction type
+            RS->>RC: SREM reactions:{entity_id}:{old_type} user_id
+            RS->>RC: HINCRBY reaction_counts:{entity_id} {old_type} -1
+        end
+
+        RS->>K: publish ReactionEvent {entity_id, user_id, type, action}
+        RS-->>API: 200 OK {updated_counts}
+    end
+
+    Note over K,FL: Async batch persistence
+    K->>FL: window(30s) aggregate reactions per entity
+    FL->>DB: batch UPDATE reaction_counts
+    FL->>WS: broadcast updated counts to active viewers
+```
+
+---
+
+## Caching Strategy
+
+### Multi-Tier Cache Architecture
+
+| Tier | Technology | TTL | Use Case |
+|------|-----------|-----|----------|
+| L1 - Edge/Widget | CDN + ServiceWorker | 30s | Initial comment load for embedded widgets |
+| L2 - Application | Redis Cluster | 60s-5min | Comment trees, reaction counts, user sessions |
+| L3 - Counter | Redis (dedicated) | Real-time | Reaction counters (HINCRBY), membership sets |
+| L4 - Read-through | Cassandra replicas | N/A | Full comment data on cache miss |
+
+### Eviction & Invalidation
+
+- **Comment trees**: Event-driven invalidation on new comment/delete; rebuild on next read
+- **Reaction counts**: Write-through (Redis is source of truth); async persist to Cassandra
+- **User reaction state**: SET membership check; TTL 24h for inactive entities
+- **Widget embed cache**: 30s TTL at CDN; stale-while-revalidate for seamless UX
+
+---
+
+## Infrastructure Components
+
+| Component | Technology | Purpose |
+|-----------|-----------|---------|
+| CDN | CloudFront + Lambda@Edge | Widget JS delivery, comment page caching |
+| Load Balancer | AWS ALB | WebSocket support, path-based routing |
+| API Gateway | Custom (Go) | Multi-tenant auth, rate limiting per tenant |
+| WebSocket | Clustered WS (Redis Pub/Sub backplane) | Real-time comment/reaction updates |
+| Widget SDK | Embedded iframe + postMessage | Cross-origin comment widget for customers |
+| Anti-Spam | ML pipeline + rate limiter | Bot detection, content quality scoring |
 

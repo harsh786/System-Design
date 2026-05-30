@@ -1163,6 +1163,59 @@ class PIIClassifier:
 
 ## 5. Data Model
 
+### Entity-Relationship Diagram
+
+```mermaid
+erDiagram
+    DATA_SOURCES {
+        uuid id PK
+        varchar name
+        varchar source_type
+        boolean enabled
+    }
+    DATA_ASSETS {
+        uuid id PK
+        uuid source_id FK
+        varchar qualified_name
+        varchar asset_type
+        varchar domain
+        uuid owner_team_id FK
+        decimal quality_score
+    }
+    DATA_COLUMNS {
+        uuid id PK
+        uuid asset_id FK
+        varchar name
+        varchar data_type
+        boolean is_pii
+    }
+    SCHEMA_CHANGES {
+        bigint id PK
+        uuid asset_id FK
+        varchar change_type
+        varchar column_name
+    }
+    QUALITY_PROFILES {
+        bigint id PK
+        uuid asset_id FK
+        decimal quality_score
+        timestamp profiled_at
+    }
+    ASSET_USAGE {
+        bigint id PK
+        uuid asset_id FK
+        uuid user_id FK
+        varchar query_type
+        varchar tool
+    }
+
+    DATA_SOURCES ||--o{ DATA_ASSETS : discovers
+    DATA_ASSETS ||--o{ DATA_COLUMNS : has
+    DATA_ASSETS ||--o{ SCHEMA_CHANGES : tracks
+    DATA_ASSETS ||--o{ QUALITY_PROFILES : profiled-by
+    DATA_ASSETS ||--o{ ASSET_USAGE : queried-in
+```
+
 ### PostgreSQL Schema (Core Metadata)
 
 ```sql
@@ -1638,3 +1691,116 @@ def compute_ownership(asset, lineage_graph, usage_data):
 - Contract validation on schema changes (CI/CD gate)
 - Consumer-producer agreements on data quality SLOs
 - Breaking change detection and notification workflow
+
+---
+
+## 12. Sequence Diagrams
+
+### Diagram 1: Asset Registration + Lineage Tracking
+
+```mermaid
+sequenceDiagram
+    participant Pipeline as dbt/Airflow Pipeline
+    participant Hook as Catalog Hook (OpenLineage)
+    participant API as Catalog API
+    participant DB as Metadata Store (PostgreSQL)
+    participant Graph as Lineage Graph (Neo4j)
+    participant Search as Search Index (Elasticsearch)
+    participant Event as Event Bus (Kafka)
+
+    Pipeline->>Pipeline: Execute transformation: raw_orders → clean_orders → revenue_daily
+    Pipeline->>Hook: Emit OpenLineage START event (job, inputs, outputs)
+    Hook->>API: POST /v1/lineage/events (OpenLineage format)
+
+    API->>DB: Upsert dataset: raw_orders (schema, location, owner)
+    API->>DB: Upsert dataset: clean_orders (schema, location, owner)
+    API->>DB: Upsert dataset: revenue_daily (schema, location, owner)
+    
+    API->>Graph: CREATE/MERGE lineage edges
+    Graph->>Graph: (raw_orders)-[:FEEDS]->(clean_orders)-[:FEEDS]->(revenue_daily)
+    Graph->>Graph: (pipeline_job)-[:PRODUCES]->(revenue_daily)
+
+    Pipeline->>Hook: Emit OpenLineage COMPLETE event (row counts, duration)
+    Hook->>API: POST /v1/lineage/events (completion metadata)
+    
+    API->>DB: Update freshness: revenue_daily.last_updated = now()
+    API->>DB: Update stats: revenue_daily.row_count = 1.2M
+    API->>Search: Index updated metadata (async via event)
+    API->>Event: Publish asset_updated event
+
+    Note over Event: Downstream subscribers
+    Event->>Event: Data quality service: trigger checks on revenue_daily
+    Event->>Event: Notification service: alert subscribers of freshness update
+    Event->>Event: Governance service: check compliance tags propagated
+```
+
+### Diagram 2: Metadata Search + Discovery
+
+```mermaid
+sequenceDiagram
+    participant Analyst as Data Analyst
+    participant UI as Catalog UI
+    participant API as Catalog API
+    participant Search as Elasticsearch
+    participant DB as Metadata Store
+    participant Graph as Lineage Graph
+    participant Usage as Usage Analytics
+
+    Analyst->>UI: Search: "customer revenue monthly"
+    UI->>API: GET /v1/search?q=customer+revenue+monthly&filters=certified:true
+
+    API->>Search: Multi-match query (name, description, column names, tags)
+    Search->>Search: BM25 scoring + boost: certified(×2), popular(×1.5), fresh(×1.2)
+    Search-->>API: Ranked results: [revenue_monthly (score:8.5), customer_ltv (7.2), ...]
+
+    API->>Usage: Get popularity scores for result assets
+    Usage-->>API: {revenue_monthly: 450 queries/week, customer_ltv: 120 queries/week}
+    
+    API->>API: Re-rank: combine relevance + popularity + freshness
+    API-->>UI: Top 10 results with snippets, owners, freshness, quality score
+
+    Analyst->>UI: Click on "revenue_monthly" → asset detail page
+    UI->>API: GET /v1/assets/revenue_monthly
+    API->>DB: Fetch full metadata (schema, description, tags, owner, SLA)
+    API->>Graph: GET upstream lineage (depth=3)
+    Graph-->>API: raw_events → clean_events → customer_dim + order_facts → revenue_monthly
+    API->>Usage: GET /assets/revenue_monthly/usage (top queries, users, frequency)
+    Usage-->>API: {weekly_queries: 450, top_users: ["team-analytics"], peak_hour: 9am}
+
+    API-->>UI: Full asset profile (schema + lineage + usage + quality)
+
+    Analyst->>UI: Click "Preview Data" (sample rows)
+    UI->>API: GET /v1/assets/revenue_monthly/preview?limit=100
+    API->>API: Check column-level permissions (mask PII columns)
+    API-->>UI: Sample rows (email column masked: j***@example.com)
+
+    UI->>API: POST /v1/assets/revenue_monthly/bookmark
+    API->>Usage: Log discovery event (for search ranking improvement)
+```
+
+### Deep Dive: Async Event-Driven Architecture
+
+The catalog uses an event-driven architecture for loose coupling between subsystems:
+
+```
+Event Types:
+  asset_created → triggers: search indexing, governance check, notification
+  asset_updated → triggers: search re-index, freshness update, downstream alerts
+  schema_changed → triggers: compatibility check, consumer notification, contract validation
+  lineage_updated → triggers: impact analysis recalculation, tag propagation
+  quality_check_failed → triggers: alert owner, update trust score, pause downstream
+
+Processing Guarantees:
+  - Events published to Kafka (partitioned by asset_id for ordering)
+  - Each consumer maintains its own offset (independent processing speeds)
+  - Idempotent consumers (re-processing same event is safe)
+  - Dead letter queue for events that fail after 3 retries
+
+Async Workflows:
+  1. Tag Propagation: when a table is tagged "PII", propagate to all downstream
+     tables in lineage graph (BFS traversal, async per-hop)
+  2. Search Re-indexing: batch updates every 5s (coalesce multiple changes to same asset)
+  3. Popularity Decay: daily job recalculates popularity scores (exponential decay, half-life=7 days)
+  4. Freshness Monitoring: async check every 5min, compare last_updated vs SLA threshold
+```
+

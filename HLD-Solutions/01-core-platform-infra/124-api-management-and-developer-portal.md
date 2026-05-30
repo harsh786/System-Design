@@ -873,6 +873,72 @@ class UsageMeteringService:
 
 ## 5. Data Model
 
+### Entity-Relationship Diagram
+
+```mermaid
+erDiagram
+    TEAMS {
+        uuid id PK
+        string name
+    }
+    APIS {
+        uuid id PK
+        uuid owner_team_id FK
+        string name
+        string base_path
+        string state
+    }
+    API_VERSIONS {
+        uuid id PK
+        uuid api_id FK
+        string version
+        string state
+        jsonb openapi_spec
+    }
+    API_ROUTES {
+        uuid id PK
+        uuid api_id FK
+        string method
+        string path_pattern
+        string backend_service
+    }
+    DEVELOPERS {
+        uuid id PK
+        string email
+        uuid plan_id FK
+        string state
+    }
+    API_KEYS {
+        uuid id PK
+        uuid developer_id FK
+        uuid plan_id FK
+        string key_hash
+        boolean revoked
+    }
+    PLANS {
+        uuid id PK
+        string name
+        int requests_per_second
+        int daily_quota
+        decimal base_price
+    }
+    USAGE_AGGREGATES {
+        bigint id PK
+        uuid developer_id FK
+        string api_name
+        bigint request_count
+        timestamp period_start
+    }
+
+    TEAMS ||--o{ APIS : owns
+    APIS ||--o{ API_VERSIONS : has
+    APIS ||--o{ API_ROUTES : defines
+    DEVELOPERS ||--o{ API_KEYS : creates
+    PLANS ||--o{ API_KEYS : governs
+    PLANS ||--o{ DEVELOPERS : subscribed_to
+    DEVELOPERS ||--o{ USAGE_AGGREGATES : tracked_in
+```
+
 ### Database Schema (PostgreSQL)
 
 ```sql
@@ -1285,3 +1351,89 @@ maxmemory-policy allkeys-lru
 - Automatic rate limiting escalation during attacks
 - IP reputation scoring integrated with rate limiting
 - Challenge-response for suspicious traffic patterns (not for API clients)
+
+---
+
+## Sequence Diagrams
+
+### 1. API Call Through Gateway
+
+```mermaid
+sequenceDiagram
+    participant Dev as Developer App
+    participant GW as API Gateway
+    participant Cache as Response Cache
+    participant RL as Rate Limiter
+    participant Auth as Auth/Key Validation
+    participant Transform as Request Transform
+    participant Backend as Backend API
+    participant Analytics as Analytics Pipeline
+
+    Dev->>GW: GET /v2/products/123 (x-api-key: ak_prod_xxx)
+
+    GW->>Auth: Validate API key
+    Auth->>Auth: Lookup key → {app_id, plan: gold, scopes: [products.read]}
+    Auth-->>GW: Valid {app_id: A1, plan: gold, rate: 1000/min}
+
+    GW->>RL: Check rate limit {app_id: A1, plan: gold}
+    RL-->>GW: Allowed (remaining: 847/1000)
+
+    GW->>Cache: Check response cache {key: GET:/v2/products/123}
+    alt Cache hit (< max-age)
+        Cache-->>GW: Cached response (age: 45s)
+        GW-->>Dev: 200 OK (X-Cache: HIT, X-RateLimit-Remaining: 847)
+    else Cache miss
+        GW->>Transform: Apply request policies (add internal headers, strip sensitive params)
+        Transform->>Backend: GET /internal/products/123 (X-App-Id: A1, X-Request-Id: uuid)
+        Backend-->>Transform: 200 {product data}
+        Transform->>Transform: Response transform (filter fields per plan tier)
+        Transform->>Cache: Store response (TTL from Cache-Control)
+        Transform-->>GW: Transformed response
+        GW-->>Dev: 200 OK (X-Cache: MISS, X-RateLimit-Remaining: 847)
+    end
+
+    GW--)Analytics: Async log {app_id, endpoint, latency, status, bytes}
+```
+
+### 2. Developer API Key Provisioning
+
+```mermaid
+sequenceDiagram
+    participant Dev as Developer
+    participant Portal as Developer Portal
+    participant Auth as Auth Service (OAuth)
+    participant KMS as Key Management
+    participant DB as Portal DB
+    participant GW as Gateway Config
+    participant Email as Notification Service
+
+    Dev->>Portal: Sign up / Login (OAuth2 with GitHub/Google)
+    Portal->>Auth: OAuth2 authorization code flow
+    Auth-->>Portal: {access_token, user_info}
+    Portal->>DB: Create developer account
+
+    Dev->>Portal: Create App {name: "My App", description, callback_urls}
+    Portal->>DB: Store app metadata
+
+    Dev->>Portal: Subscribe to API Product {product: "Products API", plan: "Gold"}
+    Portal->>Portal: Check plan eligibility (auto-approve for free/gold; manual for enterprise)
+
+    alt Auto-approved plan
+        Portal->>KMS: Generate API key pair
+        KMS->>KMS: Generate: ak_prod_xxx (public) + sk_prod_xxx (secret)
+        KMS-->>Portal: {api_key, secret_key, key_id}
+
+        Portal->>DB: Store key metadata {key_id, app_id, plan, scopes, created_at}
+        Portal->>GW: Sync key to gateway (push via config API)
+        GW-->>Portal: Key active
+
+        Portal->>Email: Send welcome email with getting-started guide
+        Portal-->>Dev: {api_key: ak_prod_xxx, secret: sk_prod_xxx (shown once)}
+    else Manual approval required (Enterprise plan)
+        Portal->>DB: Create pending subscription
+        Portal->>Email: Notify admin for approval
+        Portal-->>Dev: Subscription pending approval (ETA: 24h)
+    end
+
+    Note over Dev: Developer can now:<br/>- View usage dashboard<br/>- Rotate keys<br/>- Set webhook URLs<br/>- Access sandbox environment
+```

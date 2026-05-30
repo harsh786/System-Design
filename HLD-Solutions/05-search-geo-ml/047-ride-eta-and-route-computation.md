@@ -41,6 +41,57 @@
 
 ## 3. Data Modeling
 
+### Entity-Relationship Diagram
+
+```mermaid
+erDiagram
+    RIDERS {
+        uuid rider_id PK
+        varchar phone
+        varchar name
+        decimal rating_avg
+    }
+    DRIVERS {
+        uuid driver_id PK
+        varchar phone
+        varchar name
+        uuid vehicle_id FK
+        varchar status
+    }
+    VEHICLES {
+        uuid vehicle_id PK
+        uuid driver_id FK
+        varchar vehicle_type
+        varchar license_plate
+    }
+    TRIPS {
+        uuid trip_id PK
+        uuid rider_id FK
+        uuid driver_id FK
+        varchar status
+        bigint estimated_fare_cents
+        decimal surge_multiplier
+    }
+    PAYMENT_LEDGER {
+        uuid ledger_id PK
+        uuid trip_id FK
+        bigint amount_cents
+        varchar transaction_type
+        varchar status
+    }
+    RATINGS {
+        uuid rating_id PK
+        uuid trip_id FK
+        uuid rater_id
+        int score
+    }
+    RIDERS ||--o{ TRIPS : requests
+    DRIVERS ||--o{ TRIPS : drives
+    DRIVERS ||--|| VEHICLES : owns
+    TRIPS ||--o{ PAYMENT_LEDGER : generates
+    TRIPS ||--o{ RATINGS : receives
+```
+
 ### 3.1 PostgreSQL - Core Entities
 
 ```sql
@@ -1237,3 +1288,307 @@ Total P50: 2.5s | P95: 8s | P99: 15s
 - **Location service down**: Use last-known positions, client dead reckoning
 - **Payment failure**: Complete trip, queue retry, don't block user
 - **Kafka lag**: Back-pressure, shed non-critical events (analytics)
+
+---
+
+## 12. Sequence Diagrams
+
+### 12.1 Driver Matching Flow
+
+```mermaid
+sequenceDiagram
+    participant Rider
+    participant API as API Gateway
+    participant Match as Matching Service
+    participant H3Idx as H3 Driver Index (Redis)
+    participant ETA as ETA Service
+    participant Driver
+    participant Dispatch as Dispatch Service
+
+    Rider->>API: POST /ride/request {pickup_lat, pickup_lng, dest}
+    API->>Match: findDrivers(pickup, destination)
+    Match->>H3Idx: grid_disk(rider_cell, k=1) → nearby driver cells
+    H3Idx-->>Match: [driver_1, driver_2, ..., driver_8] in ring-1
+    
+    alt Not enough candidates
+        Match->>H3Idx: grid_disk(rider_cell, k=2) → expand ring
+        H3Idx-->>Match: [driver_9, ..., driver_15] in ring-2
+    end
+
+    Match->>ETA: batch_eta([driver_positions], pickup_point)
+    ETA-->>Match: ETAs: [2min, 4min, 3min, 7min, ...]
+    Match->>Match: Score = f(ETA, driver_rating, acceptance_rate, trip_alignment)
+    Match->>Dispatch: dispatch(best_driver, ride_details)
+    Dispatch->>Driver: Push notification: "New ride request, 0.5 mi away"
+    Driver-->>Dispatch: ACCEPT (within 15s timeout)
+    Dispatch-->>Match: Driver accepted
+    Match-->>API: {driver_info, eta: "3 min"}
+    API-->>Rider: 200 OK {driver: {...}, eta: "3 min", vehicle: {...}}
+```
+
+### 12.2 Real-time ETA Update During Trip
+
+```mermaid
+sequenceDiagram
+    participant Driver as Driver App
+    participant Ingest as Location Ingestion
+    participant Kafka
+    participant ETASvc as ETA Service
+    participant ML as ML Model Service
+    participant Traffic as Traffic Service
+    participant Rider as Rider App
+
+    loop Every 4 seconds
+        Driver->>Ingest: {lat, lng, speed, heading, timestamp}
+        Ingest->>Kafka: Publish to driver-locations topic
+    end
+    
+    Kafka->>ETASvc: Consume location update
+    ETASvc->>ETASvc: Map-match to road segment (HMM)
+    ETASvc->>Traffic: Get speeds for remaining route segments
+    Traffic-->>ETASvc: Segment speeds (live + historical blend)
+    ETASvc->>ML: predict_eta(remaining_route, traffic, time_of_day, weather)
+    ML-->>ETASvc: {eta: 12.3min, confidence: [10min, 15min]}
+    ETASvc->>Rider: WebSocket push: {eta_minutes: 12, updated_route: [...]}
+```
+
+### 12.3 Surge Pricing Calculation
+
+```mermaid
+sequenceDiagram
+    participant Sys as Demand Analyzer (Flink)
+    participant H3 as H3 Cell Aggregator
+    participant Supply as Supply Counter
+    participant Surge as Surge Calculator
+    participant Pricing as Pricing Service
+    participant Rider
+
+    Note over Sys: Every 60 seconds per H3-res7 cell
+    Sys->>H3: Count ride requests in cell (last 5 min)
+    H3-->>Sys: demand = 45 requests
+    Sys->>Supply: Count available drivers in cell + k-ring(1)
+    Supply-->>Sys: supply = 12 drivers
+    Sys->>Surge: ratio = demand/supply = 3.75
+    Surge->>Surge: Apply surge curve: multiplier = min(1.2 + 0.5*log2(ratio), 5.0)
+    Surge-->>Pricing: surge_multiplier = 2.1x for cell 89283082803ffff
+    
+    Rider->>Pricing: GET /estimate {pickup, destination}
+    Pricing->>Pricing: base_fare = $12.50
+    Pricing->>Pricing: surged_fare = $12.50 × 2.1 = $26.25
+    Pricing-->>Rider: {estimate: "$24-$28", surge: "2.1x", reason: "High demand"}
+```
+
+---
+
+## 13. Deep Dive: ETA Prediction & Spatial Matching
+
+### 13.1 H3 Hexagonal Index for Driver Matching
+
+**How driver positions are indexed:**
+```python
+import h3
+import redis
+
+r = redis.Redis()
+RESOLUTION = 9  # ~174m edge length, good for urban matching
+
+def update_driver_position(driver_id, lat, lng):
+    """Called every 4 seconds per active driver"""
+    new_cell = h3.latlng_to_cell(lat, lng, RESOLUTION)
+    old_cell = r.get(f"driver:{driver_id}:cell")
+
+    if old_cell and old_cell != new_cell:
+        r.srem(f"cell:{old_cell}:drivers", driver_id)
+
+    r.sadd(f"cell:{new_cell}:drivers", driver_id)
+    r.set(f"driver:{driver_id}:cell", new_cell)
+    r.set(f"driver:{driver_id}:pos", f"{lat},{lng}")
+    r.expire(f"cell:{new_cell}:drivers", 30)  # Auto-cleanup stale
+
+def find_nearby_drivers(rider_lat, rider_lng, min_candidates=10, max_k=6):
+    """K-ring expansion until enough candidates found"""
+    rider_cell = h3.latlng_to_cell(rider_lat, rider_lng, RESOLUTION)
+    candidates = []
+
+    for k in range(0, max_k + 1):
+        ring_cells = h3.grid_disk(rider_cell, k)
+        keys = [f"cell:{c}:drivers" for c in ring_cells]
+        driver_ids = r.sunion(keys)
+
+        candidates = [
+            d for d in driver_ids
+            if is_available(d) and not is_on_trip(d)
+        ]
+
+        if len(candidates) >= min_candidates:
+            break
+
+    return candidates
+```
+
+**K-ring expansion visualization:**
+```
+k=0: Just rider's cell (1 cell)
+     ⬡
+
+k=1: Immediate neighbors (7 cells, ~350m radius)
+    ⬡ ⬡
+   ⬡ ● ⬡
+    ⬡ ⬡
+
+k=2: Two rings out (19 cells, ~700m radius)
+   ⬡ ⬡ ⬡
+  ⬡ ⬡ ⬡ ⬡
+ ⬡ ⬡ ● ⬡ ⬡
+  ⬡ ⬡ ⬡ ⬡
+   ⬡ ⬡ ⬡
+
+k=3: (37 cells, ~1km radius) - typical urban match
+k=5: (91 cells, ~1.7km radius) - suburban areas
+```
+
+**Why hexagons avoid corner-case distance errors:**
+- In a square grid, a point at the corner of a cell is √2 × cell_width from the center
+- Adjacent square cells can have points that are 2× further apart than expected
+- Hexagons: maximum distance from center to any edge = edge_length
+- All 6 neighbors are equidistant → consistent distance estimation
+
+---
+
+### 13.2 ETA Prediction Pipeline
+
+**Architecture:**
+```
+┌─────────────────────────────────────────────────────────┐
+│                    ETA Prediction Pipeline               │
+├─────────────────────────────────────────────────────────┤
+│                                                         │
+│  ┌──────────┐   ┌──────────────┐   ┌───────────────┐  │
+│  │ Route    │──▶│ Segment-Level │──▶│ ML Adjustment │  │
+│  │ Planning │   │ ETA (sum)    │   │ (correction)  │  │
+│  └──────────┘   └──────────────┘   └───────────────┘  │
+│       │                │                    │           │
+│       ▼                ▼                    ▼           │
+│  CH shortest     Per-segment speed:    Features:       │
+│  path + traffic  - Historical avg      - Time of day   │
+│  aware edges     - Live traffic        - Day of week   │
+│                  - Time-of-day         - Weather        │
+│                    adjustment          - Events         │
+│                                        - Road type      │
+│                                        - # traffic      │
+│                                          signals       │
+└─────────────────────────────────────────────────────────┘
+```
+
+**Historical speed data by road segment + time of day:**
+```python
+# Speed profiles stored per segment per time bucket
+# Table: segment_speeds
+# Columns: segment_id | day_of_week | hour | avg_speed_kmh | p25 | p75 | sample_count
+
+# Example: Highway 101 segment near SF, Monday 8AM
+# segment_id=HWY101_0042, day=MON, hour=8, avg=35kmh, p25=22, p75=48, samples=12000
+
+def get_segment_eta(segment_id, length_m, departure_time):
+    dow = departure_time.weekday()
+    hour = departure_time.hour
+
+    # 1. Get historical baseline
+    historical = db.query(
+        "SELECT avg_speed, p25, p75 FROM segment_speeds WHERE segment_id=%s AND day=%s AND hour=%s",
+        segment_id, dow, hour
+    )
+
+    # 2. Get real-time speed (if available, < 5 min old)
+    live_speed = redis.get(f"live_speed:{segment_id}")
+
+    # 3. Blend: weight live data higher when fresh and high confidence
+    if live_speed and live_speed.sample_count > 5:
+        blended_speed = 0.7 * live_speed.value + 0.3 * historical.avg_speed
+    else:
+        blended_speed = historical.avg_speed
+
+    eta_seconds = (length_m / 1000) / blended_speed * 3600
+    confidence_low = (length_m / 1000) / historical.p75 * 3600
+    confidence_high = (length_m / 1000) / historical.p25 * 3600
+
+    return eta_seconds, (confidence_low, confidence_high)
+```
+
+**ML Model: Graph Neural Network on road graph:**
+```
+Input features per road segment:
+- Historical speed (for this time/day)
+- Current live speed
+- Speed trend (accelerating/decelerating)
+- Distance to traffic signals
+- Road functional class (highway/arterial/residential)
+- Number of lanes
+- Is there construction?
+- Weather (rain reduces speed ~15%, snow ~30%)
+- Special events nearby
+
+Model architecture:
+1. GNN propagates information along road graph (traffic jams propagate)
+2. Temporal attention: recent observations weighted higher
+3. Output: predicted speed per segment for next 30 minutes
+4. Trained on billions of historical trips
+
+Result: Reduces ETA error from ±25% (historical only) to ±11% (ML model)
+```
+
+**Why Uber/Lyft show ranges ("12-18 min") not point estimates:**
+```
+Confidence intervals account for:
+1. Traffic signal timing (red vs green = ±2 min on a 10-min trip)
+2. Potential incidents on route
+3. Driver behavior variance
+4. Pickup time uncertainty (driver finds parking, rider walks)
+
+Display logic:
+- If confidence interval < 3 min: show point estimate ("15 min")
+- If confidence interval 3-8 min: show range ("12-18 min")
+- If confidence interval > 8 min: show "~15-25 min" with hedge language
+```
+
+---
+
+### 13.3 Map Matching with Hidden Markov Model
+
+**Problem:** GPS points are noisy (±5-50m). Which road is the driver actually on?
+
+```
+GPS points (noisy):          Actual road network:
+    •                        ═══════════╗
+      •                                 ║
+   •     •                   ═══════════╝
+     •
+```
+
+**HMM approach:**
+```python
+def map_match_hmm(gps_points, road_network):
+    """
+    States: candidate road segments for each GPS point
+    Observations: GPS positions
+    Emission probability: P(GPS point | on segment) ∝ exp(-dist²/2σ²)
+    Transition probability: P(seg_j | seg_i) ∝ exp(-|route_dist - great_circle_dist|)
+    """
+    candidates = []
+    for point in gps_points:
+        nearby_segments = road_network.find_within(point, radius=50m)
+        candidates.append(nearby_segments)
+
+    # Viterbi algorithm to find most likely sequence
+    # Emission: closer GPS point to road = higher probability
+    # Transition: route distance between consecutive matches
+    #             should be similar to GPS distance
+
+    path = viterbi(candidates, emission_prob, transition_prob)
+    return path  # Sequence of road segments
+```
+
+**Why this matters for ETA:**
+- Wrong road → wrong speed data → wrong ETA
+- Parallel roads (highway vs service road) have very different speeds
+- U-turns and one-way streets must be respected

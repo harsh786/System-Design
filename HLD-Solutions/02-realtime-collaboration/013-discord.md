@@ -90,6 +90,67 @@
 
 ## 4. Data Modeling
 
+### Entity-Relationship Diagram
+
+```mermaid
+erDiagram
+    USERS {
+        bigint id PK
+        varchar username
+        varchar email
+        smallint premium_type
+    }
+    GUILDS {
+        bigint id PK
+        bigint owner_id FK
+        varchar name
+        smallint premium_tier
+        int member_count
+    }
+    CHANNELS {
+        bigint id PK
+        bigint guild_id FK
+        bigint parent_id FK
+        smallint type
+        varchar name
+    }
+    ROLES {
+        bigint id PK
+        bigint guild_id FK
+        varchar name
+        bigint permissions
+        smallint position
+    }
+    GUILD_MEMBERS {
+        bigint guild_id PK
+        bigint user_id PK
+        bigint_arr roles
+        varchar nick
+    }
+    RELATIONSHIPS {
+        bigint user_id PK
+        bigint target_id PK
+        smallint type
+    }
+    MESSAGES {
+        bigint channel_id PK
+        bigint message_id PK
+        bigint author_id FK
+        text content
+        smallint type
+    }
+
+    USERS ||--o{ GUILD_MEMBERS : "joins"
+    GUILDS ||--o{ GUILD_MEMBERS : "has"
+    GUILDS ||--o{ CHANNELS : "contains"
+    GUILDS ||--o{ ROLES : "defines"
+    CHANNELS ||--o{ MESSAGES : "contains"
+    USERS ||--o{ MESSAGES : "sends"
+    USERS ||--o{ RELATIONSHIPS : "has"
+    USERS ||--o{ GUILDS : "owns"
+    CHANNELS }o--o| CHANNELS : "parent category"
+```
+
 ### Database Technology Selection
 
 | Workload | Technology | Rationale |
@@ -939,3 +1000,136 @@ Business Metrics:
 - Content scanning: PhotoDNA for CSAM, ML for spam/gore
 - IP reputation: block known bad actors at edge
 - DDoS: Cloudflare + internal rate limits + voice server protection
+
+---
+
+## Sequence Diagrams
+
+### 1. Voice Channel Join (WebRTC)
+
+```mermaid
+sequenceDiagram
+    participant C as Client
+    participant GW as Gateway (WebSocket)
+    participant VS as Voice Server Selector
+    participant SFU as SFU (Selective Forwarding Unit)
+    participant TURN as TURN Server
+    participant VC as Voice Channel Members
+
+    C->>GW: Voice State Update {guild_id, channel_id, self_mute, self_deaf}
+    GW->>VS: Request voice server assignment
+    VS->>VS: Select optimal SFU (latency-based, region-aware)
+    VS-->>GW: Voice Server Endpoint + token
+    GW-->>C: VOICE_SERVER_UPDATE {endpoint, token}
+
+    C->>SFU: WebSocket connect (voice signaling)
+    SFU-->>C: Hello {heartbeat_interval}
+    C->>SFU: Identify {server_id, user_id, token}
+    SFU-->>C: Ready {SSRC, IP, port, encryption_modes}
+
+    C->>SFU: UDP IP Discovery (STUN-like)
+    SFU-->>C: Your external IP + port
+
+    alt Direct connection possible
+        C->>SFU: Select Protocol {UDP, address, port, mode: xsalsa20_poly1305}
+        SFU-->>C: Session Description {audio_codec: opus}
+    else NAT traversal needed
+        C->>TURN: Allocate relay
+        TURN-->>C: Relay address
+        C->>SFU: Select Protocol via TURN relay
+    end
+
+    C->>SFU: Speaking (SSRC, audio frames via UDP)
+    SFU->>VC: Forward audio (selective, based on speaking state)
+
+    Note over SFU: SFU forwards audio only from<br/>active speakers (up to 25 simultaneous)
+    
+    GW-->>VC: VOICE_STATE_UPDATE (new member joined)
+```
+
+### 2. Guild Message with Role Permissions
+
+```mermaid
+sequenceDiagram
+    participant C as Client
+    participant GW as Gateway
+    participant PS as Permission Service
+    participant MS as Message Service
+    participant Q as Kafka
+    participant DB as ScyllaDB
+    participant Cache as Redis
+    participant FO as Fanout Service
+    participant GW_N as Guild Member Gateways
+
+    C->>GW: Create Message {channel_id, content, mentions}
+    GW->>PS: Check permissions (user_id, channel_id, SEND_MESSAGES)
+    PS->>Cache: Get user roles + channel overwrites
+    PS->>PS: Compute effective permissions<br/>(server roles ∪ channel overwrites)
+    
+    alt Permission denied
+        PS-->>GW: 403 Forbidden
+        GW-->>C: Error: Missing permissions
+    else Permission granted
+        PS-->>GW: Allowed
+        GW->>MS: Create message
+        MS->>MS: Process @mentions, @everyone, @role
+        MS->>DB: Persist message
+        MS->>Q: Publish guild.message.create
+        MS-->>GW: Message object
+        GW-->>C: MESSAGE_CREATE (echo)
+
+        Q->>FO: Fanout to guild members
+        FO->>Cache: Get channel member list (permission-filtered)
+        
+        loop For each member with READ_MESSAGES permission
+            FO->>FO: Check @everyone suppression per user
+            FO->>GW_N: Dispatch MESSAGE_CREATE
+        end
+        
+        GW_N-->>GW_N: Deliver to connected clients
+        
+        Note over FO: Large guilds (>100K) use lazy loading<br/>Only send to members with channel open
+    end
+```
+
+### 3. Bot Message Handling
+
+```mermaid
+sequenceDiagram
+    participant U as User
+    participant GW as Gateway
+    participant MS as Message Service
+    participant Q as Kafka
+    participant BG as Bot Gateway
+    participant Bot as Bot Application
+    participant API as Discord API (REST)
+    participant RL as Rate Limiter
+    participant DB as ScyllaDB
+
+    U->>GW: Send message "/roll 2d6" (slash command)
+    GW->>MS: Create interaction
+    MS->>Q: Publish INTERACTION_CREATE
+
+    Q->>BG: Route to bot's gateway session
+    BG->>Bot: INTERACTION_CREATE event
+    
+    Bot->>Bot: Process command logic
+    Bot->>API: POST /interactions/{id}/{token}/callback<br/>{type: 4, data: {content: "🎲 You rolled: 8"}}
+    API->>RL: Check rate limits (50 req/sec per bot)
+    
+    alt Under rate limit
+        RL-->>API: Allowed
+        API->>MS: Create interaction response
+        MS->>DB: Persist
+        MS->>Q: Publish message
+        Q->>GW: Fanout to channel
+        GW-->>U: Interaction response displayed
+    else Rate limited
+        RL-->>API: 429 Too Many Requests
+        API-->>Bot: {retry_after: 1.5}
+        Bot->>Bot: Queue + retry after delay
+    end
+
+    Note over Bot,API: Bots must ACK interactions within 3 seconds<br/>or defer with DEFERRED_CHANNEL_MESSAGE_WITH_SOURCE
+```
+

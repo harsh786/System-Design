@@ -90,6 +90,44 @@ Analytics events:
 
 ## 5. Data Modeling
 
+### Entity-Relationship Diagram
+
+```mermaid
+erDiagram
+    SHOWS {
+        bigint show_id PK
+        bigint owner_user_id FK
+        varchar title
+        varchar rss_feed_url
+        bigint subscriber_count
+        varchar status
+    }
+    EPISODES {
+        bigint episode_id PK
+        bigint show_id FK
+        varchar title
+        int duration_sec
+        bigint play_count
+        varchar transcript_status
+    }
+    USER_SUBSCRIPTIONS {
+        bigint user_id PK
+        bigint show_id PK
+        boolean auto_download
+        boolean notifications
+    }
+    PLAYBACK_PROGRESS {
+        bigint user_id PK
+        bigint episode_id PK
+        int position_ms
+        boolean completed
+    }
+
+    SHOWS ||--o{ EPISODES : contains
+    SHOWS ||--o{ USER_SUBSCRIPTIONS : "subscribed to"
+    EPISODES ||--o{ PLAYBACK_PROGRESS : "tracked in"
+```
+
 ### 5.1 Shows Table (PostgreSQL)
 
 ```sql
@@ -1653,3 +1691,154 @@ Revenue:
 7. **P2P distribution**: WebRTC-based peer-assisted delivery for popular episodes to reduce CDN costs
 
 ---
+
+---
+
+## Sequence Diagrams
+
+### 1. RSS Feed Crawl + New Episode Detection
+
+```mermaid
+sequenceDiagram
+    participant Sched as Crawler Scheduler
+    participant Crawl as Crawler Workers
+    participant RSS as Podcast RSS Feed (External)
+    participant Parse as Feed Parser
+    participant DB as Podcast/Episode DB
+    participant Q as Event Queue (Kafka)
+    participant Ingest as Ingestion Pipeline
+    participant Notify as Notification Service
+    participant Subs as Subscribers
+
+    Sched->>Sched: Determine crawl priority (popular=every 5min, long-tail=every 6h)
+    Sched->>Crawl: Dispatch crawl jobs (batch of feed URLs)
+
+    loop For each feed
+        Crawl->>RSS: GET feed.xml (If-None-Match: etag, If-Modified-Since)
+        alt 304 Not Modified
+            RSS-->>Crawl: No changes
+            Crawl->>Crawl: Skip, update last_checked
+        else 200 OK (new content)
+            RSS-->>Crawl: Updated XML
+            Crawl->>Parse: Parse feed XML
+            Parse->>Parse: Extract episodes, metadata, enclosure URLs
+            Parse->>DB: Compare with known episodes (guid matching)
+
+            alt New episode(s) detected
+                Parse->>DB: Insert new episode records
+                Parse->>Q: Publish NewEpisodeDetected {podcast_id, episode_id, audio_url}
+                Q->>Ingest: Trigger audio download + processing
+                Ingest->>RSS: Download audio file (mp3/m4a)
+                Ingest->>Ingest: Transcode to standard formats, generate waveform
+                Ingest->>Ingest: Run speech-to-text for transcription
+                Ingest->>DB: Update episode (status: ready, duration, transcript)
+                Q->>Notify: Trigger subscriber notifications
+                Notify->>Subs: Push notifications (new episode from subscribed show)
+            end
+        end
+    end
+
+    Note over Sched: Adaptive crawl frequency based on publish cadence history
+```
+
+### 2. Dynamic Ad Insertion During Playback
+
+```mermaid
+sequenceDiagram
+    participant C as Client Player
+    participant API as Playback API
+    participant AdServer as Ad Decision Server
+    participant Targeting as User Targeting Service
+    participant AdStore as Ad Audio Storage
+    participant CDN as CDN
+    participant Stitch as Audio Stitcher
+    participant Analytics as Ad Analytics
+
+    C->>API: POST /playback/start {episode_id, position: 0}
+    API->>API: Fetch episode manifest (pre-roll, mid-roll markers at 12:30, 28:45)
+    API->>Targeting: Get user ad profile (geo, demographics, interests, frequency caps)
+    Targeting-->>API: Targeting parameters
+
+    API->>AdServer: Request ad (slot: pre-roll, duration: 30s, targeting_params)
+    AdServer->>AdServer: Auction / waterfall (programmatic + direct-sold)
+    AdServer-->>API: Winning ad {ad_id, audio_url, tracking_pixels}
+
+    API->>Stitch: Generate stitched manifest (episode_part_1 + ad + episode_part_2 + ...)
+    Stitch-->>API: Stitched HLS/progressive manifest
+
+    API-->>C: Playback URL (stitched)
+
+    C->>CDN: Stream audio (seamless - ad stitched inline)
+    Note over C: User hears content → pre-roll ad → content continues
+
+    C->>Analytics: POST /ad/impression {ad_id, position, timestamp}
+
+    Note over C: Reaches mid-roll marker at 12:30
+    C->>API: Request mid-roll ad (real-time, server-side)
+    API->>AdServer: Request ad (slot: mid-roll, context: episode_genre)
+    AdServer-->>API: Mid-roll ad
+    API->>CDN: Serve ad audio inline
+    C->>Analytics: POST /ad/impression {mid-roll ad_id}
+
+    alt User skips (if allowed)
+        C->>Analytics: POST /ad/skip {ad_id, skip_time}
+    end
+```
+
+### 3. Offline Download + Sync
+
+```mermaid
+sequenceDiagram
+    participant C as Client App
+    participant API as Download API
+    participant Auth as Auth Service
+    participant License as License/DRM Service
+    participant CDN as CDN
+    participant Local as Local Storage (Device)
+    participant Sync as Sync Service
+    participant DB as User State DB
+
+    C->>API: POST /downloads {episode_id, quality: high}
+    API->>Auth: Validate subscription (offline allowed?)
+    alt Free tier (no offline)
+        Auth-->>API: DENY
+        API-->>C: 403 (upgrade required)
+    else Premium tier
+        Auth-->>API: OK
+    end
+
+    API->>License: Generate offline license (validity: 30 days)
+    License-->>API: Encrypted license + decryption key (device-bound)
+
+    API-->>C: Download manifest {segment_urls[], license, total_size}
+
+    loop Download segments (background, resumable)
+        C->>CDN: GET segment_N (Range headers for resume)
+        CDN-->>C: Encrypted audio segment
+        C->>Local: Store encrypted segment
+        alt Network interruption
+            C->>C: Pause, mark progress, retry on reconnect
+        end
+    end
+
+    C->>Local: Store license + metadata
+    C->>Sync: POST /sync/downloads {episode_id, status: complete}
+    Sync->>DB: Record download state for user
+
+    Note over C: Playing offline
+    C->>Local: Read encrypted segments
+    C->>C: Decrypt with device-bound key + play
+
+    Note over C: Back online after some time
+    C->>Sync: POST /sync/progress {episode_id, position: 34:22, completed: false}
+    Sync->>DB: Update listen position
+    Sync-->>C: Pull remote state (other episodes progressed on other devices)
+
+    Note over C: License expiry check
+    C->>C: Check license validity (30 day window)
+    alt Expired
+        C->>API: POST /downloads/renew {episode_id}
+        API->>License: Reissue license
+        API-->>C: New license (another 30 days)
+    end
+```

@@ -81,6 +81,64 @@
 
 ## 4. Data Modeling
 
+### Entity-Relationship Diagram
+
+```mermaid
+erDiagram
+    USERS {
+        uuid user_id PK
+        varchar phone_number
+        bytea identity_key
+        timestamptz created_at
+    }
+    DEVICES {
+        uuid device_id PK
+        uuid user_id FK
+        varchar platform
+        boolean is_primary
+    }
+    ONE_TIME_PREKEYS {
+        bigserial prekey_id PK
+        uuid device_id FK
+        bytea public_key
+        boolean is_used
+    }
+    CONVERSATIONS {
+        uuid conversation_id PK
+        varchar type
+        uuid creator_id FK
+        bytea group_key
+    }
+    CONVERSATION_MEMBERS {
+        uuid conversation_id PK
+        uuid user_id PK
+        varchar role
+        uuid last_read_msg
+    }
+    MESSAGES {
+        uuid conversation_id PK
+        timeuuid message_id PK
+        uuid sender_id FK
+        varchar message_type
+        blob encrypted_body
+    }
+    DELIVERY_RECEIPTS {
+        uuid message_id PK
+        uuid recipient_id PK
+        uuid device_id FK
+        text status
+    }
+
+    USERS ||--o{ DEVICES : "has"
+    DEVICES ||--o{ ONE_TIME_PREKEYS : "holds"
+    USERS ||--o{ CONVERSATION_MEMBERS : "joins"
+    CONVERSATIONS ||--o{ CONVERSATION_MEMBERS : "has"
+    USERS ||--o{ CONVERSATIONS : "creates"
+    CONVERSATIONS ||--o{ MESSAGES : "contains"
+    USERS ||--o{ MESSAGES : "sends"
+    MESSAGES ||--o{ DELIVERY_RECEIPTS : "tracked by"
+```
+
 ### 4.1 Users & Devices (PostgreSQL / CockroachDB)
 
 ```sql
@@ -1398,3 +1456,128 @@ Blue-Green for Breaking Changes:
 8. Push notification payload is metadata-only (no message content)
 9. Disappearing messages enforced client-side (server deletes after TTL)
 10. Read receipts are opt-in (bilateral: disabling hides others' receipts too)
+
+---
+
+## Sequence Diagrams
+
+### 1. Send Message (E2E Encrypted)
+
+```mermaid
+sequenceDiagram
+    participant A as Sender Client
+    participant GW as WebSocket Gateway
+    participant MS as Message Service
+    participant KS as Key Server
+    participant Q as Kafka
+    participant DB as Cassandra
+    participant GW2 as Recipient Gateway
+    participant B as Recipient Client
+
+    A->>A: Encrypt message (Signal Protocol, recipient's public key)
+    A->>GW: Send encrypted message (WebSocket)
+    GW->>GW: Validate JWT + rate limit
+    GW->>MS: Route message
+    MS->>DB: Persist encrypted blob + metadata
+    MS-->>GW: ACK (message stored)
+    GW-->>A: Delivery receipt (single tick ✓)
+    MS->>Q: Publish MESSAGE_SENT event
+    
+    alt Recipient Online
+        Q->>GW2: Notify recipient gateway
+        GW2->>B: Push encrypted message
+        B->>B: Decrypt with private key
+        B->>GW2: Delivery ACK
+        GW2->>MS: Mark delivered
+        MS->>Q: Publish DELIVERED event
+        Q->>GW: Notify sender gateway
+        GW-->>A: Delivered receipt (double tick ✓✓)
+    else Recipient Offline
+        Note over MS,DB: Message queued in offline store
+        MS->>Q: Publish PUSH_NOTIFICATION event
+        Q->>MS: FCM/APNs push sent
+    end
+```
+
+### 2. Group Message Fanout
+
+```mermaid
+sequenceDiagram
+    participant S as Sender
+    participant GW as WebSocket Gateway
+    participant GS as Group Service
+    participant MS as Message Service
+    participant Q as Kafka (Partitioned by GroupID)
+    participant DB as Cassandra
+    participant FO as Fanout Workers
+    participant GW_N as Recipient Gateways (N)
+    participant R as Recipients (N)
+
+    S->>GW: Send group message (encrypted per member)
+    GW->>GS: Validate membership + permissions
+    GS->>GS: Fetch group member list (cached)
+    GS->>MS: Create message entries (sender-key optimization)
+    MS->>DB: Write message (single write, sender-key encryption)
+    MS->>Q: Publish GROUP_MESSAGE event
+
+    loop For each group member partition
+        Q->>FO: Consume event
+        FO->>FO: Lookup recipient gateway (Redis)
+        alt Member Online
+            FO->>GW_N: Route to member's gateway
+            GW_N-->>R: Deliver message
+        else Member Offline
+            FO->>DB: Queue in offline inbox
+            FO->>Q: Trigger push notification
+        end
+    end
+
+    Note over FO: Fanout capped at 256 members per group<br/>Larger groups use sender-key (one encrypt, N decrypt)
+```
+
+### 3. Key Exchange (Signal Protocol - X3DH)
+
+```mermaid
+sequenceDiagram
+    participant A as Alice (Initiator)
+    participant KS as Key Server
+    participant B as Bob (Recipient)
+
+    Note over B,KS: Pre-key bundle upload (registration)
+    B->>KS: Upload Identity Key + Signed Pre-Key + One-Time Pre-Keys (100)
+
+    Note over A: Alice wants to message Bob for first time
+    A->>KS: Request Bob's pre-key bundle
+    KS-->>A: {Identity Key, Signed Pre-Key, One-Time Pre-Key}
+    KS->>KS: Delete used One-Time Pre-Key
+
+    A->>A: X3DH Key Agreement<br/>DH1 = DH(IK_A, SPK_B)<br/>DH2 = DH(EK_A, IK_B)<br/>DH3 = DH(EK_A, SPK_B)<br/>DH4 = DH(EK_A, OPK_B)<br/>SK = KDF(DH1 || DH2 || DH3 || DH4)
+
+    A->>A: Initialize Double Ratchet with SK
+    A->>KS: Send initial message + EK_A + used OPK identifier
+    KS->>B: Forward (when online)
+
+    B->>B: Compute same SK using own private keys
+    B->>B: Initialize Double Ratchet with SK
+    B-->>A: First reply (completes ratchet setup)
+
+    Note over A,B: Subsequent messages use Double Ratchet<br/>New DH keys every message (forward secrecy)
+```
+
+### Caching Strategy
+
+| Layer | Store | Content | TTL | Eviction |
+|-------|-------|---------|-----|----------|
+| Connection State | Redis Cluster | UserID → {GatewayID, ConnID, LastSeen} | Session duration | On disconnect event |
+| Recent Messages | Redis (sorted sets) | Last 50 messages per conversation | 24h | LRU when memory pressure > 70% |
+| Group Metadata | Redis | Group members, settings, sender-keys | 1h | Invalidate on group update event |
+| Presence Cache | Redis pub/sub | Online/offline/typing status | 30s heartbeat | Expire on missed heartbeat |
+| Media URLs | CDN + Local | Pre-signed URLs for media | 15min | Re-generate on access |
+| Offline Queue | Redis Lists | Pending messages for offline users | 30 days | Deliver + delete on reconnect |
+
+**Cache Invalidation Patterns:**
+- **Write-through** for connection state (gateway writes on connect/disconnect)
+- **Event-driven invalidation** for group metadata (Kafka consumer updates cache)
+- **TTL-based expiry** for presence (heartbeat refreshes TTL)
+- **Read-aside with backfill** for message history (cache miss → query Cassandra → populate cache)
+

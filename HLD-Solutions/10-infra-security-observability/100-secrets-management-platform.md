@@ -860,6 +860,63 @@ class ConvergentEncryption:
 
 ## 8. Database Schema
 
+### Entity-Relationship Diagram
+
+```mermaid
+erDiagram
+    VAULT_ENTRIES {
+        string path PK
+        bytea value
+        bigint version
+    }
+    SECRET_VERSIONS {
+        string path FK
+        int version
+        bytea data_encrypted
+        boolean destroyed
+    }
+    LEASES {
+        string lease_id PK
+        string path FK
+        string token_id FK
+        timestamp expires_at
+        boolean renewable
+    }
+    TOKENS {
+        string id PK
+        string accessor
+        string parent_id
+        text_arr policies
+        timestamp expires_at
+    }
+    POLICIES {
+        string name PK
+        text rules
+        int version
+    }
+    AUDIT_LOG {
+        bigint id PK
+        string path
+        string operation
+        string auth_accessor
+    }
+    TRANSIT_KEYS {
+        string name PK
+        string type
+        int latest_version
+    }
+    TRANSIT_KEY_VERSIONS {
+        string key_name FK
+        int version
+        bytea key_material
+    }
+
+    VAULT_ENTRIES ||--o{ SECRET_VERSIONS : "versioned"
+    TOKENS ||--o{ LEASES : "issues"
+    VAULT_ENTRIES ||--o{ LEASES : "leased"
+    TRANSIT_KEYS ||--o{ TRANSIT_KEY_VERSIONS : "rotated"
+```
+
 ### Storage Backend (Encrypted at rest)
 
 ```sql
@@ -1123,3 +1180,100 @@ redis:
 - RPO: < 1 second (bounded by replication lag)
 - RTO: < 60 seconds (promotion + unseal)
 - Backup: periodic snapshots to encrypted object storage
+
+---
+
+## Sequence Diagrams
+
+### Secret Read + Lease Renewal
+
+```mermaid
+sequenceDiagram
+    participant App as Application
+    participant SDK as Vault SDK
+    participant Cache as Local Cache (encrypted)
+    participant Vault as Vault Server
+    participant Backend as Secret Backend (DB creds)
+    participant Audit as Audit Log
+
+    App->>SDK: GetSecret("db/prod/payments")
+    SDK->>Cache: Check local cache
+    alt Cache hit (lease still valid)
+        Cache-->>SDK: Secret value + remaining TTL
+        SDK-->>App: Secret (from cache)
+    else Cache miss or lease expired
+        SDK->>Vault: GET /v1/secret/db/prod/payments [token]
+        Vault->>Vault: Authenticate token, check policy
+        Vault->>Backend: Fetch/generate credential
+        Backend-->>Vault: {username, password, lease_id, lease_ttl: 1h}
+        Vault->>Audit: Log access {who, what, when} (async)
+        Vault-->>SDK: Secret + lease metadata
+        SDK->>Cache: Store encrypted {secret, lease_id, expiry}
+        SDK-->>App: Secret value
+    end
+
+    loop Lease renewal (every TTL/2 = 30 min)
+        SDK->>Vault: PUT /v1/sys/leases/renew {lease_id}
+        Vault->>Vault: Validate lease, extend TTL
+        Vault-->>SDK: Renewed {new_ttl: 1h}
+        SDK->>Cache: Update expiry
+    end
+```
+
+### Dynamic Secret Generation + Rotation
+
+```mermaid
+sequenceDiagram
+    participant App as Application
+    participant Vault as Vault Server
+    participant DBPlugin as Database Plugin
+    participant DB as PostgreSQL
+    participant Rotator as Rotation Scheduler
+    participant Audit as Audit Log
+
+    App->>Vault: GET /v1/database/creds/payments-readonly
+    Vault->>Vault: Check policy: app has "read" on path
+    Vault->>DBPlugin: Generate dynamic credential
+    DBPlugin->>DB: CREATE ROLE "v-app-payments-ro-abc123" WITH PASSWORD 'xyz' VALID UNTIL '...'
+    DBPlugin->>DB: GRANT SELECT ON payments.* TO "v-app-payments-ro-abc123"
+    DB-->>DBPlugin: Role created
+    DBPlugin-->>Vault: {username: "v-app-payments-ro-abc123", password: "xyz"}
+    Vault->>Audit: Dynamic secret generated (async)
+    Vault-->>App: {username, password, lease_id, lease_ttl: 1h}
+
+    Note over App,DB: App uses credential for 1 hour
+
+    Rotator->>Vault: Lease expired for "v-app-payments-ro-abc123"
+    Vault->>DBPlugin: Revoke credential
+    DBPlugin->>DB: DROP ROLE "v-app-payments-ro-abc123"
+    DB-->>DBPlugin: Role dropped
+    Vault->>Audit: Credential revoked
+
+    Note over Rotator: If app still running → SDK auto-fetches new credential before expiry
+```
+
+## Caching Strategy
+
+| Layer | What's Cached | TTL | Invalidation |
+|-------|--------------|-----|-------------|
+| SDK local cache | Decrypted secret values | Lease TTL (typ. 1h) | Lease expiry, forced revocation |
+| Vault response cache | Token→policy mappings | Token TTL | Token revocation |
+| Transit key cache | Encryption keys (in Vault memory) | Until restart | Key rotation event |
+| Template cache | Rendered secret templates | 5 min | Secret value change |
+
+### Security Constraints on Caching
+- Secrets NEVER cached in shared caches (Redis) — only in-process or encrypted-at-rest
+- Cache eviction MUST zero-out memory (prevent memory dump attacks)
+- Lease revocation MUST propagate to all caches within 60s (event-driven)
+
+## Async Processing
+
+- **Lease management**: Background thread renews leases before expiry (non-blocking to app)
+- **Audit logging**: All secret access logged async to prevent audit from blocking reads
+- **Rotation execution**: Scheduled background jobs rotate static secrets (e.g., API keys)
+- **CRL distribution**: Certificate revocation lists published async to all consumers
+- **Seal/unseal**: Auto-unseal via KMS is async on Vault restart (no operator needed)
+
+### Exactly-Once Rotation
+- Rotation uses compare-and-swap: new secret only committed if old version matches
+- Prevents double-rotation race condition when multiple Vault nodes trigger simultaneously

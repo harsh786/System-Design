@@ -61,6 +61,77 @@
 
 ## 4. Data Modeling
 
+### Entity-Relationship Diagram
+
+```mermaid
+erDiagram
+    CALENDARS {
+        uuid calendar_id PK
+        uuid owner_id FK
+        varchar name
+        varchar timezone
+        varchar visibility
+    }
+    EVENTS {
+        uuid event_id PK
+        uuid calendar_id FK
+        uuid organizer_id FK
+        varchar title
+        timestamptz start_time
+        timestamptz end_time
+        boolean is_recurring
+        text rrule
+    }
+    EVENT_EXCEPTIONS {
+        uuid exception_id PK
+        uuid master_event_id FK
+        timestamptz original_start
+        boolean is_deleted
+    }
+    EVENT_INSTANCES {
+        uuid instance_id PK
+        uuid event_id FK
+        uuid calendar_id FK
+        timestamptz instance_start
+        timestamptz instance_end
+    }
+    EVENT_ATTENDEES {
+        uuid event_id PK
+        varchar email PK
+        uuid user_id FK
+        varchar response_status
+        varchar role
+    }
+    CALENDAR_ACL {
+        uuid acl_id PK
+        uuid calendar_id FK
+        varchar grantee_type
+        varchar permission
+    }
+    EVENT_REMINDERS {
+        uuid reminder_id PK
+        uuid event_id FK
+        uuid user_id FK
+        varchar method
+        integer minutes_before
+    }
+    RESOURCES {
+        uuid resource_id PK
+        varchar name
+        varchar type
+        integer capacity
+        uuid calendar_id FK
+    }
+
+    CALENDARS ||--o{ EVENTS : contains
+    CALENDARS ||--o{ CALENDAR_ACL : "shared via"
+    CALENDARS ||--o| RESOURCES : "assigned to"
+    EVENTS ||--o{ EVENT_EXCEPTIONS : "has exceptions"
+    EVENTS ||--o{ EVENT_INSTANCES : "expanded into"
+    EVENTS ||--o{ EVENT_ATTENDEES : "has attendees"
+    EVENTS ||--o{ EVENT_REMINDERS : "has reminders"
+```
+
 ### Primary Database: Sharded PostgreSQL + Event Store
 
 ```sql
@@ -1369,3 +1440,80 @@ Strategy:
 | Room double-booking | User frustration | Optimistic locking + immediate conflict notification |
 
 ---
+
+---
+
+## 12. Sequence Diagrams
+
+### 12.1 Event Creation with Recurrence Expansion
+
+```mermaid
+sequenceDiagram
+    participant U as User/Client
+    participant API as API Gateway
+    participant ES as Event Service
+    participant RR as RRULE Engine
+    participant MAT as Materializer
+    participant DB as PostgreSQL (Sharded)
+    participant Cache as Redis Cache
+    participant NQ as Notification Queue (Kafka)
+
+    U->>API: POST /events {title, rrule: "FREQ=WEEKLY;COUNT=52", attendees}
+    API->>ES: createEvent(userId, eventPayload)
+    ES->>ES: Validate RRULE (RFC 5545 compliance)
+    ES->>DB: INSERT master event (rrule stored as-is)
+    DB-->>ES: eventId = evt_abc123
+    ES->>MAT: Materialize instances (async)
+    MAT->>RR: Expand RRULE → next 6 months of instances
+    RR-->>MAT: [instance_1, instance_2, ..., instance_26]
+    MAT->>DB: BATCH INSERT event_instances (26 rows)
+    MAT->>Cache: INVALIDATE calendar:{userId}:month:*
+    ES->>NQ: Emit EventCreated {eventId, attendees}
+    NQ-->>NQ: Fan-out to attendee notification workers
+    ES-->>API: 201 Created {eventId, instances_count: 26}
+    API-->>U: 201 {eventId, recurrence_summary}
+    
+    Note over NQ: Async: email/push to attendees
+```
+
+### 12.2 Free/Busy Query Across Multiple Calendars
+
+```mermaid
+sequenceDiagram
+    participant U as Organizer Client
+    participant API as API Gateway
+    participant FB as Free/Busy Service
+    participant Cache as Redis Cache
+    participant DB as PostgreSQL
+    participant ExtCal as External Calendar (CalDAV)
+    participant ACL as ACL Service
+
+    U->>API: POST /freebusy {attendees: [A, B, C], timeMin, timeMax}
+    API->>FB: queryFreeBusy(organizerId, attendees, timeRange)
+    
+    par Check each attendee in parallel
+        FB->>ACL: checkPermission(organizer, attendee_A, "freebusy")
+        ACL-->>FB: allowed
+        FB->>Cache: GET freebusy:{A}:{timeRange_hash}
+        Cache-->>FB: HIT → [busy_blocks_A]
+    and
+        FB->>ACL: checkPermission(organizer, attendee_B, "freebusy")
+        ACL-->>FB: allowed
+        FB->>Cache: GET freebusy:{B}:{timeRange_hash}
+        Cache-->>FB: MISS
+        FB->>DB: SELECT start,end FROM events WHERE calendar_id IN (B's calendars) AND overlaps(timeRange)
+        DB-->>FB: [busy_blocks_B]
+        FB->>Cache: SET freebusy:{B}:{hash} TTL=60s
+    and
+        FB->>ACL: checkPermission(organizer, attendee_C, "freebusy")
+        ACL-->>FB: allowed (external calendar)
+        FB->>ExtCal: CalDAV REPORT free-busy-query
+        ExtCal-->>FB: iCal VFREEBUSY response
+        FB->>FB: Parse iCal → [busy_blocks_C]
+    end
+    
+    FB->>FB: Merge busy blocks, find common free slots
+    FB-->>API: {attendees: {A: [...], B: [...], C: [...]}, suggested_slots: [...]}
+    API-->>U: 200 OK {free_busy_response}
+```
+

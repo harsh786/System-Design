@@ -113,6 +113,39 @@ Inbound (tweet writes):
 
 ## 4. Data Modeling
 
+### Entity-Relationship Diagram
+
+```mermaid
+erDiagram
+    USERS {
+        bigint user_id PK
+        varchar username
+        boolean is_verified
+        boolean is_celebrity
+    }
+    FOLLOWS {
+        bigint follower_id PK
+        bigint followee_id PK
+        timestamptz created_at
+    }
+    TWEETS {
+        bigint tweet_id PK
+        bigint user_id FK
+        text text
+        bigint reply_to_id FK
+        bigint retweet_of_id FK
+    }
+    USER_TIMELINE {
+        bigint user_id PK
+        bigint tweet_id FK
+        timestamp created_at
+    }
+    USERS ||--o{ FOLLOWS : "follows"
+    USERS ||--o{ TWEETS : "authors"
+    USERS ||--o{ USER_TIMELINE : "has timeline"
+    TWEETS ||--o| TWEETS : "replies to / retweets"
+```
+
 ### PostgreSQL — Users & Relationships (Sharded by user_id)
 
 ```sql
@@ -731,6 +764,115 @@ Search: 300/15m per user (API), 180/15m (app)
 - GDPR: right to deletion propagates through all stores (Cassandra, ES, Redis, S3, ClickHouse)
 - Soft-delete with 30-day grace period before hard purge
 - Geo-fencing for content restricted by jurisdiction
+
+---
+
+## Sequence Diagrams
+
+### 1. Tweet Post + Fanout-on-Write
+
+```mermaid
+sequenceDiagram
+    participant U as User
+    participant API as API Gateway
+    participant TS as Tweet Service
+    participant K as Kafka
+    participant FO as Fanout Service
+    participant GS as Graph Service
+    participant RC as Redis Cache (Timelines)
+    participant CS as Cassandra
+
+    U->>API: POST /tweet {text, media_ids}
+    API->>TS: createTweet(user_id, content)
+    TS->>CS: persist tweet
+    TS->>K: publish TweetCreated event
+
+    Note over K,FO: Async fanout pipeline
+
+    K->>FO: consume TweetCreated
+    FO->>GS: getFollowers(author_id)
+    GS-->>FO: follower_ids[]
+
+    alt Author has < 10K followers (Normal user)
+        loop For each follower batch
+            FO->>RC: LPUSH timeline:{follower_id} tweet_id
+            FO->>RC: LTRIM timeline:{follower_id} 0 799
+        end
+    else Author has >= 10K followers (Celebrity)
+        Note over FO: Skip fanout; merge at read time
+        FO->>RC: ADD celebrity_tweets:{author_id} tweet_id
+    end
+
+    FO->>K: publish FanoutComplete event
+```
+
+### 2. Timeline Read for Celebrity Followers
+
+```mermaid
+sequenceDiagram
+    participant U as User
+    participant API as API Gateway
+    participant TL as Timeline Service
+    participant RC as Redis Cache
+    participant GS as Graph Service
+    participant MS as Merge Service
+    participant RK as Ranking Service
+
+    U->>API: GET /home_timeline?cursor=xxx
+    API->>TL: getTimeline(user_id, cursor)
+    TL->>RC: LRANGE timeline:{user_id} offset limit
+
+    Note over TL: Check if user follows any celebrities
+    TL->>GS: getCelebrityFollowees(user_id)
+    GS-->>TL: celebrity_ids[]
+
+    alt User follows celebrities
+        loop For each celebrity
+            TL->>RC: ZRANGEBYSCORE celebrity_tweets:{celeb_id} since cursor
+        end
+        TL->>MS: merge(precomputed_tweets, celebrity_tweets)
+        MS->>RK: rank(merged_tweets, user_features)
+        RK-->>MS: ranked_tweets[]
+        MS-->>TL: final_timeline
+    else No celebrity follows
+        TL-->>TL: use precomputed directly
+    end
+
+    TL-->>API: timeline_page + next_cursor
+    API-->>U: 200 OK {tweets[], cursor}
+```
+
+### 3. Retweet Propagation
+
+```mermaid
+sequenceDiagram
+    participant U as User A
+    participant API as API Gateway
+    participant RS as Retweet Service
+    participant TS as Tweet Service
+    participant K as Kafka
+    participant FO as Fanout Service
+    participant NS as Notification Service
+    participant RC as Redis Cache
+
+    U->>API: POST /retweet {tweet_id}
+    API->>RS: createRetweet(user_id, tweet_id)
+    RS->>TS: getTweet(tweet_id)
+    TS-->>RS: original_tweet
+
+    alt Tweet exists and is public
+        RS->>TS: incrementRetweetCount(tweet_id)
+        RS->>K: publish RetweetCreated {user_id, tweet_id, original_author}
+        K->>FO: consume RetweetCreated
+        Note over FO: Same fanout logic as new tweet
+        FO->>RC: LPUSH timeline:{follower_id} retweet_ref
+        K->>NS: notify original author
+        NS-->>NS: push notification to original_author
+        RS-->>API: 200 OK
+    else Tweet deleted or private
+        RS-->>API: 404 Not Found
+    end
+```
 
 ---
 

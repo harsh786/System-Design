@@ -59,6 +59,58 @@ Compute:
 
 ## 4. Data Modeling
 
+### Entity-Relationship Diagram
+
+```mermaid
+erDiagram
+    DEVICES {
+        varchar device_id PK
+        uuid tenant_id
+        varchar device_type
+        varchar connection_status
+        varchar protocol
+    }
+    DEVICE_TWINS {
+        varchar device_id PK_FK
+        jsonb desired_properties
+        jsonb reported_properties
+        varchar sync_status
+    }
+    DEVICE_TELEMETRY {
+        varchar device_id PK_FK
+        timestamptz timestamp PK
+        varchar metric_name PK
+        double value_numeric
+        uuid tenant_id
+    }
+    ROUTING_RULES {
+        uuid rule_id PK
+        uuid tenant_id
+        varchar action_type
+        text condition_sql
+        int priority
+    }
+    FIRMWARE_UPDATES {
+        uuid update_id PK
+        uuid tenant_id
+        varchar firmware_version
+        varchar rollout_strategy
+        varchar status
+    }
+    FIRMWARE_DEVICE_STATUS {
+        uuid update_id PK_FK
+        varchar device_id PK_FK
+        varchar status
+        int progress_pct
+    }
+
+    DEVICES ||--|| DEVICE_TWINS : has
+    DEVICES ||--o{ DEVICE_TELEMETRY : emits
+    DEVICES ||--o{ FIRMWARE_DEVICE_STATUS : receives
+    FIRMWARE_UPDATES ||--o{ FIRMWARE_DEVICE_STATUS : targets
+    ROUTING_RULES }o--o{ DEVICES : applies-to
+```
+
 ### Device Registry Schema
 ```sql
 CREATE TABLE devices (
@@ -1252,3 +1304,97 @@ monitoring:
 - OTA firmware: signed + encrypted, verified before installation
 - Network segmentation: device traffic isolated from management traffic
 - Rate limiting per device: max 100 msgs/s, max 1 KB per message
+
+---
+
+## 12. Sequence Diagrams
+
+### Diagram 1: Device Connect + Publish + Route
+
+```mermaid
+sequenceDiagram
+    participant Device as IoT Device
+    participant LB as L4 Load Balancer
+    participant Broker as MQTT Broker
+    participant Auth as Auth Service
+    participant Redis as Session Store (Redis)
+    participant Rules as Rule Engine
+    participant Kafka
+    participant TSDB as TimescaleDB
+
+    Device->>LB: TCP SYN (port 8883/TLS)
+    LB->>Broker: Route to least-connections broker node
+    Device->>Broker: TLS handshake (client cert: X.509)
+    Broker->>Auth: Validate certificate (check revocation list, extract device_id)
+    Auth-->>Broker: Authenticated (device_id=sensor-42, permissions=[publish:telemetry/#])
+    Broker->>Redis: HSET session:sensor-42 {broker_id, connected_at, clean_session=false}
+    Broker-->>Device: CONNACK (session_present=true, queued messages available)
+
+    Device->>Broker: PUBLISH telemetry/sensor-42/temperature (QoS=1, payload={"temp":23.5,"ts":1709123456})
+    Broker->>Broker: Validate topic ACL (sensor-42 can publish to telemetry/sensor-42/*)
+    Broker-->>Device: PUBACK (packet_id=7)
+
+    Broker->>Rules: Forward message to rule engine
+    Rules->>Rules: Evaluate rules: IF topic MATCHES 'telemetry/*' THEN route to Kafka
+    Rules->>Rules: Evaluate rules: IF temp > 50 THEN trigger alert
+    Rules->>Kafka: Produce to topic: iot-telemetry (key=device_id, partition by device)
+    
+    Kafka-->>Rules: ACK
+    
+    Note over Kafka,TSDB: Consumer pipeline
+    TSDB->>Kafka: Consume batch (1000 messages)
+    TSDB->>TSDB: INSERT INTO telemetry (device_id, metric, value, ts) VALUES (batch)
+    TSDB->>Kafka: Commit offset
+```
+
+### Diagram 2: Rule Engine Evaluation + Alert Trigger
+
+```mermaid
+sequenceDiagram
+    participant Broker as MQTT Broker
+    participant Rules as Rule Engine (Flink CEP)
+    participant State as Rule State (RocksDB)
+    participant Alert as Alert Service
+    participant PD as PagerDuty
+    participant Device as Device Shadow
+    participant Cmd as Command Service
+
+    Broker->>Rules: Message: {device: "pump-7", pressure: 95, ts: T1}
+    Rules->>State: Load state for pump-7 (last 5 readings, alert_status)
+    State-->>Rules: [80, 85, 88, 92] — trending up
+
+    Rules->>Rules: Evaluate rule: "pressure > 90 for 3 consecutive readings"
+    Note over Rules: Current reading (95) + previous (92, 88) → only 2 consecutive > 90
+    Rules->>State: Update state: [85, 88, 92, 95], consecutive_high=2
+    
+    Broker->>Rules: Message: {device: "pump-7", pressure: 97, ts: T2}
+    Rules->>State: Load state
+    Rules->>Rules: Evaluate: 95, 92... wait, [92, 95, 97] → 3 consecutive > 90!
+    
+    Rules->>Rules: ALERT condition met! Check cooldown (last alert > 5min ago? YES)
+    Rules->>Alert: Trigger alert (severity=HIGH, device=pump-7, rule_id=pressure-3x)
+    
+    Alert->>PD: Create incident (auto-resolve after 30min if pressure normalizes)
+    Alert->>Device: Update device shadow: {alert_state: "HIGH_PRESSURE"}
+    Alert->>Cmd: Send command to pump-7: REDUCE_SPEED
+
+    Cmd->>Broker: PUBLISH cmd/pump-7/control (QoS=2, payload={action:"reduce_speed",target_pressure:80})
+    Broker->>Broker: QoS 2: store message, await device PUBREC
+    
+    Note over Rules: Windowed aggregation (parallel)
+    Rules->>Rules: Tumbling window (1min): avg(pressure) for all pumps
+    Rules->>Rules: Sliding window (5min): detect anomaly (value > 3σ from mean)
+    Rules->>State: Update aggregation state
+```
+
+### Caching Strategy
+
+| Cache Layer | Data | TTL/Policy | Purpose |
+|-------------|------|-----------|---------|
+| Device session cache (Redis) | Connection state, subscriptions, QoS queues | Session lifetime | Fast session restore on reconnect |
+| Device shadow (Redis) | Latest reported + desired state per device | Persistent (no TTL) | Serve last-known-state without querying TSDB |
+| Rule state (RocksDB) | Per-device windowed state for CEP | Checkpointed to S3 | Stateful rule evaluation without external calls |
+| Auth cache (local) | Certificate validation results | 5min | Avoid auth service call on every PUBLISH |
+| Topic ACL cache (local) | Device → allowed topics mapping | 10min (invalidate on policy change) | Sub-millisecond authorization |
+| Kafka producer buffer | Pending messages for Kafka | Flush every 100ms or 1000 msgs | Batch efficiency, survive brief Kafka unavailability |
+

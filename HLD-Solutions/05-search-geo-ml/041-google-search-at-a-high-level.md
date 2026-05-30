@@ -77,6 +77,33 @@ Cache hit ratio:          ~30% for popular queries
 
 ## 5. Data Modeling
 
+### Entity-Relationship Diagram
+
+```mermaid
+erDiagram
+    DOCUMENTS {
+        bigint doc_id PK
+        text url
+        float page_rank
+        char content_hash
+        timestamp last_crawled
+    }
+    DOCUMENT_METADATA {
+        bigint doc_id FK
+        varchar meta_key PK
+        text meta_value
+    }
+    QUERY_LOGS {
+        uuid query_id PK
+        bigint user_id
+        text query_text
+        timestamp timestamp
+        jsonb results_clicked
+    }
+    DOCUMENTS ||--o{ DOCUMENT_METADATA : has
+    QUERY_LOGS }o--o{ DOCUMENTS : "clicks on"
+```
+
 ### Forward Index (Document Store)
 ```sql
 CREATE TABLE documents (
@@ -1043,6 +1070,179 @@ Solution:
 - Serving latency: Sub-200ms with fan-out to 10K+ shards requires aggressive parallelism
 - Storage cost: Tiered storage (hot SSD → warm HDD → cold archive)
 - Freshness: Balance between crawl frequency and being a good web citizen
+```
+
+---
+
+## 16. Sequence Diagrams
+
+### 16.1 Query Processing Pipeline
+
+```mermaid
+sequenceDiagram
+    participant User
+    participant LB as Load Balancer
+    participant QP as Query Parser
+    participant Spell as Spell Checker
+    participant Index as Index Servers (shards)
+    participant Rank as Ranking Service
+    participant Blend as Blender (Merge)
+    participant Cache as Result Cache
+
+    User->>LB: GET /search?q=pythn machine lerning
+    LB->>Cache: Check (normalized query hash)
+    alt Cache Hit
+        Cache-->>LB: Cached SERP
+        LB-->>User: Results (< 50ms)
+    else Cache Miss
+        LB->>QP: Parse query
+        QP->>Spell: Spell check "pythn machine lerning"
+        Spell-->>QP: Corrected: "python machine learning"
+        QP->>QP: Tokenize, detect intent (informational), expand synonyms
+        QP->>Index: Fan-out query to N shards (parallel)
+        par Shard 1
+            Index-->>Blend: Top-1000 docs (BM25 + PageRank score)
+        and Shard 2
+            Index-->>Blend: Top-1000 docs
+        and Shard N
+            Index-->>Blend: Top-1000 docs
+        end
+        Blend->>Blend: Merge results, deduplicate
+        Blend->>Rank: Re-rank top-200 with ML model (GBDT)
+        Rank->>Rank: Final re-rank top-20 with BERT
+        Rank-->>Blend: Ranked results with snippets
+        Blend->>Cache: Store (TTL=5min)
+        Blend-->>LB: Final SERP
+    end
+    LB-->>User: Search results page
+```
+
+### 16.2 Index Update Pipeline
+
+```mermaid
+sequenceDiagram
+    participant Crawler
+    participant Kafka as Kafka (Page Events)
+    participant Parser as Document Parser
+    participant Indexer as Index Builder
+    participant QualSvc as Quality Scorer
+    participant LiveIdx as Real-time Index
+    participant BatchIdx as Batch Index
+    participant ServIdx as Serving Index
+
+    Crawler->>Kafka: New page crawled {url, html, timestamp}
+    Kafka->>Parser: Consume page event
+    Parser->>Parser: Extract text, title, headings, links, structured data
+    Parser->>QualSvc: Score page quality (spam? thin content?)
+    QualSvc-->>Parser: quality_score=0.82, spam=false
+    
+    alt Breaking News / High Priority
+        Parser->>LiveIdx: Insert into real-time index (< 30s latency)
+        LiveIdx->>ServIdx: Merge into serving (within minutes)
+    else Normal Page
+        Parser->>Indexer: Add to batch queue
+        Indexer->>Indexer: Build inverted index segment (hourly)
+        Indexer->>BatchIdx: Write new segment
+        BatchIdx->>ServIdx: Merge during off-peak (daily)
+    end
+    
+    Note over ServIdx: Serving index = real-time overlay + batch segments
+```
+
+---
+
+## 17. Deep Dive: Inverted Index
+
+### 17.1 Structure of an Inverted Index
+
+```
+Term Dictionary (in memory, sorted):
+┌──────────────┬─────────────────────────────────┐
+│ Term         │ Posting List Pointer             │
+├──────────────┼─────────────────────────────────┤
+│ "algorithm"  │ → offset 0x1A2B in postings file│
+│ "binary"     │ → offset 0x2C3D                 │
+│ "cache"      │ → offset 0x3E4F                 │
+│ ...          │                                  │
+└──────────────┴─────────────────────────────────┘
+
+Posting List (on disk, compressed):
+"algorithm" → [doc3:tf=2:pos[5,17], doc7:tf=1:pos[3], doc15:tf=5:pos[1,8,12,20,31], ...]
+              │       │        │
+              │       │        └─ Positions within document (for phrase queries)
+              │       └─ Term frequency (for BM25 scoring)
+              └─ Document ID (delta-encoded for compression)
+```
+
+### 17.2 Skip Lists for Fast Intersection
+
+```
+Query: "python" AND "machine" AND "learning"
+
+Posting list for "python":   [2, 5, 8, 12, 15, 20, 25, 30, 35, 40, ...]
+Posting list for "machine":  [3, 5, 10, 12, 18, 20, 28, 30, 35, 42, ...]
+Posting list for "learning": [1, 5, 7, 12, 14, 20, 22, 30, 35, 38, ...]
+
+Without skip list: O(n) scan through all entries
+With skip list: skip ahead when current doc < target
+
+Skip list for "python" (skip every 4):
+Level 1: [2, ────────>, 15, ────────>, 35, ...]
+Level 0: [2, 5, 8, 12, 15, 20, 25, 30, 35, 40, ...]
+
+Intersection algorithm:
+1. Start with shortest list as driver ("learning")
+2. For each doc in driver, use skip list to advance other lists
+3. Result: docs appearing in ALL lists → [5, 12, 20, 30, 35, ...]
+```
+
+### 17.3 BM25 Scoring (The Math)
+
+```
+BM25(D, Q) = Σ IDF(qi) × [f(qi, D) × (k1 + 1)] / [f(qi, D) + k1 × (1 - b + b × |D|/avgdl)]
+
+Where:
+- f(qi, D) = term frequency of qi in document D
+- |D| = document length
+- avgdl = average document length in collection
+- k1 = 1.2 (term frequency saturation)
+- b = 0.75 (length normalization)
+- IDF(qi) = log[(N - n(qi) + 0.5) / (n(qi) + 0.5)]
+  - N = total documents
+  - n(qi) = documents containing term qi
+
+Example: Query "python tutorial" against a 500-word document:
+- "python" appears 8 times, in 1M of 10B docs
+- "tutorial" appears 3 times, in 500M of 10B docs
+- avgdl = 800 words
+
+IDF("python") = log[(10B - 1M + 0.5)/(1M + 0.5)] = log(9999) ≈ 9.2
+IDF("tutorial") = log[(10B - 500M + 0.5)/(500M + 0.5)] = log(19) ≈ 2.9
+
+TF_component("python") = (8 × 2.2) / (8 + 1.2 × (1 - 0.75 + 0.75 × 500/800))
+                        = 17.6 / (8 + 1.2 × 0.72) = 17.6 / 8.86 ≈ 1.99
+
+BM25 ≈ 9.2 × 1.99 + 2.9 × TF("tutorial") ≈ 18.3 + ... 
+```
+
+### 17.4 VByte Compression for Posting Lists
+
+```
+Problem: Posting list [2, 5, 8, 12, 15] stored as 32-bit ints = 20 bytes
+Solution: Delta-encode + variable byte encoding
+
+Step 1: Delta encode (store gaps)
+  [2, 5, 8, 12, 15] → [2, 3, 3, 4, 3]  (differences)
+
+Step 2: VByte encode each gap
+  - Use 7 bits per byte for data, 1 bit as continuation flag
+  - Small gaps (< 128) = 1 byte
+  - 2 → 0|0000010 (1 byte)
+  - 3 → 0|0000011 (1 byte)  
+  - 130 → 1|0000001  0|0000010 (2 bytes: continuation + final)
+
+Result: 5 bytes instead of 20 bytes = 75% compression
+Typical compression ratio: 4-8x for web-scale indices
 ```
 
 ---

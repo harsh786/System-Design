@@ -54,6 +54,89 @@
 
 ## 4. Data Modeling
 
+## 4. Data Modeling
+
+### Entity-Relationship Diagram
+
+```mermaid
+erDiagram
+    users ||--o{ connected_accounts : "connects"
+    users ||--o{ holdings : "owns"
+    users ||--o{ transactions : "records"
+    users ||--o{ goals : "sets"
+    users ||--o{ portfolio_snapshots : "tracked in"
+    users }o--o| family_groups : "belongs to"
+    family_groups ||--o{ family_members : "contains"
+    connected_accounts ||--o{ holdings : "syncs"
+    holdings ||--o{ transactions : "history of"
+
+    users {
+        UUID user_id PK
+        VARCHAR email
+        VARCHAR pan
+        VARCHAR risk_profile
+        UUID family_group_id FK
+        JSONB target_allocation
+    }
+    family_groups {
+        UUID group_id PK
+        VARCHAR group_name
+        UUID owner_id FK
+    }
+    connected_accounts {
+        UUID account_id PK
+        UUID user_id FK
+        VARCHAR source_type
+        VARCHAR source_institution
+        VARCHAR sync_status
+        TIMESTAMPTZ last_synced_at
+    }
+    holdings {
+        UUID holding_id PK
+        UUID user_id FK
+        UUID account_id FK
+        VARCHAR asset_class
+        VARCHAR instrument_name
+        DECIMAL quantity
+        DECIMAL total_invested
+        DECIMAL current_value
+        DECIMAL xirr
+    }
+    transactions {
+        UUID txn_id PK
+        UUID user_id FK
+        UUID holding_id FK
+        VARCHAR txn_type
+        DATE txn_date
+        DECIMAL amount
+        DECIMAL gain_loss
+        VARCHAR gain_type
+    }
+    goals {
+        UUID goal_id PK
+        UUID user_id FK
+        VARCHAR goal_name
+        VARCHAR goal_type
+        DECIMAL target_amount
+        DATE target_date
+        DECIMAL current_value
+    }
+    portfolio_snapshots {
+        UUID snapshot_id PK
+        UUID user_id FK
+        DATE snapshot_date
+        DECIMAL total_value
+        JSONB allocation
+        JSONB risk_metrics
+    }
+    family_members {
+        UUID group_id PK
+        UUID user_id PK
+        VARCHAR relationship
+        VARCHAR permission_level
+    }
+```
+
 ### Full Database Schemas
 
 ```sql
@@ -830,3 +913,93 @@ alerts:
 | Risk computation | Daily batch + cache | On-demand | Expensive Monte Carlo, acceptable staleness |
 | Attribution model | Brinson + Factor | Brinson only | More insightful for multi-asset portfolios |
 | Storage | PostgreSQL + TimescaleDB | Pure time-series DB | Relational for holdings + time-series for snapshots |
+
+---
+
+## 12. Sequence Diagrams
+
+### Diagram 1: Holdings Aggregation from Multiple Sources
+
+```mermaid
+sequenceDiagram
+    participant User as User App
+    participant API as Portfolio API
+    participant AA as Account Aggregator
+    participant Broker as Broker API (Zerodha)
+    participant MF as MF API (CAMS/Karvy)
+    participant Bank as Bank (FD/Savings)
+    participant Cache as Holdings Cache (Redis)
+    participant DB as Portfolio DB
+
+    User->>API: GET /portfolio/holdings (refresh=true)
+    API->>Cache: CHECK holdings:{user_id}:last_refresh
+    Cache-->>API: Last refresh = 2 hours ago (stale, threshold = 1 hour)
+    
+    par Fetch from multiple sources (parallel)
+        API->>AA: Fetch via Account Aggregator (consent-based)
+        AA->>Broker: GET demat holdings (CDSL/NSDL)
+        Broker-->>AA: [{symbol: RELIANCE, qty: 100, avg: 2400}, ...]
+        AA-->>API: Equity holdings (15 stocks)
+        
+        API->>MF: GET mutual fund holdings (PAN-based lookup)
+        MF-->>API: [{scheme: Axis Bluechip, units: 500.234, nav: 45.67}, ...]
+        
+        API->>Bank: GET fixed deposits (AA consent)
+        Bank-->>API: [{fd_id: FD001, principal: 500000, rate: 7.1%, maturity: 2025-06}]
+    end
+    
+    API->>API: Normalize holdings to common schema
+    API->>API: Calculate current values (equity: qty × LTP, MF: units × NAV)
+    API->>API: Asset allocation: Equity=60%, Debt=25%, FD=15%
+    API->>DB: UPSERT holdings snapshot (user_id, timestamp, holdings[])
+    API->>Cache: SET holdings:{user_id} (TTL=1hr)
+    API-->>User: {total_value: ₹25,00,000, allocation: {...}, holdings: [...]}
+
+    Note over User,DB: Account Aggregator provides consent-based data sharing (RBI regulated).<br/>Parallel fetch reduces latency from 3×2s to max(2s) = 2s.
+```
+
+### Diagram 2: Performance Attribution Calculation
+
+```mermaid
+sequenceDiagram
+    participant User as User App
+    participant API as Portfolio API
+    participant Holdings as Holdings Store
+    participant Price as Price Service
+    participant Calc as Attribution Engine
+    participant Cache as Calc Cache
+    participant DB as Analytics DB
+
+    User->>API: GET /portfolio/performance?period=1Y&attribution=true
+    API->>Cache: CHECK perf:{user_id}:1Y:date
+    Cache-->>API: MISS (not computed today)
+    
+    API->>Holdings: GET historical snapshots (monthly for 12 months)
+    Holdings-->>API: 12 monthly snapshots with holdings + quantities
+    
+    API->>Price: GET historical prices (all held symbols, 12 months)
+    Price-->>API: Time series prices for 20 symbols
+    
+    API->>Calc: Compute Brinson attribution
+    Calc->>Calc: Step 1: Portfolio return = (end_value - start_value - net_flows) / start_value
+    Calc->>Calc: Total return: ₹25L - ₹20L - ₹2L (fresh investment) / ₹20L = 15%
+    
+    Calc->>Calc: Step 2: Benchmark return (Nifty 50) = 12%
+    Calc->>Calc: Alpha = 15% - 12% = 3% outperformance
+    
+    Calc->>Calc: Step 3: Attribution decomposition
+    Note over Calc: Allocation effect: Over/underweight in sectors vs benchmark
+    Note over Calc: Selection effect: Stock picking within sectors
+    Note over Calc: Interaction effect: Combined impact
+    
+    Calc->>Calc: Allocation: +1.2% (overweight IT which rallied)
+    Calc->>Calc: Selection: +1.5% (RELIANCE outperformed within Energy)
+    Calc->>Calc: Interaction: +0.3%
+    
+    Calc-->>API: {total: 15%, benchmark: 12%, alpha: 3%, allocation: 1.2%, selection: 1.5%}
+    API->>Cache: SET perf:{user_id}:1Y:date (TTL=EOD)
+    API->>DB: Store for historical tracking
+    API-->>User: Performance card with attribution breakdown
+
+    Note over User,DB: XIRR used for absolute return (accounts for timing of flows).<br/>Brinson for relative attribution (vs benchmark).<br/>Cached per day (holdings don't change intraday for non-traders).
+```

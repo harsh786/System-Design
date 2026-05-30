@@ -57,6 +57,51 @@
 
 ## 4. Data Modeling
 
+### Entity-Relationship Diagram
+
+```mermaid
+erDiagram
+    POD {
+        string name PK
+        string namespace
+        string node_name FK
+        int priority
+        string status
+    }
+    NODE {
+        string name PK
+        map capacity
+        map allocatable
+        boolean unschedulable
+    }
+    SCHEDULING_DECISIONS {
+        uuid decision_id PK
+        varchar pod_name FK
+        varchar node_name FK
+        varchar decision
+        int scheduling_duration_us
+    }
+    AUTOSCALING_EVENTS {
+        uuid event_id PK
+        varchar scaling_type
+        varchar target_ref
+        int desired_replicas
+    }
+    RESOURCE_UTILIZATION {
+        varchar pod_name PK
+        varchar namespace PK
+        varchar container_name PK
+        timestamp timestamp PK
+        real cpu_usage_cores
+        real memory_usage_mb
+    }
+
+    NODE ||--o{ POD : hosts
+    POD ||--o{ SCHEDULING_DECISIONS : decided-by
+    NODE ||--o{ SCHEDULING_DECISIONS : target-of
+    POD ||--o{ RESOURCE_UTILIZATION : measured-in
+```
+
 ### etcd Key-Value Schemas (Protobuf-serialized)
 
 ```protobuf
@@ -1205,3 +1250,276 @@ groups:
 ---
 
 *Total lines: 500+ | Covers all 11 standard sections with full depth*
+
+---
+
+## 12. Sequence Diagrams
+
+### Diagram 1: Pod Scheduling Cycle
+
+```mermaid
+sequenceDiagram
+    participant User
+    participant API as API Server
+    participant etcd
+    participant Sched as Scheduler
+    participant Kubelet as Kubelet (Node-3)
+    participant CRI as Container Runtime
+
+    User->>API: kubectl apply -f deployment.yaml (replicas=3)
+    API->>etcd: Store Deployment object
+    API->>API: Deployment controller creates ReplicaSet
+    API->>etcd: Store 3 Pod objects (status=Pending, nodeName=nil)
+
+    Sched->>API: Watch pods (fieldSelector: spec.nodeName="")
+    API-->>Sched: New pod event: pod-abc (Pending)
+
+    Note over Sched: FILTERING PHASE
+    Sched->>Sched: NodeResourcesFit → eliminate nodes with insufficient CPU/mem
+    Sched->>Sched: PodTopologySpread → eliminate nodes violating spread constraints
+    Sched->>Sched: NodeAffinity → eliminate nodes not matching labels
+    Note over Sched: 5/20 nodes pass filters
+
+    Note over Sched: SCORING PHASE
+    Sched->>Sched: LeastAllocated → score by remaining capacity
+    Sched->>Sched: InterPodAffinity → score by co-location preferences
+    Sched->>Sched: ImageLocality → bonus if container image cached
+    Note over Sched: Node-3 wins (score: 87/100)
+
+    Sched->>API: Bind pod-abc to Node-3 (optimistic, no lock)
+    API->>etcd: UPDATE pod.spec.nodeName = "node-3"
+
+    Kubelet->>API: Watch pods (fieldSelector: spec.nodeName="node-3")
+    API-->>Kubelet: pod-abc assigned to me
+    Kubelet->>CRI: Pull image + create container
+    CRI-->>Kubelet: Container started
+    Kubelet->>API: UPDATE pod.status = Running (phase, conditions, IP)
+```
+
+### Diagram 2: Node Autoscaling Decision
+
+```mermaid
+sequenceDiagram
+    participant Sched as Scheduler
+    participant API as API Server
+    participant CA as Cluster Autoscaler
+    participant Cloud as Cloud Provider API
+    participant Kubelet as New Kubelet
+
+    Sched->>Sched: Pod pod-xyz unschedulable (no node passes filters)
+    Sched->>API: UPDATE pod condition: PodScheduled=False, reason=Unschedulable
+
+    CA->>API: Watch pods (condition: Unschedulable)
+    API-->>CA: pod-xyz pending (needs 4 vCPU, 16GB)
+
+    CA->>CA: Simulate scheduling: try each node group
+    CA->>CA: NodeGroup "compute-optimized" can fit pod-xyz if scaled up
+    CA->>CA: Check: pending pods would fill ≥50% of new node? YES
+
+    CA->>Cloud: Scale node group +1 (instance type: c5.xlarge)
+    Cloud-->>CA: Instance launching (node-21)
+
+    Note over Cloud: ~90s instance boot + kubelet registration
+
+    Kubelet->>API: Node-21 registers (allocatable: 4 vCPU, 15.5GB)
+    API-->>Sched: New node available
+
+    Sched->>Sched: Re-evaluate pod-xyz → Node-21 passes filters + scores highest
+    Sched->>API: Bind pod-xyz to Node-21
+
+    Note over CA: Scale-down check (every 10s)
+    CA->>API: List nodes with utilization < 50% for >10min
+    CA->>CA: Node-7 utilization 15%, all pods reschedulable elsewhere
+    CA->>API: Cordon Node-7 (unschedulable)
+    CA->>API: Drain Node-7 (evict pods with PDB respect)
+    CA->>Cloud: Terminate Node-7
+```
+
+## 13. Algorithm Deep Dives
+
+### Deep Dive: Scheduling Algorithm (Filtering, Scoring, Preemption)
+
+#### Overview
+The scheduler processes one pod at a time from the priority queue. Each scheduling cycle has three potential phases: Filter → Score → (Preempt if needed).
+
+#### Phase 1: Filtering (Predicates)
+
+Eliminates nodes that cannot run the pod. Each filter is a boolean predicate.
+
+```
+Input: Pod P, Nodes [N1, N2, ..., N20]
+Output: Feasible nodes [N3, N7, N12, N15, N19]
+
+Filter plugins (executed in order, short-circuit on empty set):
+1. NodeResourcesFit: 
+   N.allocatable - N.allocated >= P.requests
+   Example: N1 has 2 vCPU free, P needs 4 → REJECT
+
+2. NodePorts:
+   P.spec.containers[*].ports.hostPort not already bound on N
+   
+3. PodTopologySpread:
+   Adding P to N won't violate maxSkew constraint
+   Example: zone-a has 5 pods, zone-b has 3, maxSkew=1 → reject zone-a nodes
+
+4. InterPodAffinity:
+   P's requiredDuringScheduling anti-affinity satisfied
+   
+5. TaintToleration:
+   N's taints all tolerated by P's tolerations
+   
+6. VolumeBinding:
+   Required PVs available in N's zone
+```
+
+#### Phase 2: Scoring (Priorities)
+
+Score each feasible node 0-100, weighted sum across plugins.
+
+```
+For each feasible node N:
+  score = 0
+  
+  LeastAllocated (weight=1):
+    cpu_score = (N.allocatable.cpu - N.used.cpu) / N.allocatable.cpu × 100
+    mem_score = (N.allocatable.mem - N.used.mem) / N.allocatable.mem × 100
+    score += (cpu_score + mem_score) / 2
+    
+  InterPodAffinity (weight=2):
+    For each existing pod on N matching P's affinity:
+      score += affinity.weight (normalized to 0-100)
+      
+  ImageLocality (weight=1):
+    If P's image already present on N: score += 100
+    If partially present (some layers): score += proportional
+    
+  PodTopologySpread (weight=2):
+    Prefer nodes that minimize skew after placement
+    score += 100 - (resultingSkew / maxSkew × 100)
+
+Final = Σ(plugin_score × weight) / Σ(weights)
+
+Winner: argmax(Final[N]) — ties broken by lowest node name
+```
+
+#### Phase 3: Preemption (if no feasible node found)
+
+```
+1. For each node N with lower-priority pods:
+   a. Simulate removing pods with priority < P.priority (lowest first)
+   b. Re-run filters: does P now fit?
+   c. If yes, N is a preemption candidate
+
+2. Select victim node (minimize disruption):
+   - Prefer nodes where fewest pods need eviction
+   - Prefer nodes with no PDB-protected pods
+   - Prefer nodes where lowest-priority victim has lowest priority
+
+3. Execute preemption:
+   a. Set P.status.nominatedNodeName = victim_node
+   b. Delete victim pods (respect graceful termination)
+   c. Wait for resources freed → normal scheduling binds P
+```
+
+#### Step-by-Step Example
+```
+Pod: nginx-web (requests: 2 vCPU, 4GB, priority=100)
+     affinity: preferredDuringScheduling colocate with "cache" pods
+     topologySpreadConstraints: maxSkew=1 across zones
+
+Nodes:
+  N1: zone-a, 1 vCPU free, 8GB free → FILTERED (insufficient CPU)
+  N2: zone-a, 4 vCPU free, 16GB free, has "cache" pod → passes
+  N3: zone-b, 3 vCPU free, 6GB free, no "cache" pod → passes
+  N4: zone-b, 8 vCPU free, 32GB free, has "cache" pod → passes
+
+Topology check: zone-a has 10 matching pods, zone-b has 9
+  Adding to N2 (zone-a): skew becomes 11-9=2 > maxSkew=1 → FILTERED
+  N3 and N4 remain (zone-b): skew becomes 10-10=0 ✓
+
+Scoring N3 vs N4:
+  N3: LeastAllocated=(3/8+6/32)/2=34, Affinity=0, ImageLocality=0 → 34
+  N4: LeastAllocated=(8/16+32/64)/2=50, Affinity=80, ImageLocality=100 → 71
+
+Winner: N4 (score 71)
+```
+
+---
+
+### Deep Dive: Bin Packing (First-Fit Decreasing)
+
+#### Problem
+Pack maximum pods onto minimum nodes to reduce cost (opposite of LeastAllocated for cost optimization).
+
+#### Algorithm: MostAllocated Scoring (Bin Packing Mode)
+
+```python
+def most_allocated_score(node, pod):
+    """Score nodes higher when they're already full (pack tightly)"""
+    cpu_after = (node.used_cpu + pod.request_cpu) / node.allocatable_cpu
+    mem_after = (node.used_mem + pod.request_mem) / node.allocatable_mem
+    # Higher utilization = higher score (opposite of LeastAllocated)
+    return (cpu_after + mem_after) / 2 * 100
+```
+
+#### First-Fit Decreasing for Batch Scheduling
+
+When scheduling multiple pending pods (e.g., after cluster recovery):
+
+```
+1. Sort pending pods by resource request DESCENDING
+   [Pod-A: 8cpu, Pod-B: 4cpu, Pod-C: 4cpu, Pod-D: 2cpu, Pod-E: 1cpu]
+
+2. Sort nodes by available capacity DESCENDING
+   [N1: 8cpu free, N2: 6cpu free, N3: 4cpu free]
+
+3. For each pod (largest first):
+   Place on first node that fits:
+   
+   Pod-A (8cpu) → N1 (8 free → 0 free) ✓
+   Pod-B (4cpu) → N2 (6 free → 2 free) ✓
+   Pod-C (4cpu) → N3 (4 free → 0 free) ✓
+   Pod-D (2cpu) → N2 (2 free → 0 free) ✓
+   Pod-E (1cpu) → No node fits → trigger scale-up
+
+Result: 3 nodes used optimally (vs naive approach needing 4+ nodes)
+Bin packing efficiency: 19/18 cpu allocated/capacity = ~100% utilization
+```
+
+#### Trade-offs
+| Strategy | Pro | Con |
+|----------|-----|-----|
+| LeastAllocated (spread) | Better fault tolerance, headroom for bursts | More nodes needed, higher cost |
+| MostAllocated (pack) | Fewer nodes, lower cost | Single node failure impacts more pods |
+| RequestToCapacityRatio | Balanced, configurable target utilization | More complex scoring |
+
+### Async Processing Architecture
+
+#### Asynchronous Scheduling Pipeline
+
+The scheduler uses an async event-driven architecture to handle thousands of pod scheduling decisions per second:
+
+```
+Informer Cache (shared)
+    ↓ watch events (async)
+Scheduling Queue (3 sub-queues):
+    ├── ActiveQ (heap by priority) → pods ready to schedule
+    ├── BackoffQ → pods that failed scheduling, exponential backoff
+    └── UnschedulableQ → pods waiting for cluster state change
+
+Scheduling Goroutine (single-threaded per profile):
+    1. Pop from ActiveQ
+    2. Run filter/score (parallel across nodes via goroutines)
+    3. Assume binding (update cache optimistically)
+    4. Async bind (goroutine → API server)
+
+Binding Goroutine Pool:
+    - Sends Bind request to API server
+    - On failure: revert cache assumption, re-queue pod
+```
+
+Key async patterns:
+- **Optimistic concurrency**: Scheduler updates its cache assuming bind succeeds, schedules next pod immediately without waiting for etcd confirmation
+- **Parallel node scoring**: Filter/score plugins run in parallel across node groups (128 nodes per goroutine batch)
+- **Event coalescing**: Multiple node update events batched into single cache refresh
+

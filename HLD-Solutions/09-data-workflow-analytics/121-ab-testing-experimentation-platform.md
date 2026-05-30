@@ -545,6 +545,82 @@ class ExperimentStateMachine:
 
 ## 5. Data Model
 
+### Entity-Relationship Diagram
+
+```mermaid
+erDiagram
+    EXPERIMENT_LAYERS {
+        uuid id PK
+        varchar name
+        varchar domain
+    }
+    EXPERIMENTS {
+        uuid id PK
+        varchar name
+        uuid layer_id FK
+        uuid owner_id FK
+        varchar state
+        decimal traffic_percentage
+    }
+    EXPERIMENT_VARIANTS {
+        uuid id PK
+        uuid experiment_id FK
+        varchar name
+        int weight
+        boolean is_control
+    }
+    METRICS {
+        uuid id PK
+        varchar name
+        varchar metric_type
+        varchar aggregation
+    }
+    EXPERIMENT_METRICS {
+        uuid experiment_id PK_FK
+        uuid metric_id PK_FK
+        varchar metric_role
+    }
+    EXPERIMENT_TARGETING {
+        uuid id PK
+        uuid experiment_id FK
+        varchar attribute
+        varchar operator
+    }
+    MUTUAL_EXCLUSION_GROUPS {
+        uuid id PK
+        varchar name
+        uuid layer_id FK
+    }
+    MUTUAL_EXCLUSION_MEMBERS {
+        uuid group_id PK_FK
+        uuid experiment_id PK_FK
+    }
+    ASSIGNMENT_LOG {
+        varchar user_id
+        uuid experiment_id FK
+        varchar variant_name
+        timestamp assigned_at
+    }
+    EXPERIMENT_RESULTS {
+        uuid id PK
+        uuid experiment_id FK
+        uuid metric_id FK
+        varchar variant_name
+        boolean is_significant
+    }
+
+    EXPERIMENT_LAYERS ||--o{ EXPERIMENTS : contains
+    EXPERIMENTS ||--o{ EXPERIMENT_VARIANTS : has
+    EXPERIMENTS ||--o{ EXPERIMENT_METRICS : measures
+    METRICS ||--o{ EXPERIMENT_METRICS : used-in
+    EXPERIMENTS ||--o{ EXPERIMENT_TARGETING : targets
+    EXPERIMENTS ||--o{ ASSIGNMENT_LOG : assigns
+    EXPERIMENTS ||--o{ EXPERIMENT_RESULTS : produces
+    EXPERIMENT_LAYERS ||--o{ MUTUAL_EXCLUSION_GROUPS : scopes
+    MUTUAL_EXCLUSION_GROUPS ||--o{ MUTUAL_EXCLUSION_MEMBERS : includes
+    EXPERIMENTS ||--o{ MUTUAL_EXCLUSION_MEMBERS : belongs-to
+```
+
 ### Database Schema (PostgreSQL)
 
 ```sql
@@ -997,3 +1073,217 @@ def detect_interaction(experiment_a_results, experiment_b_results, combined_resu
 - "Why was I assigned?" tool for debugging unexpected behavior
 - Hash bucket visualization for uniformity verification
 - Assignment replay capability for debugging metric discrepancies
+
+---
+
+## 12. Sequence Diagrams
+
+### Diagram 1: Experiment Assignment + Bucketing
+
+```mermaid
+sequenceDiagram
+    participant User as End User
+    participant App as Application
+    participant SDK as Experimentation SDK
+    participant Cache as Local Cache
+    participant Server as Assignment Service
+    participant DB as Experiment Config DB
+    participant Event as Event Pipeline
+
+    User->>App: HTTP Request (user_id in session)
+    App->>SDK: get_variant(experiment="checkout_v2", user_id="u-789")
+
+    SDK->>Cache: Lookup (experiment="checkout_v2", config_version)
+    
+    alt Config cached and fresh
+        Cache-->>SDK: Experiment config (hash_seed, traffic%, variants, targeting)
+    else Cache miss or stale
+        SDK->>Server: GET /experiments/checkout_v2/config
+        Server->>DB: Fetch active experiment config
+        DB-->>Server: {id, hash_seed: "abc123", traffic: 50%, variants: [control, variant_a], targeting_rules}
+        Server-->>SDK: Config (ETag for caching)
+        SDK->>Cache: Store config (TTL=60s)
+    end
+
+    SDK->>SDK: Evaluate targeting rules (country=US? premium_user? new_user?)
+    Note over SDK: User qualifies for experiment
+
+    SDK->>SDK: Hash assignment: murmurhash3(user_id + hash_seed) % 10000
+    SDK->>SDK: hash("u-789" + "abc123") = 3472 → bucket 3472
+    SDK->>SDK: Traffic allocation: 0-4999 = in experiment (50%)
+    SDK->>SDK: 3472 < 5000 → user IS in experiment
+    SDK->>SDK: Variant assignment: 0-2499 = control, 2500-4999 = variant_a
+    SDK->>SDK: 3472 → variant_a
+
+    SDK-->>App: {variant: "variant_a", in_experiment: true}
+    App->>App: Render checkout_v2 variant_a UI
+
+    App->>Event: Log exposure event {user_id, experiment_id, variant, timestamp, context}
+    Event->>Event: Deduplicate (first exposure per user per experiment only)
+```
+
+### Diagram 2: Results Analysis + Significance Check
+
+```mermaid
+sequenceDiagram
+    participant Scheduler as Analysis Scheduler
+    participant Pipeline as Metrics Pipeline
+    participant DWH as Data Warehouse
+    participant Stats as Statistics Engine
+    participant Dashboard as Experiment Dashboard
+    participant Owner as Experiment Owner
+
+    Scheduler->>Scheduler: Cron: run analysis every 6h for active experiments
+
+    Scheduler->>Pipeline: Trigger analysis for experiment "checkout_v2"
+    Pipeline->>DWH: Query metric data per variant
+    
+    Note over DWH: SQL: aggregate conversion_rate, revenue per variant<br/>JOIN exposures ON events WHERE experiment_id='checkout_v2'
+    
+    DWH-->>Pipeline: Control: n=50000, conversions=2500 (5.0%)<br/>Variant_A: n=50000, conversions=2750 (5.5%)
+
+    Pipeline->>Stats: Compute significance (sequential test)
+    
+    Stats->>Stats: Compute always-valid p-value (mSPRT)
+    Stats->>Stats: H0: p_control = p_variant
+    Stats->>Stats: z = (0.055 - 0.050) / sqrt(p*(1-p)*(1/n1 + 1/n2))
+    Stats->>Stats: z = 0.005 / 0.00137 = 3.65
+    Stats->>Stats: Sequential boundary at current sample: 2.94
+    Stats->>Stats: 3.65 > 2.94 → SIGNIFICANT (can stop early)
+
+    Stats->>Stats: CUPED variance reduction
+    Stats->>Stats: Fetch pre-experiment metric (covariate)
+    Stats->>Stats: Adjusted effect = raw_effect - θ*(covariate - mean)
+    Stats->>Stats: Variance reduced by 40% → narrower CI
+
+    Stats-->>Pipeline: {significant: true, p_value: 0.00013, lift: +10%, CI: [4.2%, 15.8%], power: 0.92}
+
+    Pipeline->>Dashboard: Update experiment results
+    Dashboard->>Owner: Notification: "checkout_v2 reached significance!"
+    
+    Owner->>Dashboard: Review results + guardrail metrics
+    Dashboard->>Stats: Check guardrail: latency_p99 not degraded?
+    Stats-->>Dashboard: Guardrail PASS (p99 diff not significant)
+    
+    Owner->>Dashboard: Ship variant_a (100% rollout)
+    Dashboard->>Pipeline: Mark experiment COMPLETED, log decision
+```
+
+## 13. Algorithm Deep Dives
+
+### Deep Dive: Statistical Significance in A/B Testing
+
+#### Problem
+Traditional fixed-horizon tests require waiting until predetermined sample size. Business pressure to "peek" at results causes inflated false-positive rates (up to 30% instead of 5%).
+
+#### Solution 1: Sequential Testing (Always-Valid P-Values)
+
+**mSPRT (Mixture Sequential Probability Ratio Test):**
+
+```
+At any time t, compute the likelihood ratio:
+  Λ_t = ∫ L(data | θ) × H(θ) dθ / L(data | θ=0)
+
+Where:
+  - L(data | θ) = likelihood under effect size θ
+  - H(θ) = mixing distribution (prior over plausible effects)
+  - θ=0 = null hypothesis (no effect)
+
+Reject H0 when: Λ_t > 1/α (e.g., > 20 for α=0.05)
+
+The p-value at any time: p_t = 1/Λ_t (always valid regardless of peeking)
+```
+
+**Step-by-step example:**
+```
+Experiment: checkout button color (blue vs green)
+Metric: conversion rate
+MDE (minimum detectable effect): 2% relative lift
+α = 0.05, mixing distribution: N(0, τ²) where τ = MDE/2
+
+Day 1: n=1000/variant, conv_control=5.0%, conv_variant=5.8%
+  z = 0.008 / SE = 0.008 / 0.0097 = 0.82
+  Λ_1 = 1.4 → p = 0.71 → NOT significant (need Λ > 20)
+
+Day 3: n=5000/variant, conv_control=5.1%, conv_variant=5.6%
+  z = 0.005 / 0.0044 = 1.14
+  Λ_3 = 2.8 → p = 0.36 → NOT significant
+
+Day 7: n=15000/variant, conv_control=5.0%, conv_variant=5.5%
+  z = 0.005 / 0.0025 = 2.0
+  Λ_7 = 8.2 → p = 0.12 → NOT significant (but trending)
+
+Day 10: n=25000/variant, conv_control=5.0%, conv_variant=5.5%
+  z = 0.005 / 0.0019 = 2.58
+  Λ_10 = 22.1 → p = 0.045 → SIGNIFICANT! (Λ > 20)
+  
+  Can stop experiment now with valid Type I error control.
+  A fixed-horizon test would have required n=32000 per variant.
+  Sequential test saved 7000 samples (22% faster).
+```
+
+#### Solution 2: CUPED (Controlled-experiment Using Pre-Experiment Data)
+
+**Problem**: High variance in metrics means experiments need large sample sizes.
+
+**Insight**: Use pre-experiment behavior as a covariate to reduce variance.
+
+```python
+def cuped_estimate(metric_values, pre_experiment_values):
+    """
+    metric_values: conversion rate per user during experiment
+    pre_experiment_values: conversion rate per user BEFORE experiment (covariate)
+    """
+    # Compute optimal adjustment coefficient
+    theta = np.cov(metric_values, pre_experiment_values)[0,1] / np.var(pre_experiment_values)
+    
+    # Adjusted metric (variance reduced)
+    adjusted = metric_values - theta * (pre_experiment_values - np.mean(pre_experiment_values))
+    
+    # Variance reduction factor
+    r_squared = np.corrcoef(metric_values, pre_experiment_values)[0,1] ** 2
+    # If correlation = 0.6, variance reduced by 36%!
+    # Equivalent to having 56% more samples for free
+    
+    return adjusted, r_squared
+
+# Example:
+# User bought 3 items last month, 4 items during experiment
+# Without CUPED: variance(purchases) = 5.2
+# With CUPED (θ=0.7, r²=0.4): variance reduced to 3.1
+# Required sample size reduced by 40%!
+```
+
+**When CUPED helps most:**
+- Metrics with high user-level variance (revenue, engagement time)
+- When pre-experiment behavior correlates with experiment-period behavior
+- Typically reduces required sample size by 30-50%
+
+#### Solution 3: Guardrail Metrics with Bonferroni Correction
+
+```
+Problem: Checking 5 guardrail metrics inflates false-positive rate
+  P(at least one false alarm) = 1 - (1-0.05)^5 = 23%
+
+Solution: Adjusted significance threshold
+  Per-metric α = 0.05 / 5 = 0.01 (Bonferroni)
+  
+  Or better: Holm-Bonferroni (step-down, more power)
+  1. Sort p-values: p₁ ≤ p₂ ≤ ... ≤ p₅
+  2. Compare p₁ with α/5 = 0.01
+  3. Compare p₂ with α/4 = 0.0125
+  4. Compare p₃ with α/3 = 0.0167
+  5. Stop at first non-rejection
+```
+
+#### Architecture Implications
+
+| Statistical Requirement | System Design Impact |
+|------------------------|---------------------|
+| Sequential testing | Must store running sufficient statistics, not just final counts |
+| CUPED | Need 2-4 weeks of pre-experiment data accessible at analysis time |
+| Always-valid p-values | Analysis pipeline can run at any frequency without inflation |
+| Guardrail monitoring | Real-time metric aggregation per variant needed |
+| Power analysis | Pre-experiment: need historical metric variance estimates |
+| Sample ratio mismatch | Real-time check: flag if variant sizes diverge >1% from expected |
+

@@ -58,6 +58,43 @@ Total Stock (Physical)
 
 ## 4. Data Modeling
 
+### Entity-Relationship Diagram
+
+```mermaid
+erDiagram
+    inventory {
+        UUID inventory_id PK
+        UUID product_id FK
+        UUID warehouse_id FK
+        UUID seller_id FK
+        INTEGER total_quantity
+        INTEGER available_quantity
+        INTEGER reserved_quantity
+        VARCHAR status
+    }
+    reservations {
+        UUID reservation_id PK
+        UUID product_id FK
+        UUID warehouse_id FK
+        VARCHAR reservation_type
+        UUID reference_id FK
+        INTEGER quantity
+        VARCHAR status
+        TIMESTAMP expires_at
+    }
+    inventory_events {
+        UUID event_id PK
+        UUID product_id FK
+        UUID warehouse_id FK
+        VARCHAR event_type
+        INTEGER quantity_change
+        INTEGER available_after
+    }
+
+    inventory ||--o{ reservations : "reserves from"
+    inventory ||--o{ inventory_events : "logs"
+```
+
 ### Inventory Schema (PostgreSQL - Source of Truth)
 ```sql
 CREATE TABLE inventory (
@@ -1180,3 +1217,106 @@ alerts:
 | Monitoring | Prometheus + Grafana | Real-time alerting on oversell |
 | Batch Processing | Kafka + Flink | High-throughput WMS integration |
 | Service Framework | Go | Low-latency, high-concurrency |
+
+---
+
+## 12. Sequence Diagrams
+
+### 12.1 Reserve Stock + TTL Hold
+
+```mermaid
+sequenceDiagram
+    participant CheckoutService
+    participant InventoryService
+    participant Redis
+    participant PostgreSQL
+    participant Kafka
+    participant TTLWorker
+
+    CheckoutService->>InventoryService: reserveStock(sku=SKU-100, qty=2, ttl=10min)
+    InventoryService->>Redis: WATCH inventory:SKU-100
+    InventoryService->>Redis: GET inventory:SKU-100:available
+    Redis-->>InventoryService: available = 50
+
+    Note over InventoryService: available(50) >= requested(2) ✓
+
+    InventoryService->>Redis: MULTI
+    InventoryService->>Redis: DECRBY inventory:SKU-100:available 2
+    InventoryService->>Redis: INCRBY inventory:SKU-100:reserved 2
+    InventoryService->>Redis: SET reservation:R-001 {sku,qty,expires} EX 600
+    InventoryService->>Redis: EXEC
+    Redis-->>InventoryService: [48, 2, OK]
+
+    InventoryService->>PostgreSQL: INSERT reservation(R-001, SKU-100, 2, expires_at)
+    InventoryService->>Kafka: publish("inventory.reserved", {R-001})
+    InventoryService-->>CheckoutService: {reservation_id: R-001, expires_in: 600s}
+
+    Note over TTLWorker: After 10min if not confirmed...
+    TTLWorker->>Redis: Key expiry event for reservation:R-001
+    TTLWorker->>Redis: INCRBY inventory:SKU-100:available 2
+    TTLWorker->>Redis: DECRBY inventory:SKU-100:reserved 2
+    TTLWorker->>PostgreSQL: UPDATE reservation SET status=EXPIRED
+    TTLWorker->>Kafka: publish("inventory.released", {R-001})
+```
+
+### 12.2 Stock Replenishment + Recount
+
+```mermaid
+sequenceDiagram
+    participant WarehouseSystem
+    participant InventoryService
+    participant PostgreSQL
+    participant Redis
+    participant Kafka
+    participant AlertService
+
+    WarehouseSystem->>InventoryService: POST /replenish {sku: SKU-100, qty: 500, warehouse: W-1}
+    InventoryService->>PostgreSQL: UPDATE stock SET qty = qty + 500 WHERE sku AND warehouse
+    InventoryService->>Redis: INCRBY inventory:SKU-100:available 500
+    InventoryService->>Kafka: publish("inventory.replenished")
+    InventoryService-->>WarehouseSystem: 200 OK {new_total: 548}
+
+    Note over WarehouseSystem: Periodic cycle count (recount)
+    WarehouseSystem->>InventoryService: POST /recount {sku: SKU-100, actual_qty: 540}
+    InventoryService->>PostgreSQL: SELECT expected_qty → 548
+    Note over InventoryService: Discrepancy: expected 548, actual 540 (delta = -8)
+
+    InventoryService->>PostgreSQL: INSERT stock_adjustment(SKU-100, -8, reason=RECOUNT)
+    InventoryService->>PostgreSQL: UPDATE stock SET qty = 540
+    InventoryService->>Redis: SET inventory:SKU-100:available 540 - reserved
+    InventoryService->>Kafka: publish("inventory.adjusted", {delta: -8})
+
+    alt Discrepancy > threshold (5%)
+        Kafka->>AlertService: consume("inventory.adjusted")
+        AlertService-->>WarehouseSystem: ALERT: Shrinkage detected SKU-100
+    end
+```
+
+## 13. Infrastructure & Deployment
+
+### 13.1 Compute & Storage
+| Layer | Technology | Spec |
+|-------|-----------|------|
+| Application | EKS on AWS | 3 AZs, c6i.2xlarge nodes |
+| Primary DB | PostgreSQL (RDS) | Multi-AZ, db.r6g.2xlarge, 1TB gp3 |
+| Cache/Locks | Redis Cluster | 6 shards, r6g.xlarge, cluster mode |
+| Event Bus | MSK (Kafka) | 6 brokers, m5.2xlarge, 7-day retention |
+| Time-series | TimescaleDB | Stock level history for analytics |
+
+### 13.2 Networking
+- **Private subnets** for all data stores (no public internet access)
+- **VPC Endpoints** for S3, DynamoDB, SQS (avoid NAT costs)
+- **NLB** for internal gRPC between services (low latency)
+- **mTLS** between all services via service mesh (Istio)
+
+### 13.3 Auto-Scaling & Performance
+- **Redis**: Cluster mode resharding at 75% memory; read replicas for analytics
+- **PostgreSQL**: Read replicas for reporting queries; pgbouncer for connection pooling
+- **Application**: HPA targeting p95 latency < 50ms, scale at 60% CPU
+- **Kafka consumers**: Scale consumer group members based on lag
+
+### 13.4 Disaster Recovery
+- **RPO**: 0 for Redis (sync replication), < 1s for PostgreSQL (sync standby)
+- **RTO**: < 15s Redis sentinel, < 60s PostgreSQL failover
+- **Cross-region**: Async replication to DR region, manual failover
+- **Backup**: Hourly snapshots for Redis, continuous WAL archiving for PostgreSQL

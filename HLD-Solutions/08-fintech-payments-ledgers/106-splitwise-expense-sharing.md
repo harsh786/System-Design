@@ -56,6 +56,91 @@
 
 ## 4. Data Modeling
 
+## 4. Data Modeling
+
+### Entity-Relationship Diagram
+
+```mermaid
+erDiagram
+    users ||--o{ group_members : "joins"
+    groups ||--o{ group_members : "has"
+    groups ||--o{ expenses : "contains"
+    groups ||--o{ settlements : "settles in"
+    groups ||--o{ group_balances : "tracks"
+    expenses ||--o{ expense_shares : "split into"
+    users ||--o{ expense_shares : "owes/paid"
+    users ||--o{ activity_feed : "receives"
+    groups ||--o{ recurring_expenses : "schedules"
+
+    users {
+        UUID user_id PK
+        VARCHAR email
+        VARCHAR name
+        VARCHAR default_currency
+    }
+    groups {
+        UUID group_id PK
+        VARCHAR group_name
+        VARCHAR group_type
+        BOOLEAN simplify_debts
+        UUID created_by FK
+    }
+    group_members {
+        UUID group_id PK
+        UUID user_id PK
+        VARCHAR role
+        BOOLEAN is_active
+    }
+    expenses {
+        UUID expense_id PK
+        UUID group_id FK
+        UUID created_by FK
+        VARCHAR description
+        DECIMAL total_amount
+        VARCHAR split_type
+        VARCHAR category
+        BOOLEAN is_deleted
+    }
+    expense_shares {
+        UUID share_id PK
+        UUID expense_id FK
+        UUID user_id FK
+        DECIMAL paid_amount
+        DECIMAL owed_amount
+        DECIMAL net_balance
+    }
+    settlements {
+        UUID settlement_id PK
+        UUID group_id FK
+        UUID payer_id FK
+        UUID payee_id FK
+        DECIMAL amount
+        VARCHAR payment_method
+    }
+    group_balances {
+        UUID balance_id PK
+        UUID group_id FK
+        UUID from_user_id FK
+        UUID to_user_id FK
+        DECIMAL amount
+    }
+    activity_feed {
+        UUID activity_id PK
+        UUID group_id FK
+        UUID user_id FK
+        VARCHAR activity_type
+        BOOLEAN is_read
+    }
+    recurring_expenses {
+        UUID recurring_id PK
+        UUID group_id FK
+        VARCHAR description
+        DECIMAL amount
+        VARCHAR frequency
+        DATE next_occurrence
+    }
+```
+
 ### Full Database Schemas
 
 ```sql
@@ -877,3 +962,332 @@ alerts:
 | Multi-currency | Convert at expense time | Settle in original currencies | Simpler user experience, single balance per pair |
 | Feed | Fan-out on write | Fan-out on read | Small groups (6 members), write amplification acceptable |
 | Offline | Queue + sync | CRDT | Conflicts rare, queue simpler to implement |
+
+---
+
+## 12. Sequence Diagrams
+
+### Diagram 1: Add Expense + Debt Recalculation
+
+```mermaid
+sequenceDiagram
+    participant User as User (Alice)
+    participant API as Expense API
+    participant DB as PostgreSQL (Serializable)
+    participant Calc as Debt Calculator
+    participant Cache as Balance Cache (Redis)
+    participant Kafka as Event Bus
+    participant Members as Group Members (Bob, Charlie)
+
+    User->>API: POST /expenses (group=G1, paid_by=Alice, amount=900, split=equal, members=[Alice,Bob,Charlie])
+    API->>DB: BEGIN SERIALIZABLE
+    API->>DB: INSERT expense (id=EXP_001, group=G1, payer=Alice, amount=900)
+    API->>DB: INSERT splits (Alice:300, Bob:300, Charlie:300)
+    
+    API->>Calc: Recalculate debts for group G1
+    Calc->>Calc: Alice paid 900, owes 300 → net: others owe Alice 600
+    Calc->>Calc: Bob owes 300 (his share, didn't pay)
+    Calc->>Calc: Charlie owes 300 (his share, didn't pay)
+    Calc->>DB: UPSERT balances: Bob→Alice: +300, Charlie→Alice: +300
+    
+    API->>DB: COMMIT
+    DB-->>API: SUCCESS
+    
+    API->>Cache: UPDATE balance:{G1}:{Bob→Alice}=300, balance:{G1}:{Charlie→Alice}=300
+    API->>Kafka: Publish expense.created {EXP_001, group=G1}
+    API-->>User: 201 Expense created
+    
+    Kafka-->>Members: Push: "Alice added $900 dinner. You owe $300."
+
+    Note over User,Members: Serializable isolation prevents race condition:<br/>two expenses added simultaneously both see consistent prior state.<br/>Balance is MATERIALIZED (pre-computed) for O(1) "who owes whom" queries.
+```
+
+### Diagram 2: Group Settlement
+
+```mermaid
+sequenceDiagram
+    participant Bob as Bob
+    participant API as Settlement API
+    participant DB as PostgreSQL
+    participant Ledger as Settlement Ledger
+    participant Cache as Balance Cache
+    participant Kafka as Event Bus
+    participant Alice as Alice
+
+    Bob->>API: POST /settlements (group=G1, from=Bob, to=Alice, amount=300)
+    API->>DB: BEGIN SERIALIZABLE
+    API->>DB: SELECT balance WHERE group=G1 AND debtor=Bob AND creditor=Alice
+    DB-->>API: balance=300 (Bob owes Alice 300)
+    API->>API: Validate: settlement_amount (300) <= owed (300) ✓
+    
+    API->>DB: INSERT settlement (id=SET_001, from=Bob, to=Alice, amount=300)
+    API->>DB: UPDATE balances SET amount=0 WHERE debtor=Bob AND creditor=Alice
+    API->>Ledger: Record: Bob settled 300 with Alice (expense refs: EXP_001)
+    API->>DB: COMMIT
+    
+    API->>Cache: SET balance:{G1}:{Bob→Alice}=0
+    API->>Kafka: Publish settlement.recorded {SET_001, Bob→Alice, 300}
+    API-->>Bob: 200 Settlement recorded (Bob now owes Alice: $0)
+    Kafka-->>Alice: Push: "Bob paid you $300. You're settled up!"
+
+    Note over Bob,Alice: Settlement is recorded in-app but actual money transfer is external<br/>(Venmo, cash, bank transfer). Splitwise tracks the record, not the payment.<br/>Idempotency: duplicate settlement POST returns same result (no double-credit).
+```
+
+### Diagram 3: Multi-Currency Expense Conversion
+
+```mermaid
+sequenceDiagram
+    participant User as Alice (in Europe)
+    participant API as Expense API
+    participant FX as FX Rate Service
+    participant DB as PostgreSQL
+    participant Calc as Debt Calculator
+    participant Cache as Balance Cache
+
+    User->>API: POST /expenses (group=G1, amount=100, currency=EUR, split=equal, members=[Alice,Bob,Charlie])
+    Note over API: Group G1 default currency = USD
+    
+    API->>FX: GET /rates?from=EUR&to=USD
+    FX-->>API: EUR/USD = 1.08 (rate locked at expense time)
+    
+    API->>API: Convert: 100 EUR × 1.08 = 108 USD
+    API->>DB: BEGIN
+    API->>DB: INSERT expense (amount_original=100, currency_original=EUR, amount_group=108, currency_group=USD, fx_rate=1.08)
+    API->>DB: INSERT splits (Alice: 36 USD, Bob: 36 USD, Charlie: 36 USD)
+    
+    API->>Calc: Update balances in group currency (USD)
+    Calc->>Calc: Bob→Alice: += 36 USD, Charlie→Alice: += 36 USD
+    Calc->>DB: UPSERT balances
+    API->>DB: COMMIT
+    
+    API->>Cache: Update balance cache (all in USD)
+    API-->>User: Expense added (€100 = $108, each owes $36)
+
+    Note over User,Cache: FX rate is LOCKED at expense creation time (no retroactive changes).<br/>All balances computed in group's base currency for simplicity.<br/>Settlement can happen in any currency (user's choice, they handle conversion).
+```
+
+### Caching Strategy
+
+```
+SPLITWISE CACHING
+
+1. GROUP BALANCE CACHE (Write-through)
+   Key: balance:{group_id}:{debtor}:{creditor}
+   Updated: On every expense/settlement (in same transaction)
+   Used for: "Balances" screen (most viewed page)
+   Pattern: Materialized balance + cache = O(1) read
+   CRITICAL: Stale balance → user thinks they owe different amount
+
+2. SIMPLIFIED DEBTS CACHE
+   Key: simplified:{group_id}:version
+   TTL: Invalidated on any expense/settlement in group
+   Content: Minimum transactions needed to settle all debts
+   Computed: On-demand (triggered by viewing "settle up" screen)
+   Expensive: O(N²) computation, cache is essential
+
+3. GROUP ACTIVITY FEED CACHE
+   Key: feed:{group_id}:page:{n}
+   TTL: Invalidated on new activity
+   Pattern: Fan-out on write (small groups, 6 members avg)
+
+4. USER TOTAL BALANCE CACHE
+   Key: user:{id}:total_owed (across all groups)
+   Updated: On any expense in any group user belongs to
+   Used for: Home screen "You owe $X overall"
+
+WHERE EVENTUAL CONSISTENCY IS ACCEPTABLE:
+- Activity feed (1-2s delay is fine)
+- Monthly spending analytics
+- Friend suggestions
+WHERE IT'S DANGEROUS:
+- Balance display (users compare and argue!)
+- Settlement amount validation (must be current)
+```
+
+### Infrastructure Components
+
+```
+┌─────────────────────────────────────────────────────────────┐
+│ SPLITWISE-LIKE INFRASTRUCTURE                                │
+├─────────────────────────────────────────────────────────────┤
+│                                                              │
+│ COMPUTE:                                                     │
+│ ├── API servers: 8 pods (most operations are simple CRUD)    │
+│ ├── Debt simplification: Async workers (CPU-intensive)       │
+│ └── Push notifications: Dedicated service (fan-out)          │
+│                                                              │
+│ DATABASE:                                                     │
+│ ├── PostgreSQL: Groups, expenses, splits, balances           │
+│ ├── Sharding: By group_id (all group data co-located)        │
+│ ├── Serializable isolation (low contention: avg 6 members)   │
+│ └── Read replicas for activity feed / history queries        │
+│                                                              │
+│ CACHING:                                                     │
+│ ├── Redis: Balance cache, simplified debts, rate limiting    │
+│ └── Local cache: FX rates (30s TTL)                          │
+│                                                              │
+│ MESSAGING:                                                   │
+│ ├── Kafka: expense.created, settlement.recorded events       │
+│ ├── Push: FCM/APNs for real-time notifications               │
+│ └── Email: Weekly summary digests                            │
+│                                                              │
+│ EXTERNAL:                                                    │
+│ ├── FX rate provider (for multi-currency groups)             │
+│ ├── OCR service (receipt scanning for expense entry)         │
+│ └── Payment links (settle via UPI/Venmo - optional)          │
+│                                                              │
+└─────────────────────────────────────────────────────────────┘
+```
+
+## 13. Algorithm Deep Dive: Debt Simplification
+
+### Minimum Transactions to Settle All Debts
+
+```
+PROBLEM: Given N people with various debts between them, find the minimum
+number of transactions to settle everyone to zero.
+
+This is NP-hard in general, but practical for small groups (Splitwise groups avg 6 people).
+
+STEP-BY-STEP EXAMPLE WITH 5 PEOPLE:
+
+Initial debt graph (who owes whom):
+  Alice → Bob: $40
+  Alice → Charlie: $20
+  Bob → Dave: $30
+  Charlie → Dave: $10
+  Charlie → Eve: $20
+  Dave → Eve: $10
+
+Without simplification: 6 transactions needed.
+
+ALGORITHM: Net Balance Approach
+
+Step 1: Compute net balance for each person
+  Alice:   -40 - 20          = -60  (net debtor)
+  Bob:     +40 - 30          = +10  (net creditor)
+  Charlie: +20 - 10 - 20     = -10  (net debtor)
+  Dave:    +30 + 10 - 10     = +30  (net creditor)
+  Eve:     +20 + 10          = +30  (net creditor — wait, let me recalculate)
+  
+  Actually: Eve receives 20 + 10 = +30 (net creditor? No...)
+  Let me redo:
+  Alice:   owes 40+20 = -60
+  Bob:     receives 40, owes 30 = +10  
+  Charlie: receives 20, owes 10+20 = -10
+  Dave:    receives 30+10, owes 10 = +30
+  Eve:     receives 20+10 = +30
+  
+  Verify: sum = -60 + 10 + (-10) + 30 + 30 = 0 ✓
+
+Step 2: Separate into debtors and creditors
+  Debtors:  Alice(-60), Charlie(-10)
+  Creditors: Bob(+10), Dave(+30), Eve(+30)
+
+Step 3: Greedy matching (match largest debtor with largest creditor)
+  
+  Transaction 1: Alice pays Eve $30
+    Alice: -60 + 30 = -30
+    Eve: +30 - 30 = 0 (settled!)
+  
+  Transaction 2: Alice pays Dave $30
+    Alice: -30 + 30 = 0 (settled!)
+    Dave: +30 - 30 = 0 (settled!)
+  
+  Transaction 3: Charlie pays Bob $10
+    Charlie: -10 + 10 = 0 (settled!)
+    Bob: +10 - 10 = 0 (settled!)
+
+RESULT: 3 transactions instead of 6! (50% reduction)
+
+IMPLEMENTATION:
+```
+
+```python
+def simplify_debts(debts: list[tuple[str, str, float]]) -> list[tuple[str, str, float]]:
+    """
+    Input: list of (debtor, creditor, amount) tuples
+    Output: minimum transactions to settle all debts
+    
+    Algorithm: Compute net balances, then greedily match debtors to creditors.
+    Greedy is optimal when we can match amounts exactly or partially.
+    For true minimum (NP-hard), use subset-sum optimization for small N.
+    """
+    from collections import defaultdict
+    import heapq
+    
+    # Step 1: Compute net balance for each person
+    balance = defaultdict(float)
+    for debtor, creditor, amount in debts:
+        balance[debtor] -= amount
+        balance[creditor] += amount
+    
+    # Step 2: Separate into debtors (negative) and creditors (positive)
+    # Use heaps for efficient max extraction
+    debtors = []   # max-heap (by absolute value)
+    creditors = [] # max-heap (by value)
+    
+    for person, bal in balance.items():
+        if bal < -0.01:  # Debtor (owes money)
+            heapq.heappush(debtors, (bal, person))  # min-heap of negatives = max by magnitude
+        elif bal > 0.01:  # Creditor (owed money)
+            heapq.heappush(creditors, (-bal, person))  # negate for max-heap
+    
+    # Step 3: Greedily match largest debtor with largest creditor
+    transactions = []
+    
+    while debtors and creditors:
+        debt_amount, debtor = heapq.heappop(debtors)      # most negative
+        credit_amount, creditor = heapq.heappop(creditors)  # most positive (negated)
+        
+        debt_abs = -debt_amount
+        credit_abs = -credit_amount
+        
+        settle_amount = min(debt_abs, credit_abs)
+        transactions.append((debtor, creditor, round(settle_amount, 2)))
+        
+        # Update remainders
+        remaining_debt = debt_abs - settle_amount
+        remaining_credit = credit_abs - settle_amount
+        
+        if remaining_debt > 0.01:
+            heapq.heappush(debtors, (-remaining_debt, debtor))
+        if remaining_credit > 0.01:
+            heapq.heappush(creditors, (-remaining_credit, creditor))
+    
+    return transactions
+
+
+# Example usage:
+debts = [
+    ("Alice", "Bob", 40),
+    ("Alice", "Charlie", 20),
+    ("Bob", "Dave", 30),
+    ("Charlie", "Dave", 10),
+    ("Charlie", "Eve", 20),
+    ("Dave", "Eve", 10),
+]
+
+result = simplify_debts(debts)
+# Output: [("Alice", "Eve", 30), ("Alice", "Dave", 30), ("Charlie", "Bob", 10)]
+# 3 transactions instead of 6!
+```
+
+```
+COMPLEXITY:
+- Time: O(N log N) where N = number of people (heap operations)
+- Space: O(N) for balance map and heaps
+- For Splitwise groups (avg 6 people): essentially O(1)
+
+OPTIMALITY NOTE:
+- Greedy gives optimal results for most practical cases
+- True minimum is NP-hard (reducible to subset-sum)
+- For N ≤ 20 (typical Splitwise group), brute-force optimal is feasible
+- Splitwise uses greedy (good enough, much simpler)
+
+EDGE CASES:
+- Circular debts: A→B→C→A automatically resolved by net balance
+- Self-debt: Filtered out (net balance handles it)
+- Zero balances: Skip (person is already settled)
+- Floating point: Round to 2 decimal places, verify sum still = 0
+```

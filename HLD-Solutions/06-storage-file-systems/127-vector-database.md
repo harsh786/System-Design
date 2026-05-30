@@ -94,6 +94,49 @@
 
 ## 4. Data Model / Schema Design
 
+### Entity-Relationship Diagram
+
+```mermaid
+erDiagram
+    COLLECTION {
+        string collection_id PK
+        string tenant_id FK
+        string name
+        int dimension
+        string distance_metric
+    }
+    INDEX_CONFIG {
+        string collection_id PK
+        string index_type
+        int hnsw_m
+        string quantization
+    }
+    VECTOR_RECORD {
+        string id PK
+        string collection_id FK
+        string namespace
+        blob vector
+    }
+    SEGMENT {
+        string segment_id PK
+        string collection_id FK
+        int shard_id
+        int num_vectors
+        int level
+    }
+    WRITE_AHEAD_LOG {
+        int sequence_id PK
+        string collection_id FK
+        string operation
+        string vector_id FK
+    }
+    COLLECTION ||--|| INDEX_CONFIG : "configured with"
+    COLLECTION ||--o{ VECTOR_RECORD : stores
+    COLLECTION ||--o{ SEGMENT : "persisted in"
+    COLLECTION ||--o{ WRITE_AHEAD_LOG : "logged in"
+    SEGMENT }o--o{ VECTOR_RECORD : contains
+```
+
 ### Collection Schema
 ```python
 @dataclass
@@ -957,4 +1000,139 @@ IVF-PQ        | 0.92      | 3ms           | 64 B          | Fast
 IVF-SQ        | 0.95      | 2.5ms         | 1 KB          | Medium
 Binary         | 0.85      | 0.5ms         | 96 B          | Fast
 Flat (brute)  | 1.00      | 50ms          | 3 KB          | None
+```
+
+---
+
+## Sequence Diagrams
+
+### Vector Insert + Index Update
+
+```mermaid
+sequenceDiagram
+    participant C as Client
+    participant API as API Gateway
+    participant Router as Shard Router
+    participant W as Write Node (Shard-2)
+    participant WAL as Write-Ahead Log
+    participant Mem as Memtable (flat index)
+    participant Idx as HNSW Index (on-disk)
+    participant Rep as Replica Node
+
+    C->>API: Insert(id="doc_42", vector=[0.12, -0.34, ...768d], metadata={title:...})
+    API->>Router: Route by partition key (hash(id) → Shard-2)
+    Router->>W: Write(id, vector, metadata)
+    
+    W->>WAL: Append (durability first)
+    WAL-->>W: Persisted
+    
+    W->>Mem: Insert into flat buffer (unsorted, batch accumulator)
+    Mem-->>W: Buffered (count: 847/1000)
+
+    W-->>C: 200 OK (written, searchable after index refresh)
+
+    Note over W: When buffer reaches 1000 vectors...
+    Mem->>Mem: Flush trigger (1000 vectors accumulated)
+    Mem->>Idx: BatchInsertIntoHNSW(1000 vectors)
+    
+    loop For each vector in batch
+        Idx->>Idx: Find entry point (top layer)
+        Idx->>Idx: Greedy search down layers to insertion layer
+        Idx->>Idx: Connect to M nearest neighbors at each layer
+        Idx->>Idx: Probabilistic: promote to higher layer? (p=1/mL)
+    end
+    
+    Idx-->>Mem: Index updated (clear buffer)
+    
+    W->>Rep: Replicate WAL entries (async)
+    Rep-->>W: ACK
+```
+
+### ANN Search with HNSW (Hierarchical Navigable Small World)
+
+```mermaid
+sequenceDiagram
+    participant C as Client
+    participant API as API Gateway
+    participant Router as Shard Router
+    participant S1 as Shard-1 Search
+    participant S2 as Shard-2 Search
+    participant S3 as Shard-3 Search
+    participant HNSW as HNSW Index (detail)
+    participant Filter as Metadata Filter
+
+    C->>API: Search(query_vector=[0.23, -0.11, ...], top_k=10, filter={category:"tech"})
+    API->>Router: Fan-out to all shards (scatter-gather)
+
+    par Search all shards
+        Router->>S1: SearchLocal(query, k=10, filter)
+        Router->>S2: SearchLocal(query, k=10, filter)
+        Router->>S3: SearchLocal(query, k=10, filter)
+    end
+
+    Note over S2,HNSW: Detailed HNSW search within one shard
+    S2->>HNSW: Enter at Layer 3 (top, sparse layer)
+    HNSW->>HNSW: Layer 3: greedy walk to nearest (1 neighbor per hop)
+    HNSW->>HNSW: Layer 2: expand search (ef_search=5 candidates)
+    HNSW->>HNSW: Layer 1: expand (ef_search=20 candidates)
+    HNSW->>HNSW: Layer 0: full search (ef_search=64 candidates)
+    HNSW-->>S2: top_64 candidates (by distance)
+    
+    S2->>Filter: ApplyFilter(candidates, {category:"tech"})
+    Filter-->>S2: Filtered to 28 candidates matching metadata
+    S2->>S2: Re-rank, take top 10
+
+    S1-->>Router: Local top-10 results (with distances)
+    S2-->>Router: Local top-10 results
+    S3-->>Router: Local top-10 results
+
+    Router->>Router: Global merge: merge 30 results, take global top-10
+    Router-->>API: Top-10 results [{id, distance, metadata}, ...]
+    API-->>C: Search results (latency p50: 5ms, p99: 25ms)
+```
+
+## Async Processing
+
+| Operation | Mechanism | Frequency | Purpose |
+|-----------|-----------|-----------|---------|
+| Index build/refresh | Background merger | Every 1000 inserts or 10s | Make new vectors searchable |
+| Compaction | Merge small segments | When segment count > threshold | Reduce search fan-out |
+| Quantization training | Batch job | On data distribution change | Update PQ codebook for accuracy |
+| Replica sync | WAL streaming | Continuous | Keep replicas current |
+| Index warmup | Pre-load on startup | On node start/restart | Avoid cold-start latency spike |
+| Garbage collection | Tombstone cleanup | Hourly | Reclaim space from deleted vectors |
+
+## Infrastructure Components
+
+```
+┌─────────────────────────────────────────────────────────────────┐
+│               Vector Database Infrastructure                     │
+├─────────────────────────────────────────────────────────────────┤
+│ Query Layer:                                                     │
+│   4× Query nodes (128GB RAM, 32 cores)                          │
+│   HNSW index fully in memory (or memory-mapped)                 │
+│   Connection pooling: 10K concurrent searches                   │
+│                                                                  │
+│ Storage:                                                         │
+│   6 shards × 2 replicas = 12 shard instances                   │
+│   Each shard: ~100M vectors (768d float32 = ~300GB raw)         │
+│   With PQ compression: ~12GB per shard in memory                │
+│   Full vectors on NVMe SSD for re-ranking                       │
+│                                                                  │
+│ Index Configuration:                                             │
+│   HNSW: M=32, ef_construction=200, ef_search=64                │
+│   Layers: ~log(N)/log(M) ≈ 5 layers for 100M vectors           │
+│   Memory: ~1.2KB per vector (graph links + compressed vector)   │
+│                                                                  │
+│ Ingest Pipeline:                                                 │
+│   Embedding service: 8× GPU (A100) for real-time vectorization  │
+│   Batch import: dedicated ETL nodes (bulk index build)          │
+│   WAL: local NVMe (fsync per batch, not per vector)             │
+│                                                                  │
+│ Monitoring:                                                      │
+│   Recall@10 tracking (sample queries against brute-force)       │
+│   Query latency: p50 < 5ms, p99 < 30ms                         │
+│   Index freshness: time from insert to searchable < 10s         │
+│   Memory pressure: alert at 85% utilization                     │
+└─────────────────────────────────────────────────────────────────┘
 ```

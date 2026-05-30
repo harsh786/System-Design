@@ -58,6 +58,58 @@ Storage:
 
 ## 4. Data Modeling
 
+### Entity-Relationship Diagram
+
+```mermaid
+erDiagram
+    SUBJECTS {
+        uuid subject_id PK
+        varchar subject_name
+        varchar schema_type
+        varchar compatibility_level
+        varchar owner_team
+    }
+    SCHEMA_VERSIONS {
+        uuid version_id PK
+        uuid subject_id FK
+        int version_number
+        int schema_id
+        varchar schema_hash
+    }
+    SCHEMA_CONTENT_STORE {
+        varchar content_hash PK
+        varchar schema_type
+        text content
+    }
+    CONSUMER_CONTRACTS {
+        uuid contract_id PK
+        uuid subject_id FK
+        varchar consumer_name
+        varchar consumer_team
+        varchar status
+    }
+    CONTRACT_VALIDATIONS {
+        uuid validation_id PK
+        uuid contract_id FK
+        uuid schema_version_id FK
+        varchar result
+    }
+    APPROVAL_WORKFLOWS {
+        uuid workflow_id PK
+        uuid subject_id FK
+        varchar change_type
+        varchar status
+        varchar requested_by
+    }
+
+    SUBJECTS ||--o{ SCHEMA_VERSIONS : versions
+    SUBJECTS ||--o{ CONSUMER_CONTRACTS : consumed-by
+    SUBJECTS ||--o{ APPROVAL_WORKFLOWS : governed-by
+    CONSUMER_CONTRACTS ||--o{ CONTRACT_VALIDATIONS : validated-by
+    SCHEMA_VERSIONS ||--o{ CONTRACT_VALIDATIONS : tested-against
+    SCHEMA_VERSIONS }o--|| SCHEMA_CONTENT_STORE : references
+```
+
 ### 4.1 Subjects and Schema Versions
 
 ```sql
@@ -955,3 +1007,96 @@ Deserialization Trace (per message):
 - Protocol Buffers Language Guide
 - Pact (consumer-driven contract testing)
 - RFC 7386 (JSON Merge Patch for schema diffs)
+
+---
+
+## 12. Sequence Diagrams
+
+### Diagram 1: Schema Registration + Compatibility Check
+
+```mermaid
+sequenceDiagram
+    participant Dev as Developer
+    participant CI as CI/CD Pipeline
+    participant API as Registry API
+    participant Store as Schema Store (PostgreSQL)
+    participant Cache as Schema Cache (Redis)
+    participant Kafka as Kafka Brokers
+
+    Dev->>CI: Push code (includes schema change: add field "discount")
+    CI->>CI: Extract schema from code (protobuf/avro definition)
+    CI->>API: POST /subjects/orders-value/versions (new schema JSON)
+
+    API->>Store: Fetch all previous versions for subject "orders-value"
+    Store-->>API: [v1, v2, v3] (latest: v3)
+
+    API->>API: Fetch compatibility mode for subject (BACKWARD_TRANSITIVE)
+    API->>API: Check compatibility: new schema vs ALL previous versions
+
+    Note over API: Compatibility checks:<br/>1. New optional field with default? ✓<br/>2. No removed required fields? ✓<br/>3. No type changes on existing fields? ✓
+
+    alt Compatible
+        API->>Store: INSERT schema (id=AUTO_INCREMENT, subject, version=4, schema_json, fingerprint)
+        API->>Cache: SET schema:{id} → schema_json
+        API->>Cache: SET subject:orders-value:latest → {version:4, id:47}
+        API-->>CI: 200 OK {id: 47, version: 4}
+        CI->>CI: Schema check PASSED → continue deployment
+    else Incompatible
+        API-->>CI: 409 Conflict {error: "Field 'amount' type changed from long to int — incompatible with v2"}
+        CI->>CI: BUILD FAILED — block deployment
+        CI->>Dev: Notification: "Schema incompatibility detected"
+    end
+
+    Note over Kafka: Producer uses registered schema
+    Kafka->>API: (Producer at write time) GET /schemas/ids/47
+    API->>Cache: GET schema:47
+    Cache-->>Kafka: Schema JSON (cache hit)
+```
+
+### Diagram 2: Consumer Deserialization with Cache
+
+```mermaid
+sequenceDiagram
+    participant Producer as Kafka Producer
+    participant Registry as Schema Registry
+    participant Kafka as Kafka Broker
+    participant Consumer as Kafka Consumer
+    participant Cache as Local Schema Cache
+    participant App as Application Logic
+
+    Producer->>Registry: GET schema ID for fingerprint (or register if new)
+    Registry-->>Producer: schema_id = 47
+    Producer->>Producer: Serialize: [magic_byte(0) | schema_id(4 bytes) | avro_payload]
+    Producer->>Kafka: Produce message (topic: orders, key: order-1001)
+
+    Consumer->>Kafka: Poll (batch of 500 messages)
+    Kafka-->>Consumer: Messages with wire format [0|schema_id|payload]
+
+    loop For each message
+        Consumer->>Consumer: Read schema_id from first 5 bytes (id=47)
+        Consumer->>Cache: GET schema:47 (in-process LRU cache, max 1000 schemas)
+        
+        alt Cache HIT (99%+ of cases after warmup)
+            Cache-->>Consumer: Avro schema object (pre-parsed)
+        else Cache MISS (first time seeing this schema)
+            Consumer->>Registry: GET /schemas/ids/47
+            Registry-->>Consumer: Schema JSON
+            Consumer->>Consumer: Parse schema JSON → schema object
+            Consumer->>Cache: PUT schema:47 → parsed schema
+        end
+
+        Consumer->>Consumer: Deserialize avro payload using writer schema (id=47)
+        
+        Note over Consumer: Schema evolution: reader schema may differ
+        Consumer->>Consumer: Apply schema resolution (writer=v3, reader=v4)
+        Consumer->>Consumer: New field "discount": use default value (0.0)
+        Consumer->>Consumer: Removed field "legacy_code": skip bytes
+        
+        Consumer->>App: Deliver deserialized record (reader schema shape)
+    end
+
+    App->>App: Process 500 records (all deserialized with correct schema version)
+
+    Note over Consumer: Performance: schema cache avoids network call for 99.9% of messages<br/>Only ~10-20 unique schema IDs per topic in practice
+```
+

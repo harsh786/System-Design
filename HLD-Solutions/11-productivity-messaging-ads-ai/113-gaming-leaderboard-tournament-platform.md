@@ -58,6 +58,67 @@
 
 ## 4. Data Modeling
 
+### Entity-Relationship Diagram
+
+```mermaid
+erDiagram
+    PLAYERS {
+        uuid player_id PK
+        varchar username
+        float rating
+        varchar season_rank
+        varchar region
+        integer games_played
+    }
+    SEASONS {
+        uuid season_id PK
+        varchar name
+        uuid game_id FK
+        varchar status
+        timestamptz start_date
+        timestamptz end_date
+    }
+    SCORE_SUBMISSIONS {
+        uuid submission_id PK
+        uuid player_id FK
+        uuid game_id FK
+        uuid match_id FK
+        bigint score
+        varchar score_type
+    }
+    TOURNAMENTS {
+        uuid tournament_id PK
+        varchar name
+        uuid game_id FK
+        varchar type
+        varchar status
+        integer max_participants
+    }
+    TOURNAMENT_MATCHES {
+        uuid match_id PK
+        uuid tournament_id FK
+        integer round_number
+        uuid player1_id FK
+        uuid player2_id FK
+        uuid winner_id
+        varchar status
+    }
+    MATCHMAKING_TICKETS {
+        uuid ticket_id PK
+        uuid player_id FK
+        varchar game_mode
+        float rating
+        varchar region
+        varchar status
+    }
+
+    PLAYERS ||--o{ SCORE_SUBMISSIONS : submits
+    PLAYERS ||--o{ MATCHMAKING_TICKETS : queues
+    SEASONS ||--o{ PLAYERS : "ranks in"
+    TOURNAMENTS ||--o{ TOURNAMENT_MATCHES : contains
+    PLAYERS ||--o{ TOURNAMENT_MATCHES : "participates in"
+```
+
 ```sql
 -- Players
 CREATE TABLE players (
@@ -1252,3 +1313,212 @@ Data flow:
 | Rating calculation divergence | Unfair matchmaking | Periodic full recalculation from match history, alerts on deviation |
 
 ---
+
+---
+
+## 12. Sequence Diagrams
+
+### 12.1 Score Update + Leaderboard Position Calculation
+
+```mermaid
+sequenceDiagram
+    participant G as Game Server
+    participant API as API Gateway
+    participant Val as Score Validation Service
+    participant Redis as Redis Cluster (Sorted Set)
+    participant Kafka as Kafka
+    participant DB as PostgreSQL (Audit)
+    participant Client as Player Client
+
+    G->>API: POST /scores {player_id, game_id, score: 15200, proof_hash}
+    API->>Val: Validate(score, proof_hash, player_session)
+    Val->>Val: Anti-cheat: verify score is physically possible (max_score_per_second check)
+    Val->>Val: Verify cryptographic proof (server-signed game events)
+    Val-->>API: validated = true
+    
+    API->>Redis: ZADD leaderboard:{game_id}:global 15200 player_id
+    Redis-->>API: (updated)
+    API->>Redis: ZREVRANK leaderboard:{game_id}:global player_id
+    Redis-->>API: rank = 42
+    API->>Redis: ZCARD leaderboard:{game_id}:global
+    Redis-->>API: total = 1,847,293
+    
+    API->>Kafka: Emit ScoreUpdated {player_id, score, rank, prev_rank: 58}
+    API-->>G: 200 {rank: 42, percentile: 99.997%}
+    
+    Kafka->>DB: Persist score history (async, for audit/analytics)
+    
+    Note over Client: If player overtook friends...
+    Kafka->>Client: Push notification: "You overtook Player_X! Now #42"
+```
+
+### 12.2 Matchmaking Queue + ELO Rating Update
+
+```mermaid
+sequenceDiagram
+    participant P1 as Player 1 (ELO: 1450)
+    participant P2 as Player 2 (ELO: 1480)
+    participant MM as Matchmaking Service
+    participant Queue as Match Queue (Redis)
+    participant ELO as Rating Service
+    participant Game as Game Server
+    participant DB as PostgreSQL
+
+    P1->>MM: POST /matchmaking/queue {game_mode: "ranked", player_id: P1}
+    MM->>Queue: ZADD match_queue:{mode} {elo:1450} P1 (score=ELO for range search)
+    MM-->>P1: 202 {status: "queued", estimated_wait: "15s"}
+    
+    P2->>MM: POST /matchmaking/queue {game_mode: "ranked", player_id: P2}
+    MM->>Queue: ZADD match_queue:{mode} {elo:1480} P2
+    
+    MM->>MM: Matchmaking tick (every 1s)
+    MM->>Queue: ZRANGEBYSCORE match_queue:{mode} 1400 1500 (find ELO-compatible players)
+    Queue-->>MM: [P1(1450), P2(1480)] → ELO diff=30, within threshold(200)
+    MM->>Queue: ZREM match_queue:{mode} P1 P2 (atomically remove both)
+    MM->>Game: CreateMatch(P1, P2, mode="ranked")
+    Game-->>MM: match_id = match_xyz
+    MM-->>P1: Match found! {match_id, opponent: P2}
+    MM-->>P2: Match found! {match_id, opponent: P1}
+    
+    Note over Game: Match plays out... P1 wins
+    
+    Game->>ELO: RecordResult(match_id, winner=P1, loser=P2)
+    ELO->>ELO: Calculate ELO update (K=32 for both)
+    Note over ELO: Expected(P1) = 1/(1+10^((1480-1450)/400)) = 0.457<br/>P1 new = 1450 + 32*(1 - 0.457) = 1467<br/>P2 new = 1480 + 32*(0 - 0.543) = 1463
+    ELO->>DB: UPDATE ratings SET elo=1467 WHERE player=P1
+    ELO->>DB: UPDATE ratings SET elo=1463 WHERE player=P2
+    ELO->>Redis: ZADD leaderboard:ranked 1467 P1
+    ELO->>Redis: ZADD leaderboard:ranked 1463 P2
+    ELO-->>P1: Rating update: 1450 → 1467 (+17)
+    ELO-->>P2: Rating update: 1480 → 1463 (-17)
+```
+
+## 13. Algorithm Deep Dives
+
+### 13.1 Leaderboard at Scale with Redis Sorted Sets
+
+#### Redis Sorted Set Internals (Skip List)
+
+```
+Data Structure: Skip List + Hash Table
+  - Skip list: O(log N) for ZADD, ZREM, ZRANK, ZRANGEBYSCORE
+  - Hash table: O(1) for ZSCORE (member → score lookup)
+  - Memory: ~80 bytes per member (with pointer overhead)
+
+For 10M players: ~800MB per leaderboard (fits single Redis node)
+For 100M players: Sharded across Redis Cluster (by score range or hash)
+
+Key Operations and Complexity:
+  ZADD key score member     → O(log N) — insert/update score
+  ZREVRANK key member       → O(log N) — get rank (0-indexed, descending)
+  ZREVRANGE key start stop  → O(log N + M) — get top M players
+  ZRANGEBYSCORE key min max → O(log N + M) — range query by score
+  ZCARD key                 → O(1) — total count
+  ZINCRBY key incr member   → O(log N) — atomic increment
+
+Skip List Structure (Redis implementation):
+  Level 4: [HEAD] ────────────────────────────────────── [TAIL]
+  Level 3: [HEAD] ────────── [Score:5000] ────────────── [TAIL]
+  Level 2: [HEAD] ── [2000] ── [5000] ── [8000] ────── [TAIL]  
+  Level 1: [HEAD] ── [2000] ── [3500] ── [5000] ── [6200] ── [8000] ── [9100] ── [TAIL]
+  
+  - Probabilistic levels: P(level_i) = 0.25^i (Redis uses p=0.25)
+  - Max levels: 32 (supports 4^32 ≈ 10^19 elements theoretically)
+  - ZRANK: traverse skip list counting span values → O(log N)
+```
+
+#### Sharding Strategy for Massive Scale
+
+```
+Problem: Single Redis node handles ~10M members efficiently.
+         For 100M+ global leaderboard, need sharding.
+
+Approach 1: Score-Range Sharding (for global rank queries)
+  Shard 0: scores 0 - 999
+  Shard 1: scores 1000 - 1999
+  ...
+  Shard N: scores N*1000 - (N+1)*1000-1
+  
+  RANK query: sum(ZCARD of all shards with higher scores) + ZREVRANK in own shard
+  Problem: Hot shards (most players cluster around median scores)
+
+Approach 2: Hash Sharding + Aggregation (simpler, for top-K queries)
+  Shard by hash(player_id) % N
+  Each shard has full sorted set of its players
+  Top-K: query top-K from each shard → merge → return global top-K
+  
+  Rank for specific player: requires counting across all shards (expensive)
+  Optimization: Approximate rank using per-shard histograms
+
+Approach 3: Hybrid (Production recommendation)
+  - Top 10,000: Single dedicated Redis (hot, frequently queried, always in memory)
+  - Rest: Hash-sharded, with approximate rank (percentile-based)
+  - Exact rank only computed for players who request it (on-demand)
+
+Periodic leaderboard reset:
+  - Season reset: DEL old key, or RENAME for archival
+  - Gradual decay: ZADD with negative score adjustments (batch job)
+```
+
+### 13.2 ELO and TrueSkill Matchmaking
+
+#### ELO Rating System
+
+```
+Standard ELO Formula:
+  Expected score: E_A = 1 / (1 + 10^((R_B - R_A) / 400))
+  Rating update:  R_A_new = R_A + K × (S_A - E_A)
+  
+  Where:
+    R_A, R_B: Current ratings of players A and B
+    S_A: Actual score (1 for win, 0.5 for draw, 0 for loss)
+    K: Development coefficient (higher = more volatile)
+
+K-Factor Selection:
+  - New players (< 30 games): K = 40 (fast calibration)
+  - Intermediate (30-100 games): K = 32
+  - Established (> 100 games): K = 16 (stability)
+  - Top players (ELO > 2400): K = 10 (very stable)
+
+Limitations of ELO:
+  - Only tracks point estimate (no uncertainty)
+  - New players destabilize opponents' ratings
+  - Doesn't handle teams or multiplayer well
+```
+
+#### TrueSkill (Microsoft Research) — For Production Matchmaking
+
+```
+Core Idea: Model skill as Gaussian N(μ, σ²)
+  - μ (mu): Estimated skill level (starts at 25)
+  - σ (sigma): Uncertainty (starts at 25/3 ≈ 8.33)
+  - Conservative estimate: μ - 3σ (displayed rating, >99% confidence they're above this)
+
+Update Rules (simplified, 1v1):
+  After player A (μ_A, σ_A) beats player B (μ_B, σ_B):
+  
+  c² = 2β² + σ_A² + σ_B²    (β = σ/2 typically, performance variance)
+  t = (μ_A - μ_B) / c
+  
+  μ_A_new = μ_A + (σ_A² / c) × v(t)    // v() is Gaussian update function
+  σ_A_new² = σ_A² × (1 - (σ_A² / c²) × w(t))  // w() shrinks uncertainty
+  
+  Properties:
+    - Uncertainty decreases with more games (σ shrinks)
+    - After inactivity: σ grows (additive τ² per time period)
+    - Teams: Factor graph message passing for multi-player updates
+
+Matchmaking Algorithm:
+  quality(A, B) = sqrt(2β² / (2β² + σ_A² + σ_B²)) × exp(-(μ_A - μ_B)² / (2*(2β² + σ_A² + σ_B²)))
+  
+  Goal: maximize quality (close skill + low uncertainty both help)
+  
+  Queue search:
+    1. For each player P waiting > threshold:
+       candidates = all players where |μ_P - μ_C| < search_radius
+       search_radius grows with wait time (2σ + wait_seconds/10)
+    2. Compute quality(P, C) for each candidate
+    3. Match with highest quality if quality > min_threshold (0.4)
+    4. If no match after 60s: expand radius aggressively, relax threshold to 0.2
+```
+

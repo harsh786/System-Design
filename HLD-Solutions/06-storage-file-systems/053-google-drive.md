@@ -46,6 +46,67 @@
 
 ## 3. Data Modeling
 
+### Entity-Relationship Diagram
+
+```mermaid
+erDiagram
+    FILES {
+        string file_id PK
+        string owner_id FK
+        string parent_folder_id FK
+        string name
+        bool is_folder
+        int64 size_bytes
+    }
+    ACL_ENTRIES {
+        string file_id PK
+        string principal_id PK
+        string role
+        string principal_type
+        timestamp expiration_time
+    }
+    SHARED_LINKS {
+        string link_id PK
+        string file_id FK
+        string link_type
+        string role
+        int64 max_uses
+    }
+    COLLAB_SESSIONS {
+        string file_id PK
+        string session_id PK
+        int64 document_version
+        timestamp last_activity
+    }
+    OPERATIONS {
+        string file_id PK
+        int64 version PK
+        int64 sequence_num PK
+        string user_id FK
+        string op_type
+    }
+    FILE_VERSIONS {
+        string file_id PK
+        string version_id PK
+        int64 version_number
+        string storage_ref
+        string created_by FK
+    }
+    COMMENTS {
+        string comment_id PK
+        string file_id FK
+        string author_id FK
+        string status
+        bool is_suggestion
+    }
+    FILES ||--o{ ACL_ENTRIES : "has permissions"
+    FILES ||--o{ SHARED_LINKS : "shared via"
+    FILES ||--o{ COLLAB_SESSIONS : "edited in"
+    FILES ||--o{ FILE_VERSIONS : "versioned as"
+    FILES ||--o{ COMMENTS : "commented on"
+    COLLAB_SESSIONS ||--o{ OPERATIONS : "contains"
+```
+
 ### File Metadata (Spanner)
 ```sql
 CREATE TABLE files (
@@ -870,3 +931,137 @@ class ChangeNotificationService:
 | Version storage | Reverse deltas with periodic snapshots | Saves storage but reading old versions requires chain reconstruction |
 | Offline mode | Last-write-wins with conflict markers | Simple but may lose edits in rare concurrent offline edit scenarios |
 | Search indexing | Async with eventual consistency | Search may lag 30s behind edits but doesn't block writes |
+
+---
+
+## Sequence Diagrams
+
+### File Upload + Virus Scan + Indexing
+
+```mermaid
+sequenceDiagram
+    participant C as Client
+    participant API as API Gateway
+    participant Auth as Auth Service
+    participant US as Upload Service
+    participant VS as Virus Scanner
+    participant Idx as Indexing Service
+    participant MS as Metadata Service
+    participant BS as Block Store
+    participant Q as Task Queue
+
+    C->>API: POST /upload (file + metadata)
+    API->>Auth: Validate OAuth token + check quota
+    Auth-->>API: User authenticated, quota OK
+    API->>US: InitiateUpload(user_id, file_meta)
+    US->>BS: Store raw file (temporary staging)
+    BS-->>US: staging_blob_id
+    US->>Q: Enqueue(VirusScan, staging_blob_id)
+    US-->>API: upload_id (status: processing)
+    API-->>C: 202 Accepted (upload_id)
+
+    Q->>VS: Process VirusScan job
+    VS->>BS: Read staging blob
+    VS->>VS: Scan (ClamAV + ML model)
+    
+    alt Clean file
+        VS->>Q: Enqueue(IndexAndFinalize, staging_blob_id)
+        Q->>Idx: Process indexing job
+        Idx->>BS: Read file content
+        Idx->>Idx: Extract text (OCR for images, tika for docs)
+        Idx->>Idx: Update full-text search index (Elasticsearch)
+        Idx->>MS: Create final file record (metadata + search tokens)
+        Idx->>BS: Move staging → permanent storage
+        MS-->>C: Push notification: file ready
+    else Infected file
+        VS->>BS: Delete staging blob
+        VS->>MS: Mark upload as rejected
+        MS-->>C: Push notification: file rejected (malware)
+    end
+```
+
+### Real-Time Collaboration via Operational Transform (OT)
+
+```mermaid
+sequenceDiagram
+    participant A as User A (cursor pos 5)
+    participant OT as OT Server
+    participant B as User B (cursor pos 10)
+
+    Note over A,B: Document: "Hello World" (both see same state)
+
+    A->>OT: Op1: Insert("beautiful ", pos=6) [revision=5]
+    B->>OT: Op2: Delete(pos=10, len=1) [revision=5]
+
+    Note over OT: Both ops based on revision 5 → need transform
+
+    OT->>OT: Transform(Op1, Op2):<br/>Op1' = Insert("beautiful ", pos=6) [unchanged]<br/>Op2' = Delete(pos=20, len=1) [shifted by +10 for inserted text]
+
+    OT->>A: Apply Op2' → Delete at pos 20
+    OT->>B: Apply Op1' → Insert "beautiful " at pos 6
+
+    Note over A,B: Both converge: "Hello beautiful Worl"
+    
+    OT->>OT: Store revision 6 (Op1) and revision 7 (Op2')
+    OT->>OT: Checkpoint document state every 100 revisions
+```
+
+### Permission Check + Sharing Flow
+
+```mermaid
+sequenceDiagram
+    participant U as User (Requester)
+    participant API as API Gateway
+    participant PS as Permission Service
+    participant Cache as Permission Cache
+    participant MS as Metadata Service
+    participant NS as Notification Service
+    participant R as Recipient
+
+    U->>API: Share(file_id, recipient_email, role=EDITOR)
+    API->>PS: CheckPermission(user_id, file_id, SHARE)
+    PS->>Cache: Lookup permission (user_id, file_id)
+    
+    alt Cache hit
+        Cache-->>PS: {role: OWNER, can_share: true}
+    else Cache miss
+        PS->>MS: WalkPermissionTree(file_id → parent → root)
+        MS-->>PS: Inherited: OWNER from parent folder
+        PS->>Cache: Store (TTL=5min)
+    end
+    
+    PS-->>API: ALLOWED (owner can share)
+    API->>PS: GrantPermission(file_id, recipient, EDITOR)
+    PS->>MS: Insert ACL entry
+    PS->>Cache: Invalidate recipient's permission cache
+    MS-->>PS: ACL stored
+
+    API->>NS: NotifyRecipient(email, file_id, EDITOR)
+    NS->>R: Email + in-app notification
+    
+    R->>API: GET /files/file_id
+    API->>PS: CheckPermission(recipient_id, file_id, READ)
+    PS->>Cache: MISS (first access)
+    PS->>MS: Direct ACL lookup
+    MS-->>PS: {role: EDITOR}
+    PS->>Cache: Store
+    PS-->>API: ALLOWED
+    API->>MS: GetFileContent(file_id)
+    API-->>R: File content
+```
+
+## Caching Strategy
+
+| Layer | Technology | What's Cached | TTL | Invalidation |
+|-------|-----------|---------------|-----|--------------|
+| Client | Local SQLite | File tree structure, recent metadata | Until sync | Server push via WebSocket |
+| CDN | Google Edge | Static thumbnails, exported PDFs | 7 days | Purge on file update |
+| Permission cache | Memcached | ACL evaluation results | 5 min | Event-driven on share/unshare |
+| Metadata | Bigtable cell cache | File metadata, folder listings | 1 min | Write-through |
+| Collaboration | In-memory (OT server) | Active document state, cursor positions | Session lifetime | Checkpoint to disk every 30s |
+| Search | Elasticsearch cache | Query results for common searches | 30s | Index refresh interval |
+
+**Key Design Decisions:**
+- Permission cache short TTL (5 min) balances performance vs. security (revoked access propagates quickly)
+- OT server keeps document state in memory for active sessions; cold documents loaded from checkpoint on demand
+- Folder listing cache critical for large shared drives (10K+ files) — invalidate on any child change

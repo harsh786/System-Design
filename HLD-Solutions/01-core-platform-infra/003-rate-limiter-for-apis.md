@@ -147,6 +147,35 @@ Redis cluster:
 
 ## 4. Data Modeling
 
+### Entity-Relationship Diagram
+
+```mermaid
+erDiagram
+    TENANTS {
+        uuid id PK
+        string name
+    }
+    RATE_LIMIT_RULES {
+        uuid id PK
+        uuid tenant_id FK
+        string subject_type
+        string algorithm
+        bigint limit_value
+        int window_seconds
+        string state
+    }
+    DECISION_LOGS {
+        uuid event_id PK
+        uuid tenant_id FK
+        uuid rule_id FK
+        string subject_id
+        string decision
+    }
+
+    TENANTS ||--o{ RATE_LIMIT_RULES : defines
+    RATE_LIMIT_RULES ||--o{ DECISION_LOGS : produces
+```
+
 ### Rate Limit Rules (PostgreSQL)
 
 ```sql
@@ -1515,6 +1544,79 @@ Row 3: [Per-tenant deny rates] [Sudden traffic shifts] [Bot score distribution]
 | > 50 regions | Cross-region reconciliation overhead | Hierarchical: regional clusters + global aggregator |
 | Single celebrity key > 100K QPS | Redis hot slot | Key splitting + local caching + replica reads |
 | > 100K rules | Rule matching latency | Pre-compiled rule trees, bloom filters for fast rejection |
+
+---
+
+## Sequence Diagrams
+
+### 1. Rate Limit Check Flow
+
+```mermaid
+sequenceDiagram
+    participant Client
+    participant GW as API Gateway
+    participant LC as Local Cache
+    participant Redis
+    participant RuleDB as Rule Store (etcd)
+
+    Client->>GW: API Request (with API key)
+    GW->>LC: Lookup rate limit rules for key
+    alt Rules cached locally
+        LC-->>GW: Rules (token_bucket: 100/min)
+    else Rules not cached
+        GW->>RuleDB: Fetch rules for client tier
+        RuleDB-->>GW: Rules
+        GW->>LC: Cache rules (TTL 30s)
+    end
+
+    GW->>LC: Check local token batch
+    alt Tokens available locally
+        LC-->>GW: Deduct token locally
+        GW-->>Client: 200 OK (X-RateLimit-Remaining: 45)
+    else Local batch exhausted
+        GW->>Redis: EVAL token_bucket.lua {key, refill_rate, capacity}
+        Note over Redis: Atomic Lua script:<br/>1. Calculate tokens since last refill<br/>2. Check if token available<br/>3. Deduct and return remaining
+        alt Tokens available
+            Redis-->>GW: {allowed: true, remaining: 12}
+            GW->>LC: Replenish local batch (take 10 tokens)
+            GW-->>Client: 200 OK (X-RateLimit-Remaining: 12)
+        else Rate limited
+            Redis-->>GW: {allowed: false, retry_after: 3.2s}
+            GW-->>Client: 429 Too Many Requests (Retry-After: 3)
+        end
+    end
+```
+
+### 2. Distributed Sync Flow (Cross-Region)
+
+```mermaid
+sequenceDiagram
+    participant GW_US as Gateway (US)
+    participant Redis_US as Redis (US)
+    participant Kafka
+    participant Reconciler
+    participant Redis_EU as Redis (EU)
+    participant GW_EU as Gateway (EU)
+
+    Note over GW_US,GW_EU: Each region enforces independently<br/>Async reconciliation accepts ~10% over-provision
+
+    GW_US->>Redis_US: Consume token (user:123)
+    Redis_US-->>GW_US: allowed (remaining: 50)
+    Redis_US--)Kafka: Emit usage delta {user:123, region:US, consumed:1, ts}
+
+    GW_EU->>Redis_EU: Consume token (user:123)
+    Redis_EU-->>GW_EU: allowed (remaining: 48)
+    Redis_EU--)Kafka: Emit usage delta {user:123, region:EU, consumed:1, ts}
+
+    loop Every 5 seconds
+        Reconciler->>Kafka: Consume all usage deltas
+        Reconciler->>Reconciler: Aggregate per-user across regions
+        Reconciler->>Redis_US: DECRBY user:123:global_used (EU delta)
+        Reconciler->>Redis_EU: DECRBY user:123:global_used (US delta)
+    end
+
+    Note over Reconciler: If global usage exceeds limit,<br/>push override to all regions via Kafka
+```
 
 ---
 

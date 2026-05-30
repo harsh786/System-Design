@@ -766,6 +766,50 @@ class ServiceDependencyBuilder:
 
 ## 8. Database Schema
 
+### Entity-Relationship Diagram
+
+```mermaid
+erDiagram
+    SPANS {
+        string trace_id PK
+        string span_id PK
+        string parent_span_id
+        string service_name
+        string operation_name
+        string status_code
+        bigint duration_us
+    }
+    SERVICES {
+        uuid id PK
+        bigint tenant_id
+        string name
+        string type
+    }
+    OPERATIONS {
+        uuid id PK
+        uuid service_id FK
+        string name
+        string span_kind
+    }
+    SAMPLING_RULES {
+        uuid id PK
+        bigint tenant_id
+        string service_pattern
+        string sampling_type
+        decimal rate
+    }
+    TRACE_ALERTS {
+        uuid id PK
+        bigint tenant_id
+        string name
+        string alert_type
+        string service
+    }
+
+    SERVICES ||--o{ OPERATIONS : "exposes"
+    SERVICES ||--o{ SPANS : "emits"
+```
+
 ### PostgreSQL (Configuration & Metadata)
 
 ```sql
@@ -945,3 +989,179 @@ redis:
 - Kafka: MirrorMaker2 for cross-region topic replication
 - Configuration: PostgreSQL streaming replication
 - RTO: 2 minutes for ingestion, 5 minutes for query
+
+---
+
+## Sequence Diagrams
+
+### Trace Collection + Span Assembly
+
+```mermaid
+sequenceDiagram
+    participant Svc1 as Service A (instrumented)
+    participant Svc2 as Service B (instrumented)
+    participant Svc3 as Service C (instrumented)
+    participant Collector as OTel Collector
+    participant Kafka as Kafka (span buffer)
+    participant Assembler as Trace Assembler
+    participant Store as Trace Store (ClickHouse/Tempo)
+    participant Index as Trace Index
+
+    Svc1->>Svc1: Start span (trace_id=abc, span_id=1, parent=null)
+    Svc1->>Svc2: HTTP call [traceparent: 00-abc-1-01]
+    Svc2->>Svc2: Start span (trace_id=abc, span_id=2, parent=1)
+    Svc2->>Svc3: gRPC call [traceparent: 00-abc-2-01]
+    Svc3->>Svc3: Start span (trace_id=abc, span_id=3, parent=2)
+    Svc3->>Collector: Export span_3 {trace_id=abc, duration=50ms, status=OK}
+    Svc2->>Collector: Export span_2 {trace_id=abc, duration=120ms, status=OK}
+    Svc1->>Collector: Export span_1 {trace_id=abc, duration=200ms, status=OK}
+
+    Collector->>Collector: Batch spans, add resource attributes
+    Collector->>Kafka: Publish spans (partitioned by trace_id)
+
+    Kafka->>Assembler: Consume spans (same trace_id → same partition)
+    Assembler->>Assembler: Buffer spans, assemble trace tree
+    Assembler->>Assembler: Wait for trace completion (timeout: 30s)
+    Assembler->>Store: Write complete trace (columnar format)
+    Assembler->>Index: Index: trace_id, service, duration, status, tags
+```
+
+### Tail-Based Sampling Decision
+
+```mermaid
+sequenceDiagram
+    participant Collector as OTel Collector (all spans)
+    participant Buffer as Span Buffer (in-memory, 30s window)
+    participant Sampler as Tail Sampler
+    participant PolicyEngine as Sampling Policy Engine
+    participant Store as Trace Store
+    participant Drop as /dev/null (dropped)
+
+    Collector->>Buffer: Buffer incoming span {trace_id=xyz}
+    Note over Buffer: Hold all spans for trace until complete or timeout
+
+    Buffer->>Sampler: Trace complete (all spans received or 30s timeout)
+    Sampler->>PolicyEngine: Evaluate sampling policies for trace
+
+    PolicyEngine->>PolicyEngine: Check policies in order:
+    Note over PolicyEngine: 1. Always sample if any span has error/exception
+    Note over PolicyEngine: 2. Always sample if latency > P99 threshold
+    Note over PolicyEngine: 3. Always sample if specific tag present (debug=true)
+    Note over PolicyEngine: 4. Rate-limit sample: 10 traces/sec per service
+    Note over PolicyEngine: 5. Probabilistic: 1% of remaining
+
+    alt Sampled (matches any keep-policy)
+        PolicyEngine-->>Sampler: KEEP
+        Sampler->>Store: Write full trace to storage
+    else Not sampled
+        PolicyEngine-->>Sampler: DROP
+        Sampler->>Drop: Discard spans (only increment counters)
+    end
+```
+
+## Caching Strategy
+
+| Layer | What's Cached | TTL | Purpose |
+|-------|--------------|-----|---------|
+| Trace ID → location | Redis | 24h | Fast trace lookup by ID |
+| Service graph | In-memory | 5 min | Service dependency visualization |
+| Recent traces (search) | Elasticsearch/Redis | 1h | Fast search for recent traces |
+| Sampling decisions | In-memory per collector | Immediate | Consistent sampling within collection window |
+
+## Infrastructure Components
+
+| Component | Technology | Sizing | HA Strategy |
+|-----------|-----------|--------|-------------|
+| OTel Collectors | OpenTelemetry Collector | 8 pods (10K spans/s each) | Stateless, multi-AZ |
+| Span Buffer (Kafka) | Kafka | 12 brokers, 3 AZ | Replication factor 3, 7-day retention |
+| Trace Assembler | Go/Java service | 6 pods | Partition-based parallelism |
+| Trace Store | ClickHouse / Grafana Tempo | 6 nodes | Replicated tables, S3 backend |
+| Index | Elasticsearch | 3 nodes | Replicated shards |
+| Query Service | Go service | 4 pods | Stateless |
+| Sampling Config | etcd/ConfigMap | - | Raft (etcd) or K8s native |
+
+### Scale Considerations
+- Ingest: 500K spans/sec sustained → Kafka provides backpressure buffer
+- Storage: 30-day retention at 1% sampling = ~10TB (compressed)
+- Query: P99 trace retrieval < 500ms (indexed by trace_id, partitioned by time)
+
+## Deep Dive: Sampling Strategies
+
+### Head-Based Sampling
+```
+Decision point: At trace START (first span)
+Algorithm:
+  sampling_rate = 0.01 (1%)
+  decision = hash(trace_id) % 10000 < (sampling_rate * 10000)
+  
+Propagation: Decision encoded in traceparent header (sampled flag)
+  All downstream services respect the initial decision
+
+Pros: Simple, low overhead, no buffering needed
+Cons: Cannot sample based on trace outcome (errors, latency)
+      Misses rare but important traces (errors in 0.01% of requests)
+```
+
+### Tail-Based Sampling
+```
+Decision point: After ALL spans collected (trace complete)
+Algorithm:
+  1. Buffer all spans in memory (grouped by trace_id)
+  2. Wait for trace completion (gap timeout: 30s)
+  3. Evaluate policies against complete trace:
+
+POLICY EVALUATION ORDER (first match wins):
+  Priority 1 - Error sampling:
+    IF any span.status == ERROR → KEEP (100% of errors)
+  Priority 2 - Latency sampling:  
+    IF root_span.duration > service_p99_threshold → KEEP
+  Priority 3 - Debug sampling:
+    IF any span.tag["debug"] == true → KEEP
+  Priority 4 - Rate limiting:
+    IF service_traces_kept_this_second < 10 → KEEP
+  Priority 5 - Probabilistic:
+    IF hash(trace_id) % 100 < 1 → KEEP (1% baseline)
+  DEFAULT → DROP
+
+Pros: Keeps all interesting traces, better signal-to-noise ratio
+Cons: Memory pressure (must buffer all spans), 30s latency to decision
+      Requires consistent routing (all spans of trace → same sampler)
+```
+
+### Adaptive Sampling
+```
+Dynamic rate adjustment based on system load and budget:
+
+FUNCTION compute_adaptive_rate(service, current_rate, budget):
+  target_traces_per_min = budget / num_services
+  actual_traces_per_min = counter.get(service)
+  
+  IF actual > target * 1.2:
+    new_rate = current_rate * 0.8  // reduce sampling
+  ELIF actual < target * 0.8:
+    new_rate = current_rate * 1.2  // increase sampling
+  ELSE:
+    new_rate = current_rate  // stable
+  
+  RETURN clamp(new_rate, min=0.001, max=1.0)
+
+Adjustment interval: every 60 seconds
+Convergence: typically 3-5 adjustment cycles
+```
+
+### Always-Sample-Errors Pattern
+```
+Challenge: With head-based sampling at 1%, 99% of errors are LOST
+
+Solution: Dual-path sampling
+  Path 1 (head-based): 1% probabilistic → general trace coverage
+  Path 2 (error collector): ALL spans with errors buffered separately
+    → On span.status == ERROR, collector marks trace_id for full collection
+    → Broadcasts trace_id to all collectors → they flush buffered spans for that trace
+    
+Implementation:
+  - Each collector maintains 60s ring buffer of all spans
+  - On error detection: publish trace_id to Redis Pub/Sub
+  - All collectors check their buffer for spans with that trace_id
+  - Matching spans forwarded to storage (even if head-sampling said "drop")
+```

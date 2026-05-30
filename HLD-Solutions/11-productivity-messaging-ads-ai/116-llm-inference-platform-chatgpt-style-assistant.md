@@ -65,6 +65,61 @@
 
 ## 4. Data Modeling
 
+### Entity-Relationship Diagram
+
+```mermaid
+erDiagram
+    API_KEYS {
+        uuid key_id PK
+        uuid org_id FK
+        uuid user_id FK
+        varchar key_prefix
+        integer rate_limit_rpm
+        varchar status
+    }
+    CONVERSATIONS {
+        uuid conversation_id PK
+        uuid org_id FK
+        uuid user_id FK
+        varchar title
+        varchar model
+        text system_prompt
+        integer message_count
+    }
+    MESSAGES {
+        uuid message_id PK
+        uuid conversation_id FK
+        varchar role
+        text content
+        jsonb tool_calls
+        integer prompt_tokens
+        integer completion_tokens
+    }
+    USAGE_RECORDS {
+        uuid record_id PK
+        uuid org_id FK
+        uuid api_key_id FK
+        varchar model
+        integer total_tokens
+        decimal cost_usd
+        timestamptz hour
+    }
+    MODELS {
+        varchar model_id PK
+        varchar display_name
+        varchar provider
+        integer max_context_tokens
+        decimal input_price_per_1k
+        decimal output_price_per_1k
+        varchar status
+    }
+
+    API_KEYS ||--o{ USAGE_RECORDS : generates
+    CONVERSATIONS ||--o{ MESSAGES : contains
+    MODELS ||--o{ CONVERSATIONS : "used in"
+    MODELS ||--o{ USAGE_RECORDS : "tracked by"
+```
+
 ```sql
 -- Users / API keys
 CREATE TABLE api_keys (
@@ -1204,3 +1259,321 @@ Cost breakdown (per 1M tokens):
 | Multi-GPU tensor parallel failure | Node offline | Redistribute shards, temporarily reduce batch size |
 
 ---
+
+---
+
+## 12. Sequence Diagrams
+
+### 12.1 Chat Completion with Streaming (Token-by-Token)
+
+```mermaid
+sequenceDiagram
+    participant U as User Client
+    participant API as API Gateway
+    participant Auth as Auth + Rate Limiter
+    participant Router as Model Router
+    participant Sched as Batch Scheduler
+    participant GPU as GPU Worker (A100)
+    participant KV as KV Cache Manager
+    participant Filter as Content Filter
+    participant SSE as SSE Stream
+
+    U->>API: POST /v1/chat/completions {model: "gpt-4", messages: [...], stream: true}
+    API->>Auth: Validate API key, check token quota
+    Auth-->>API: OK (remaining: 45,000 tokens)
+    API->>Router: Route(model="gpt-4", estimated_tokens=2000)
+    Router->>Router: Select replica (least-loaded, affinity for KV cache hit)
+    Router->>Sched: Enqueue request (priority: tier_2)
+    
+    Sched->>Sched: Continuous batching: add to current iteration batch
+    Sched->>KV: Allocate KV cache pages (prefix cache check)
+    KV-->>Sched: Prefix match: 85 tokens cached (system prompt), allocate 60 new pages
+    
+    Note over GPU: Prefill phase (process all input tokens in parallel)
+    Sched->>GPU: Prefill(input_tokens=[500 tokens], kv_pages)
+    GPU-->>Sched: Prefill complete (35ms for 500 tokens)
+    
+    loop Token generation (decode phase)
+        GPU->>GPU: Forward pass (single token, batched with other requests)
+        GPU-->>Sched: next_token = "The"
+        Sched->>Filter: Check(token, context) [async, non-blocking]
+        Sched->>SSE: data: {"choices":[{"delta":{"content":"The"}}]}
+        SSE-->>U: Server-Sent Event (token)
+    end
+    
+    GPU-->>Sched: next_token = [EOS]
+    Sched->>KV: Release KV cache pages
+    Sched->>SSE: data: {"choices":[{"finish_reason":"stop"}]}
+    SSE->>SSE: data: [DONE]
+    SSE-->>U: Stream complete
+    API->>Auth: Deduct tokens used: 847
+```
+
+### 12.2 RAG: Retrieval-Augmented Generation
+
+```mermaid
+sequenceDiagram
+    participant U as User Client
+    participant API as API Gateway
+    participant RAG as RAG Orchestrator
+    participant Embed as Embedding Service
+    participant VS as Vector Store (pgvector/Pinecone)
+    participant Rerank as Reranker Model
+    participant LLM as LLM Inference
+    participant Stream as SSE Stream
+
+    U->>API: POST /chat {message: "What's our refund policy for enterprise?", rag_enabled: true}
+    API->>RAG: Process with RAG pipeline
+    
+    RAG->>Embed: Embed(query: "refund policy enterprise")
+    Embed-->>RAG: query_vector (1536-dim, text-embedding-3-small)
+    
+    RAG->>VS: Similarity search(query_vector, top_k=20, filter={org: "acme"})
+    VS-->>RAG: 20 candidate chunks with scores
+    
+    RAG->>Rerank: Rerank(query, 20 chunks) → top 5
+    Rerank-->>RAG: [chunk_3(0.94), chunk_7(0.89), chunk_1(0.85), chunk_12(0.81), chunk_9(0.78)]
+    
+    RAG->>RAG: Assemble prompt with context injection
+    Note over RAG: System: "Answer using provided context. Cite sources."<br/>Context: [5 relevant chunks with metadata]<br/>User: "What's our refund policy for enterprise?"
+    
+    RAG->>LLM: Generate(assembled_prompt, max_tokens=1000, stream=true)
+    
+    loop Streaming tokens
+        LLM-->>RAG: token
+        RAG->>Stream: Forward token to client
+        Stream-->>U: SSE token
+    end
+    
+    RAG->>RAG: Attach source citations to response
+    RAG-->>U: {response, sources: [{doc: "policy_v3.pdf", page: 12}, ...]}
+```
+
+### 12.3 Model Routing + Load Balancing
+
+```mermaid
+sequenceDiagram
+    participant U as User
+    participant GW as API Gateway
+    participant Router as Smart Router
+    participant Class as Request Classifier
+    participant Pool70 as GPU Pool (70B model, 8×A100)
+    participant Pool13 as GPU Pool (13B model, 4×A100)
+    participant Pool7 as GPU Pool (7B model, 8×T4)
+    participant Monitor as Load Monitor
+    participant Fallback as Fallback Queue
+
+    U->>GW: POST /chat/completions {model: "auto", messages: [...]}
+    GW->>Router: Route request
+    Router->>Class: Classify complexity(messages)
+    Class->>Class: Features: token_count, task_type (code/creative/factual), user_tier
+    Class-->>Router: {complexity: "medium", recommended: "13B", confidence: 0.82}
+    
+    Router->>Monitor: Get pool status
+    Monitor-->>Router: {70B: 85% util, queue=12 | 13B: 60% util, queue=3 | 7B: 40% util, queue=0}
+    
+    Router->>Router: Decision: 13B (recommended + available)
+    Router->>Pool13: Forward request to least-loaded replica
+    
+    alt GPU Pool responds normally
+        Pool13-->>Router: Stream tokens...
+        Router-->>U: Forward stream
+    else Pool overloaded (queue > threshold)
+        Pool13-->>Router: 429 (queue full)
+        Router->>Router: Fallback: try 70B (higher quality) or 7B (faster)
+        Router->>Pool7: Forward to 7B (fast response, acceptable quality)
+        Pool7-->>Router: Stream tokens
+        Router-->>U: Forward stream + header: X-Model-Used: 7B
+    else All pools overloaded
+        Router->>Fallback: Queue request (max wait: 30s)
+        Fallback-->>U: 503 {retry_after: 5, queue_position: 8}
+    end
+```
+
+## 13. Algorithm Deep Dives
+
+### 13.1 KV Cache Management
+
+#### The Problem
+
+Each transformer layer stores Key and Value tensors for all previous tokens. For a 70B model with 80 layers, 128 heads, 128 head_dim:
+```
+KV cache per token = 2 (K+V) × 80 layers × 128 heads × 128 dim × 2 bytes (FP16) = 5.2 MB/token
+For 4096 context: 5.2MB × 4096 = 21.3 GB per request
+With 8 concurrent requests: 170 GB — exceeds A100 80GB!
+```
+
+#### PagedAttention (vLLM)
+
+```
+Core Insight: Treat KV cache like virtual memory with paging
+
+Traditional: Pre-allocate contiguous memory for max_seq_len per request
+  - Waste: average sequence uses 40% of allocated space
+  - Fragmentation: cannot serve new requests despite available total memory
+
+PagedAttention:
+  - Divide KV cache into fixed-size pages (blocks of 16 tokens each)
+  - Page size: 16 tokens × 5.2MB/token ÷ layers = manageable block
+  - Allocate pages on-demand as sequence grows
+  - Pages can be non-contiguous in physical GPU memory
+  
+  Block table (per sequence):
+    Sequence "Hello world how are you..." →
+    Logical block 0 → Physical block 7
+    Logical block 1 → Physical block 23  
+    Logical block 2 → Physical block 4 (just allocated)
+  
+  Benefits:
+    - ~95% memory utilization (vs ~55% with pre-allocation)
+    - 2-4x more concurrent requests per GPU
+    - Easy memory sharing for beam search / parallel sampling
+
+Memory Management:
+  - Free list: Available physical blocks
+  - Ref counting: Shared blocks (prefix caching, beam search)
+  - Eviction: LRU when memory pressure (preempt lowest-priority sequence)
+  - Copy-on-write: For shared prefixes with diverging continuations
+```
+
+#### Prefix Caching
+
+```
+Observation: Many requests share common prefixes (system prompts, few-shot examples)
+
+Implementation:
+  1. Hash the token sequence of each block
+  2. Before allocating new blocks, check if hash exists in cache
+  3. If hit: reuse existing KV cache blocks (read-only, ref count++)
+  4. Divergence point: copy-on-write for new tokens
+  
+  Example:
+    System prompt (200 tokens) = blocks [0..12]
+    Request A: system + user_A → reuse [0..12], allocate new for user_A
+    Request B: system + user_B → reuse [0..12], allocate new for user_B
+    
+    Memory saved: 200 tokens × 5.2MB = 1.04 GB per shared prefix
+    With 100 concurrent requests sharing system prompt: saves ~100 GB
+
+Eviction Policy:
+  - LRU across cached prefix blocks
+  - Priority: longer prefixes evicted last (more expensive to recompute)
+  - Automatic: managed by memory manager, transparent to inference
+```
+
+#### Speculative Decoding
+
+```
+Problem: Autoregressive decoding = 1 forward pass per token (GPU underutilized)
+Idea: Small "draft" model proposes N tokens, large model verifies in parallel
+
+Algorithm:
+  1. Draft model (7B, fast): generate K=5 draft tokens autoregressively
+     draft = [t1, t2, t3, t4, t5]  (5 forward passes of small model, fast)
+  
+  2. Target model (70B): verify all K tokens in ONE forward pass
+     - Run target model on [context + t1 + t2 + t3 + t4 + t5]
+     - Get target probabilities at each position
+  
+  3. Accept/reject (modified rejection sampling):
+     For each position i:
+       if target_prob(ti) >= draft_prob(ti):
+         ACCEPT ti
+       else:
+         Accept with probability target_prob(ti) / draft_prob(ti)
+         If rejected: sample correction token from adjusted distribution
+         Stop here (discard remaining draft tokens)
+  
+  4. Result: Accept 3-4 tokens on average per verification step
+     Speedup: 2-3x for well-matched draft/target pairs
+     Guarantee: Output distribution identical to target model (no quality loss)
+
+Production Considerations:
+  - Draft model must be much cheaper (7B drafts for 70B target)
+  - Acceptance rate depends on task (high for formulaic text, lower for creative)
+  - Memory: need to hold both models (or use model's early layers as draft)
+  - Tuning K: higher K = more potential speedup but higher rejection waste
+```
+
+### 13.2 Batching Strategies for GPU Inference
+
+#### Static Batching (Naive)
+
+```
+Wait for B requests, process all together, return all together.
+
+Problem:
+  - Short requests wait for long ones (head-of-line blocking)
+  - Fixed batch window adds latency
+  - Memory allocated for max_seq_len × B wastes GPU RAM
+  
+  Example: Batch of 8 requests with lengths [50, 200, 80, 1500, 30, 90, 400, 60]
+  All 8 wait until the 1500-token request finishes → terrible TTFT for short ones
+```
+
+#### Continuous Batching (Iteration-Level Scheduling)
+
+```
+Core Idea: Schedule at the granularity of individual decode steps, not entire requests
+
+Algorithm:
+  Every decode iteration (one forward pass):
+    1. COMPLETE: Remove sequences that hit EOS or max_tokens
+       → Free their KV cache pages immediately
+    2. ADD: Pull new requests from queue (if memory available)
+       → Run prefill for new requests (can be batched with decode of existing)
+    3. EXECUTE: Run one decode step for all active sequences
+    4. Repeat
+
+  Iteration timeline:
+    Step 1: [req_A(decode), req_B(decode), req_C(prefill_new)]
+    Step 2: [req_A(decode), req_B(done→remove), req_C(decode), req_D(prefill_new)]
+    Step 3: [req_A(decode), req_C(decode), req_D(decode)]
+    ...
+    
+  Benefits:
+    - No head-of-line blocking (short requests leave immediately)
+    - GPU always has work (new requests fill freed slots)
+    - Memory released immediately on completion
+    - 10-20x throughput improvement over static batching
+
+Implementation Details:
+  - Prefill vs Decode conflict: Prefill is compute-bound, decode is memory-bound
+  - Solution: Chunked prefill — process new request's prefill in chunks (e.g., 512 tokens at a time)
+    interleavd with ongoing decode steps. Limits TTFT impact on existing streams.
+  - Priority queue: Premium users get scheduled first, longer wait = higher priority
+```
+
+#### Iteration-Level Scheduling Decisions
+
+```
+Scheduler State Machine (per iteration):
+
+  available_memory = total_gpu_mem - sum(active_sequence_kv_cache)
+  
+  PREEMPTION (if memory pressure):
+    if available_memory < min_threshold:
+      victim = lowest_priority_sequence (or longest-running)
+      options:
+        a) SWAP: Move KV cache to CPU RAM (resume later without recompute)
+        b) RECOMPUTE: Discard KV cache, re-prefill when resumed (saves CPU RAM)
+      Choose swap if CPU RAM available, else recompute
+  
+  ADMISSION CONTROL:
+    new_request_estimated_memory = estimated_output_len × per_token_kv_size
+    if available_memory > new_request_estimated_memory:
+      ADMIT → begin prefill
+    else:
+      WAIT (queue) or PREEMPT lower priority
+  
+  FAIRNESS:
+    - Max active requests per user (prevent monopolization)
+    - Aging: queued requests gain priority over time
+    - SLO-aware: requests approaching latency SLO get boosted priority
+
+Throughput Optimization:
+  - Optimal batch size: limited by memory bandwidth (decode) or compute (prefill)
+  - A100 80GB: typically 64-256 concurrent sequences for 13B model
+  - Token budget per iteration: process up to 8192 total tokens (prefill + decode combined)
+```
+

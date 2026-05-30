@@ -60,6 +60,68 @@
 
 ## 4. Data Modeling
 
+### Entity-Relationship Diagram
+
+```mermaid
+erDiagram
+    DAGS {
+        varchar dag_id PK
+        uuid tenant_id
+        varchar schedule_interval
+        boolean is_paused
+    }
+    DAG_VERSIONS {
+        varchar dag_id PK_FK
+        int version PK
+        jsonb dag_definition
+    }
+    DAG_TASKS {
+        varchar dag_id PK_FK
+        varchar task_id PK
+        varchar task_type
+        varchar trigger_rule
+    }
+    DAG_RUNS {
+        uuid run_id PK
+        varchar dag_id FK
+        int dag_version
+        varchar state
+        timestamp execution_date
+    }
+    TASK_INSTANCES {
+        uuid task_instance_id PK
+        uuid run_id FK
+        varchar dag_id
+        varchar task_id
+        varchar state
+        int try_number
+    }
+    XCOM {
+        bigint xcom_id PK
+        uuid run_id FK
+        varchar task_id
+        varchar key
+    }
+    POOLS {
+        varchar pool_name PK
+        int total_slots
+    }
+    SLA_MISSES {
+        bigint sla_id PK
+        uuid run_id FK
+        varchar dag_id
+        timestamp expected_time
+    }
+
+    DAGS ||--o{ DAG_VERSIONS : versioned-as
+    DAGS ||--o{ DAG_TASKS : defines
+    DAGS ||--o{ DAG_RUNS : triggers
+    DAG_RUNS ||--o{ TASK_INSTANCES : executes
+    DAG_RUNS ||--o{ XCOM : produces
+    DAG_RUNS ||--o{ SLA_MISSES : may-miss
+    POOLS ||--o{ TASK_INSTANCES : limits
+```
+
 ### PostgreSQL Schemas
 
 ```sql
@@ -1007,3 +1069,136 @@ groups:
 ---
 
 *Total lines: 500+ | Covers all 11 standard sections with full depth*
+
+---
+
+## 12. Sequence Diagrams
+
+### Diagram 1: DAG Execution + Task Dispatch
+
+```mermaid
+sequenceDiagram
+    participant User
+    participant Scheduler as DAG Scheduler
+    participant DB as Metadata DB
+    participant Executor as Celery Executor
+    participant Worker1 as Worker Pod 1
+    participant Worker2 as Worker Pod 2
+    participant CB as Callback/Sensor
+
+    User->>Scheduler: Trigger DAG run (dag_id, conf)
+    Scheduler->>DB: INSERT dag_run (state=RUNNING)
+    Scheduler->>DB: Resolve DAG → topological sort of tasks
+    DB-->>Scheduler: [task_A, task_B, task_C] (A→B, A→C)
+
+    Scheduler->>DB: INSERT task_instance(task_A, state=QUEUED)
+    Scheduler->>Executor: Dispatch task_A (no upstream dependencies)
+    Executor->>Worker1: Execute task_A (pool slot acquired)
+
+    Worker1->>Worker1: Run operator (PythonOperator)
+    Worker1->>DB: UPDATE task_A state=RUNNING
+    Worker1->>Worker1: Execute callable
+    Worker1->>DB: UPDATE task_A state=SUCCESS, xcom_push(result)
+    Worker1-->>Executor: Task complete
+
+    Scheduler->>DB: Check task_A downstream dependencies
+    Note over Scheduler: task_B and task_C now eligible (all upstream SUCCESS)
+
+    par Parallel dispatch
+        Scheduler->>Executor: Dispatch task_B
+        Scheduler->>Executor: Dispatch task_C
+    end
+
+    Executor->>Worker1: Execute task_B
+    Executor->>Worker2: Execute task_C
+
+    Worker2->>CB: task_C is ExternalTaskSensor → poll external DAG
+    CB-->>Worker2: External DAG complete
+    Worker2->>DB: UPDATE task_C state=SUCCESS
+
+    Worker1->>DB: UPDATE task_B state=SUCCESS
+    Scheduler->>DB: All tasks SUCCESS → UPDATE dag_run state=SUCCESS
+```
+
+### Diagram 2: Step Function State Transition
+
+```mermaid
+sequenceDiagram
+    participant Client
+    participant SFN as Step Functions Service
+    participant State as State Machine
+    participant Lambda1 as Lambda (Validate)
+    participant Lambda2 as Lambda (Process)
+    participant DLQ as Dead Letter Queue
+    participant SNS as SNS Notification
+
+    Client->>SFN: StartExecution(stateMachineArn, input)
+    SFN->>State: Initialize (state=ValidateInput)
+    SFN-->>Client: executionArn
+
+    State->>Lambda1: Invoke (payload = input)
+    Lambda1-->>State: {valid: true, cleaned_data: {...}}
+
+    State->>State: Choice state: valid == true?
+    Note over State: Transition to ProcessData
+
+    State->>Lambda2: Invoke (payload = cleaned_data)
+    Lambda2-->>State: Error: TimeoutException
+
+    State->>State: Retry policy: attempt 1/3, backoff 2s
+    State->>Lambda2: Invoke (retry attempt 2)
+    Lambda2-->>State: Error: TimeoutException
+
+    State->>State: Retry policy: attempt 2/3, backoff 4s
+    State->>Lambda2: Invoke (retry attempt 3)
+    Lambda2-->>State: Error: TimeoutException
+
+    State->>State: Max retries exhausted → Catch block
+    State->>DLQ: Send failed event (full context + error)
+    State->>State: Transition to NotifyFailure state
+    State->>SNS: Publish failure notification
+    State->>State: Execution state = FAILED
+    SFN->>SFN: Record execution history (all transitions)
+```
+
+### Diagram 3: Retry + Dead Letter Handling
+
+```mermaid
+sequenceDiagram
+    participant Scheduler
+    participant Worker
+    participant DB as Metadata DB
+    participant DLQ as Dead Letter Topic
+    participant Alert as PagerDuty
+    participant Operator as On-Call Engineer
+
+    Scheduler->>Worker: Dispatch task_X (attempt=1)
+    Worker->>Worker: Execute → raises TransientError
+    Worker->>DB: UPDATE task_X state=UP_FOR_RETRY, try_number=1
+
+    Note over Scheduler: Retry delay: 5min (exponential backoff)
+
+    Scheduler->>Worker: Dispatch task_X (attempt=2)
+    Worker->>Worker: Execute → raises TransientError
+    Worker->>DB: UPDATE task_X state=UP_FOR_RETRY, try_number=2
+
+    Scheduler->>Worker: Dispatch task_X (attempt=3, final)
+    Worker->>Worker: Execute → raises FatalError
+    Worker->>DB: UPDATE task_X state=FAILED, try_number=3
+
+    Scheduler->>DB: Check on_failure_callback
+    Scheduler->>DLQ: Produce failed task context (input, error, stack trace)
+    Scheduler->>Alert: Trigger alert (task_X failed after 3 retries)
+
+    Note over Scheduler: Downstream tasks marked UPSTREAM_FAILED
+
+    Scheduler->>DB: UPDATE task_B state=UPSTREAM_FAILED (depends on task_X)
+    Scheduler->>DB: UPDATE dag_run state=FAILED
+
+    Operator->>DB: Manual clear task_X (reset state to NONE)
+    Scheduler->>Worker: Re-dispatch task_X (attempt=1, fresh)
+    Worker->>Worker: Execute → SUCCESS
+    Worker->>DB: UPDATE task_X state=SUCCESS
+    Scheduler->>Scheduler: Resume downstream tasks (task_B now eligible)
+```
+

@@ -61,6 +61,69 @@
 
 ## 4. Data Modeling
 
+### Entity-Relationship Diagram
+
+```mermaid
+erDiagram
+    USERS {
+        uuid user_id PK
+        varchar email_address
+        bigint storage_used
+        bigint storage_limit
+    }
+    LABELS {
+        uuid label_id PK
+        uuid user_id FK
+        varchar name
+        varchar type
+    }
+    MESSAGES {
+        uuid message_id PK
+        uuid user_id FK
+        uuid thread_id FK
+        varchar subject
+        varchar from_address
+        varchar category
+        boolean is_read
+        boolean is_draft
+    }
+    MESSAGE_LABELS {
+        uuid message_id PK
+        uuid label_id PK
+        uuid user_id FK
+    }
+    THREADS {
+        uuid thread_id PK
+        uuid user_id FK
+        varchar subject
+        timestamptz last_message_at
+        integer message_count
+    }
+    ATTACHMENTS {
+        uuid attachment_id PK
+        uuid message_id FK
+        varchar filename
+        varchar content_type
+        bigint size_bytes
+    }
+    MAIL_FILTERS {
+        uuid filter_id PK
+        uuid user_id FK
+        integer priority
+        varchar from_match
+        boolean is_active
+    }
+
+    USERS ||--o{ LABELS : creates
+    USERS ||--o{ MESSAGES : owns
+    USERS ||--o{ THREADS : owns
+    USERS ||--o{ MAIL_FILTERS : configures
+    THREADS ||--o{ MESSAGES : contains
+    MESSAGES ||--o{ ATTACHMENTS : has
+    MESSAGES ||--o{ MESSAGE_LABELS : tagged
+    LABELS ||--o{ MESSAGE_LABELS : applied
+```
+
 ### Primary Storage: Bigtable-style (wide column) + PostgreSQL for metadata
 
 ```sql
@@ -1253,3 +1316,112 @@ Retry strategy:
 | Send queue failure | Delayed sending | Replicated queue, at-least-once delivery semantics |
 
 ---
+
+---
+
+## 12. Sequence Diagrams
+
+### 12.1 Incoming Email → Spam Check → Inbox Delivery
+
+```mermaid
+sequenceDiagram
+    participant Sender as Sending MTA
+    participant MX as MX Gateway
+    participant SPF as SPF/DKIM/DMARC Validator
+    participant Spam as Spam Classification (ML)
+    participant Store as Message Store (Bigtable)
+    participant Index as Search Indexer
+    participant Push as Push Notification Service
+    participant Client as Recipient Client
+
+    Sender->>MX: SMTP EHLO + DATA (email payload)
+    MX->>SPF: Validate SPF record (DNS TXT lookup)
+    SPF->>SPF: Verify DKIM signature (header hash)
+    SPF->>SPF: Apply DMARC policy (alignment check)
+    SPF-->>MX: {spf: pass, dkim: pass, dmarc: pass}
+    MX->>Spam: Classify(email, sender_reputation, content_features)
+    Spam->>Spam: Feature extraction (URL reputation, language model, user signals)
+    Spam-->>MX: {verdict: ham, confidence: 0.98, category: primary}
+    MX->>Store: Store message (compressed, encrypted at rest)
+    Store-->>MX: messageId = msg_xyz789
+    MX->>Index: Index(messageId, headers, body_text, labels: [INBOX, CATEGORY_PRIMARY])
+    MX->>Push: Notify(recipientId, {subject, sender, snippet})
+    Push-->>Client: Push notification / IMAP IDLE NOTIFY
+    MX-->>Sender: 250 OK (accepted for delivery)
+```
+
+### 12.2 Email Send with DKIM/SPF Authentication
+
+```mermaid
+sequenceDiagram
+    participant U as User Client
+    participant API as Gmail API
+    participant Compose as Compose Service
+    participant Queue as Send Queue (Kafka)
+    participant Sign as DKIM Signer
+    participant MTA as Outbound MTA
+    participant DNS as DNS (Recipient MX)
+    participant Remote as Recipient MTA
+
+    U->>API: POST /messages/send {to, subject, body, attachments}
+    API->>Compose: Validate(recipients, attachments < 25MB, rate_limit)
+    Compose->>Compose: Build MIME message (multipart/mixed)
+    Compose->>Queue: Enqueue(message, priority=normal)
+    Queue->>Sign: Sign message body + headers
+    Sign->>Sign: RSA-2048 DKIM signature (selector: 20230601)
+    Sign-->>Queue: DKIM-Signature header added
+    Queue->>MTA: Deliver(signed_message)
+    MTA->>DNS: MX lookup for recipient domain
+    DNS-->>MTA: MX records [mx1.example.com, mx2.example.com]
+    MTA->>Remote: SMTP STARTTLS + deliver signed message
+    Remote-->>MTA: 250 OK
+    MTA->>API: Update message status → SENT
+    API-->>U: 200 {messageId, labelIds: [SENT]}
+```
+
+### 12.3 Thread View Assembly (Conversation Grouping)
+
+```mermaid
+sequenceDiagram
+    participant U as User Client
+    participant API as Gmail API
+    participant Thread as Thread Service
+    participant Cache as Thread Cache (Redis)
+    participant Store as Message Store
+    participant Search as Search Index
+
+    U->>API: GET /threads/{threadId}?format=full
+    API->>Thread: getThread(userId, threadId)
+    Thread->>Cache: GET thread:{userId}:{threadId}
+    Cache-->>Thread: MISS
+    Thread->>Search: Query(threadId) → ordered messageIds
+    Search-->>Thread: [msg_1, msg_2, msg_3, msg_4] (chronological)
+    Thread->>Store: BatchGet([msg_1, msg_2, msg_3, msg_4])
+    Store-->>Thread: [full messages with headers, body, attachments metadata]
+    Thread->>Thread: Assemble thread (In-Reply-To/References chain validation)
+    Thread->>Thread: Apply label visibility (hide drafts from other users)
+    Thread->>Cache: SET thread:{userId}:{threadId} TTL=300s
+    Thread-->>API: {threadId, messages: [...], historyId}
+    API-->>U: 200 {thread with all messages}
+    
+    Note over Thread: Thread grouping: Subject normalization + References header + Message-ID chain
+```
+
+### Caching Strategy
+
+| Layer | Technology | Data Cached | TTL | Invalidation |
+|-------|-----------|-------------|-----|--------------|
+| Client-side | Browser/App cache | Message list, thread snippets | Until historyId changes | Push invalidation via sync |
+| CDN/Edge | Regional CDN | Static attachments, profile images | 24h | Cache-Control headers |
+| API Gateway | Redis Cluster | Thread views, label counts | 5 min | Event-driven (on new message) |
+| Message metadata | Redis | Headers, snippet, labelIds | 30 min | Write-through on label change |
+| Search results | Memcached | Recent search query results | 60s | Short TTL (acceptable staleness) |
+| Spam model features | Local cache (per node) | Sender reputation scores | 10 min | Periodic refresh from feature store |
+
+**Cache Architecture:**
+- **Write-through** for label changes (user moves email → immediate cache update)
+- **Write-behind** for read receipts and history tracking (batched)
+- **Cache-aside** for thread assembly (expensive join, worth caching)
+- **Negative caching** for deleted messages (tombstone with short TTL to prevent store hits)
+- **Cache warming** on login: prefetch inbox top-50, priority senders
+

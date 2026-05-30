@@ -51,6 +51,92 @@ Cache:
 
 ## 4. Data Modeling — Full Schemas
 
+### Entity-Relationship Diagram
+
+```mermaid
+erDiagram
+    users ||--o{ wallets : "owns"
+    users ||--o{ linked_accounts : "has"
+    users ||--|| loyalty_accounts : "has"
+    wallets ||--o{ wallet_events : "logs"
+    wallets ||--o{ transactions : "sender"
+    wallets ||--o{ transactions : "receiver"
+    transactions ||--o| transfer_sagas : "orchestrated by"
+    loyalty_accounts ||--o{ loyalty_transactions : "tracks"
+    wallets ||--o{ qr_codes : "generates"
+    wallets ||--o{ balance_snapshots : "snapshots"
+
+    users {
+        UUID user_id PK
+        VARCHAR phone_number
+        VARCHAR kyc_status
+        SMALLINT kyc_level
+        VARCHAR status
+    }
+    wallets {
+        UUID wallet_id PK
+        UUID user_id FK
+        CHAR currency
+        BIGINT balance
+        BIGINT available_balance
+        BIGINT version
+    }
+    wallet_events {
+        BIGSERIAL event_id PK
+        UUID wallet_id FK
+        VARCHAR event_type
+        BIGINT amount
+        BIGINT balance_after
+        VARCHAR reference_type
+    }
+    transactions {
+        UUID transaction_id PK
+        UUID sender_wallet_id FK
+        UUID receiver_wallet_id FK
+        BIGINT amount
+        VARCHAR type
+        VARCHAR status
+    }
+    transfer_sagas {
+        UUID saga_id PK
+        UUID transaction_id FK
+        VARCHAR current_step
+        VARCHAR status
+    }
+    linked_accounts {
+        UUID link_id PK
+        UUID user_id FK
+        VARCHAR type
+        VARCHAR provider
+        BOOLEAN is_verified
+    }
+    loyalty_accounts {
+        UUID loyalty_id PK
+        UUID user_id FK
+        BIGINT points_balance
+        VARCHAR tier
+    }
+    loyalty_transactions {
+        BIGSERIAL id PK
+        UUID loyalty_id FK
+        VARCHAR type
+        BIGINT points
+        BIGINT balance_after
+    }
+    qr_codes {
+        VARCHAR qr_id PK
+        UUID wallet_id FK
+        VARCHAR type
+        BIGINT amount
+    }
+    balance_snapshots {
+        BIGSERIAL snapshot_id PK
+        UUID wallet_id FK
+        BIGINT balance
+        BIGINT last_event_id
+    }
+```
+
 ```sql
 -- User & Wallet Schema
 CREATE TABLE users (
@@ -936,3 +1022,116 @@ Trace: P2P Transfer
 - **Read path**: Serve from Redis cache + read replicas
 - **Write path**: Shard primary only, serialized per wallet
 - **Analytics**: Async via Kafka → Flink → ClickHouse (no impact on OLTP)
+
+---
+
+## 12. Sequence Diagrams
+
+### Diagram 1: P2P Transfer with Double-Entry
+
+```mermaid
+sequenceDiagram
+    participant S as Sender App
+    participant API as Wallet API
+    participant IK as Idempotency (Redis)
+    participant DB as PostgreSQL (Serializable)
+    participant Ledger as Double-Entry Ledger
+    participant Kafka as Event Bus
+    participant R as Receiver App
+
+    S->>API: POST /transfers (to=user_B, amount=500, idem_key=txn_001)
+    API->>IK: CHECK txn_001
+    IK-->>API: NOT FOUND
+    API->>DB: BEGIN SERIALIZABLE
+    API->>DB: SELECT balance FROM wallets WHERE user_id='A' FOR UPDATE
+    DB-->>API: balance=1200
+    API->>API: Validate: 1200 >= 500 ✓
+    API->>DB: UPDATE wallets SET balance=700 WHERE user_id='A'
+    API->>DB: UPDATE wallets SET balance=balance+500 WHERE user_id='B'
+    API->>Ledger: INSERT entries (DR: wallet_A, CR: wallet_B, amount=500)
+    API->>DB: COMMIT
+    DB-->>API: COMMITTED
+    API->>IK: STORE txn_001=succeeded
+    API->>Kafka: Publish transfer.completed {from:A, to:B, amount:500}
+    API-->>S: 200 Transfer (status=completed)
+    Kafka-->>R: Push notification: "Received ₹500 from User A"
+
+    Note over S,R: Serializable isolation prevents double-spend.<br/>Both balance updates in SAME transaction = atomic.
+```
+
+### Diagram 2: Top-Up from Bank (Add Money)
+
+```mermaid
+sequenceDiagram
+    participant U as User App
+    participant API as Wallet API
+    participant PG as Payment Gateway
+    participant Bank as User's Bank
+    participant DB as Wallet DB
+    participant Ledger as Ledger
+    participant Kafka as Events
+
+    U->>API: POST /wallet/topup (amount=2000, source=bank_upi)
+    API->>API: Create pending_topup record (id=TOP_001, status=pending)
+    API->>PG: Create payment intent (amount=2000, callback_url)
+    PG-->>API: intent_id=PI_789, redirect_url
+    API-->>U: Redirect to bank authentication
+    U->>Bank: Authenticate (UPI PIN / Net Banking)
+    Bank-->>PG: Payment authorized
+    PG->>API: Webhook: payment.captured (intent=PI_789, amount=2000)
+    API->>API: Verify webhook signature (HMAC-SHA256)
+    API->>DB: BEGIN
+    API->>DB: UPDATE wallets SET balance=balance+2000 WHERE user_id='U'
+    API->>Ledger: DR: bank_inflow_account, CR: wallet_U (amount=2000)
+    API->>DB: UPDATE topups SET status=completed WHERE id=TOP_001
+    API->>DB: COMMIT
+    API->>Kafka: Publish wallet.credited {user:U, amount:2000, source:bank}
+    API-->>U: Push: "₹2000 added to wallet"
+
+    Note over U,Kafka: If webhook received twice (at-least-once delivery),<br/>idempotency on topup_id prevents double-credit
+```
+
+### Diagram 3: Withdrawal to Bank
+
+```mermaid
+sequenceDiagram
+    participant U as User App
+    participant API as Wallet API
+    participant DB as Wallet DB
+    participant Ledger as Ledger
+    participant Queue as Payout Queue
+    participant Payout as Payout Service
+    participant Bank as Bank (NEFT/IMPS)
+
+    U->>API: POST /wallet/withdraw (amount=1000, bank_account=ACC_123)
+    API->>DB: BEGIN SERIALIZABLE
+    API->>DB: SELECT balance FROM wallets WHERE user_id='U' FOR UPDATE
+    DB-->>API: balance=3000
+    API->>API: Validate: 3000 >= 1000 ✓, KYC verified ✓
+    API->>DB: UPDATE wallets SET balance=2000 WHERE user_id='U'
+    API->>Ledger: DR: wallet_U, CR: pending_payout (amount=1000)
+    API->>DB: INSERT withdrawal (id=W_001, status=pending)
+    API->>DB: COMMIT
+    API-->>U: 200 Withdrawal (status=processing, eta=2hrs)
+    API->>Queue: Enqueue payout job (W_001)
+    
+    Queue->>Payout: Process withdrawal W_001
+    Payout->>Bank: NEFT transfer (amount=1000, beneficiary=ACC_123)
+    
+    alt Bank transfer succeeds
+        Bank-->>Payout: UTR=NEFT123456
+        Payout->>Ledger: DR: pending_payout, CR: bank_outflow (amount=1000)
+        Payout->>DB: UPDATE withdrawal SET status=completed, utr=NEFT123456
+        Payout-->>U: Push: "₹1000 transferred to bank"
+    else Bank transfer fails
+        Bank-->>Payout: FAILURE (invalid account)
+        Payout->>DB: BEGIN
+        Payout->>DB: UPDATE wallets SET balance=balance+1000 WHERE user_id='U'
+        Payout->>Ledger: DR: pending_payout, CR: wallet_U (reversal)
+        Payout->>DB: UPDATE withdrawal SET status=failed
+        Payout->>DB: COMMIT
+        Payout-->>U: Push: "Withdrawal failed, ₹1000 refunded to wallet"
+    end
+
+    Note over U,Bank: Money debited from wallet IMMEDIATELY (prevents double-withdraw).<br/>Reversal on failure ensures no money is lost.
+```

@@ -42,6 +42,71 @@
 
 ## 3. Data Modeling
 
+### Entity-Relationship Diagram
+
+```mermaid
+erDiagram
+    TENANTS {
+        uuid tenant_id PK
+        string slug
+        string status
+        string tier
+        string isolation_model
+        uuid owner_user_id
+    }
+    TENANT_RESOURCES {
+        uuid resource_id PK
+        uuid tenant_id FK
+        string resource_type
+        string status
+    }
+    TENANT_USERS {
+        uuid user_id PK
+        uuid tenant_id FK
+        string email
+        string role
+    }
+    USAGE_EVENTS {
+        uuid event_id
+        uuid tenant_id FK
+        string event_type
+        decimal quantity
+    }
+    USAGE_AGGREGATIONS {
+        uuid tenant_id FK
+        string event_type
+        timestamp period_start
+        decimal total_quantity
+    }
+    BILLING_SUBSCRIPTIONS {
+        uuid subscription_id PK
+        uuid tenant_id FK
+        uuid plan_id
+        string status
+    }
+    INVOICES {
+        uuid invoice_id PK
+        uuid tenant_id FK
+        uuid subscription_id FK
+        decimal total_amount
+        string status
+    }
+    DOCUMENTS {
+        uuid document_id PK
+        uuid tenant_id FK
+        string title
+        uuid created_by
+    }
+
+    TENANTS ||--o{ TENANT_RESOURCES : "provisions"
+    TENANTS ||--o{ TENANT_USERS : "has"
+    TENANTS ||--o{ USAGE_EVENTS : "generates"
+    TENANTS ||--o{ USAGE_AGGREGATIONS : "aggregated"
+    TENANTS ||--o{ BILLING_SUBSCRIPTIONS : "subscribes"
+    BILLING_SUBSCRIPTIONS ||--o{ INVOICES : "generates"
+    TENANTS ||--o{ DOCUMENTS : "owns"
+```
+
 ### Database Schemas
 
 ```sql
@@ -981,3 +1046,75 @@ alerts:
 - Rate limiter Redis down: Fall back to local in-memory approximation (permissive)
 - Provisioning failure: Saga rollback + alert ops + tenant stays in PROVISIONING
 - Noisy neighbor: Auto-throttle to tier limits, alert, offer upgrade path
+
+---
+
+## Sequence Diagrams
+
+### Tenant Provisioning + Isolation Setup
+
+```mermaid
+sequenceDiagram
+    participant Admin as Platform Admin
+    participant API as Provisioning API
+    participant TenantDB as Tenant Registry (DB)
+    participant Infra as Infrastructure Orchestrator
+    participant DNS as DNS Service
+    participant Vault as Secrets Vault
+    participant Queue as Event Bus (Kafka)
+
+    Admin->>API: POST /tenants {name, plan, region, isolation_level}
+    API->>API: Validate plan limits, check name uniqueness
+    API->>TenantDB: Insert tenant record {id, status: provisioning}
+    API->>Queue: Emit TenantCreated event
+    API-->>Admin: 202 Accepted {tenant_id, status: provisioning}
+
+    Queue->>Infra: Consume TenantCreated
+    alt Silo isolation (enterprise plan)
+        Infra->>Infra: Provision dedicated DB instance
+        Infra->>Infra: Create dedicated K8s namespace
+        Infra->>Infra: Provision dedicated Redis cluster
+    else Pool isolation (standard plan)
+        Infra->>Infra: Create DB schema + row-level security policies
+        Infra->>Infra: Configure shared resource quotas
+    end
+    Infra->>DNS: Create tenant subdomain (tenant.app.com)
+    Infra->>Vault: Generate tenant encryption key (envelope encryption)
+    Infra->>TenantDB: Update status: active, store connection metadata
+    Infra->>Queue: Emit TenantReady event
+    Queue->>API: Notify admin via webhook
+```
+
+### Request Routing + Tenant Context Injection
+
+```mermaid
+sequenceDiagram
+    participant C as Client
+    participant LB as Load Balancer
+    participant GW as API Gateway
+    participant TenantResolver as Tenant Resolver
+    participant Cache as Tenant Cache (Redis)
+    participant Svc as Application Service
+    participant DB as Tenant Database
+
+    C->>LB: GET /api/data [Host: acme.app.com, Bearer token]
+    LB->>GW: Route based on domain
+    GW->>GW: Extract JWT, validate signature
+    GW->>TenantResolver: Resolve tenant from (subdomain OR JWT claim OR header)
+    TenantResolver->>Cache: Lookup tenant config by domain
+    alt Cache hit
+        Cache-->>TenantResolver: Tenant config {id, db_conn, isolation, limits}
+    else Cache miss
+        TenantResolver->>DB: Query tenant registry
+        DB-->>TenantResolver: Tenant record
+        TenantResolver->>Cache: Store {ttl: 5min}
+    end
+    TenantResolver-->>GW: Tenant context
+    GW->>GW: Inject X-Tenant-ID header, apply rate limits per plan
+    GW->>Svc: Forward request + tenant context
+    Svc->>Svc: Set tenant context in thread-local / async context
+    Svc->>DB: Query with tenant_id filter (RLS enforced)
+    DB-->>Svc: Tenant-scoped data only
+    Svc-->>GW: Response
+    GW-->>C: 200 + response data
+```

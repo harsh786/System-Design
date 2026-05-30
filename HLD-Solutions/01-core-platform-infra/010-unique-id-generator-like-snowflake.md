@@ -96,6 +96,37 @@ Network overhead is negligible for this service.
 
 ## 4. Data Modeling
 
+### Entity-Relationship Diagram
+
+```mermaid
+erDiagram
+    WORKER_LEASES {
+        smallint datacenter_id PK
+        smallint worker_id PK
+        string hostname
+        uuid lease_token
+        string state
+        timestamp lease_expires_at
+    }
+    CLOCK_DRIFT_EVENTS {
+        bigint id PK
+        smallint worker_id FK
+        smallint datacenter_id FK
+        int drift_ms
+        string action_taken
+    }
+    ALLOCATION_HISTORY {
+        bigint id PK
+        smallint worker_id FK
+        smallint datacenter_id FK
+        string event_type
+        uuid lease_token
+    }
+
+    WORKER_LEASES ||--o{ CLOCK_DRIFT_EVENTS : experiences
+    WORKER_LEASES ||--o{ ALLOCATION_HISTORY : tracked_in
+```
+
 ### ID Bit Layout (64-bit Snowflake Format)
 
 ```
@@ -1520,3 +1551,106 @@ Total: ~62ms
 - [ ] ID parsing utility available for debugging
 - [ ] Epoch exhaustion date documented and monitored (alert 5 years before)
 - [ ] Backup worker allocation strategy (static config file fallback)
+
+---
+
+## Sequence Diagrams
+
+### 1. ID Generation Flow
+
+```mermaid
+sequenceDiagram
+    participant App as Application Service
+    participant SDK as ID Generator SDK
+    participant Local as Local Buffer
+    participant Clock as System Clock
+    participant ZK as Coordination (etcd)
+
+    App->>SDK: generateId()
+
+    SDK->>Local: Check buffer
+    alt Buffer has IDs
+        Local-->>SDK: Pre-generated ID
+        SDK-->>App: ID (64-bit snowflake)
+    else Buffer empty
+        SDK->>Clock: Get current timestamp (ms)
+        Clock-->>SDK: timestamp_ms
+
+        SDK->>SDK: Compose ID:<br/>| 41-bit timestamp | 10-bit worker_id | 12-bit sequence |
+
+        alt Same millisecond as last ID
+            SDK->>SDK: Increment sequence (0-4095)
+            alt Sequence overflow (>4095 in same ms)
+                SDK->>SDK: Spin-wait until next millisecond
+                SDK->>Clock: Wait for clock tick
+                Clock-->>SDK: next_ms
+                SDK->>SDK: Reset sequence to 0
+            end
+        else New millisecond
+            SDK->>SDK: Reset sequence to random(0-9)
+            Note over SDK: Random start prevents<br/>sequential patterns across workers
+        end
+
+        SDK->>Local: Generate batch of 64 IDs (prefill buffer)
+        SDK-->>App: ID (64-bit: timestamp|worker|seq)
+    end
+
+    Note over App: ~50ns per ID (in-memory, no network)<br/>4096 IDs/ms/worker = 4M IDs/sec/worker
+```
+
+### 2. Range Allocation Flow
+
+```mermaid
+sequenceDiagram
+    participant W1 as Worker-1 (Starting)
+    participant W2 as Worker-2 (Existing)
+    participant Coord as etcd (Coordinator)
+    participant Lease as Lease Manager
+
+    W1->>Coord: PUT /workers/register {host, pid, datacenter}
+    Coord->>Coord: Assign worker_id via CAS<br/>Find lowest unused ID in [0, 1023]
+    Coord-->>W1: {worker_id: 7, lease_id: L1}
+
+    W1->>Lease: Create lease (TTL 30s, keepalive every 10s)
+
+    loop Heartbeat
+        W1->>Coord: Lease keepalive (every 10s)
+        Coord-->>W1: Lease renewed
+    end
+
+    Note over W1: Worker-1 crashes / network partition
+    W1--xCoord: Missed 3 keepalives
+
+    Coord->>Coord: Lease L1 expired (30s TTL)
+    Coord->>Coord: Mark worker_id:7 as COOLDOWN<br/>Cannot be reused for 60s (clock skew safety)
+
+    Note over Coord: After 60s cooldown
+    Coord->>Coord: Mark worker_id:7 as AVAILABLE
+
+    W2->>Coord: GET /workers/available (scaling up)
+    Coord-->>W2: worker_id:7 available (cooldown expired)
+
+    Note over Coord: Anti-clock-skew protection:<br/>New holder of worker_id:7 checks<br/>current_ts > last_known_ts + cooldown<br/>before generating IDs
+```
+
+### Caching Strategy
+
+#### Multi-Tier Caching for ID Generation
+- **L1 (In-Process Buffer)**: Pre-generated batch of 64-256 IDs per thread; zero network latency
+- **L2 (Worker-local)**: Worker ID and range assignments cached locally; refreshed on lease renewal
+- **L3 (Coordination cache)**: etcd's built-in watch cache for worker registry; linearizable reads optional
+
+#### Cache Eviction Policies
+- **ID buffer**: FIFO (oldest IDs used first to maintain rough ordering); refill at 25% remaining
+- **Worker mapping cache**: TTL = lease TTL (30s); force-refresh on lease renewal or clock drift detection
+- **Configuration**: Watch-based invalidation (etcd watches push config changes immediately)
+
+#### Cache Invalidation Patterns
+- **Lease expiry**: Worker ID cache invalidated immediately on lease loss (fencing token pattern)
+- **Clock drift**: If NTP adjustment > 10ms detected, invalidate all buffered IDs (timestamps may be stale)
+- **Event-driven**: etcd watch on `/workers/` prefix pushes topology changes to all workers
+
+#### Thundering Herd Prevention
+- **Staggered registration**: Workers add random jitter (0-5s) to startup registration
+- **Batch allocation**: Workers pre-allocate 64 IDs at a time (amortizes the rare coordination needed)
+- **No shared state in hot path**: Each worker generates IDs independently (no thundering herd by design)

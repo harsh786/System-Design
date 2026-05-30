@@ -51,6 +51,71 @@
 
 ## 4. Data Modeling
 
+### Entity-Relationship Diagram
+
+```mermaid
+erDiagram
+    USERS {
+        bigint user_id PK
+        varchar email
+        bigint quota_bytes
+        bigint used_bytes
+    }
+    MEDIA_ITEMS {
+        uuid media_id PK
+        bigint user_id FK
+        smallint media_type
+        varchar filename
+        timestamptz capture_time
+        varchar hash_perceptual
+    }
+    MEDIA_LABELS {
+        uuid media_id PK
+        smallint label_type PK
+        varchar label PK
+        real confidence
+    }
+    FACE_CLUSTERS {
+        uuid cluster_id PK
+        bigint user_id FK
+        varchar person_name
+        int photo_count
+    }
+    FACE_DETECTIONS {
+        uuid detection_id PK
+        uuid media_id FK
+        uuid cluster_id FK
+        real confidence
+    }
+    ALBUMS {
+        uuid album_id PK
+        bigint owner_id FK
+        varchar title
+        smallint album_type
+        boolean is_shared
+    }
+    ALBUM_MEDIA {
+        uuid album_id PK
+        uuid media_id PK
+        bigint added_by FK
+    }
+    ALBUM_COLLABORATORS {
+        uuid album_id PK
+        bigint user_id PK
+        smallint permission
+    }
+
+    USERS ||--o{ MEDIA_ITEMS : uploads
+    MEDIA_ITEMS ||--o{ MEDIA_LABELS : "classified as"
+    USERS ||--o{ FACE_CLUSTERS : has
+    MEDIA_ITEMS ||--o{ FACE_DETECTIONS : contains
+    FACE_CLUSTERS ||--o{ FACE_DETECTIONS : groups
+    USERS ||--o{ ALBUMS : owns
+    ALBUMS ||--o{ ALBUM_MEDIA : contains
+    MEDIA_ITEMS ||--o{ ALBUM_MEDIA : "added to"
+    ALBUMS ||--o{ ALBUM_COLLABORATORS : "shared with"
+```
+
 ### PostgreSQL - User & Album Metadata
 
 ```sql
@@ -874,3 +939,174 @@ client → upload-proxy (100ms) → dedup-check (20ms) → s3-multipart (2s)
 3. **ML model updates**: Blue-green deployment, re-classification pipeline for improved models
 4. **Cross-region sync**: CRDTs for album metadata, async replication for media objects
 5. **Cost optimization**: Aggressive lifecycle policies, user-driven quality tier selection
+
+---
+
+## Sequence Diagrams
+
+### 1. Photo Upload + ML Classification + Face Clustering
+
+```mermaid
+sequenceDiagram
+    participant C as Client (Phone)
+    participant API as Upload API
+    participant S3 as Object Store (GCS)
+    participant Q as Task Queue (Pub/Sub)
+    participant Thumb as Thumbnail Worker
+    participant ML as ML Pipeline
+    participant Face as Face Detection/Embedding
+    participant Cluster as Face Clustering Service
+    participant Meta as Metadata DB
+    participant Search as Search Index
+
+    C->>API: POST /upload (photo + EXIF metadata)
+    API->>S3: Store original (full resolution)
+    API->>Meta: Create photo record (user, timestamp, geo, device)
+    API-->>C: 200 OK {photo_id}
+
+    API->>Q: Publish ProcessPhoto event
+
+    par Parallel ML Processing
+        Q->>Thumb: Generate thumbnails (64px, 256px, 1024px)
+        Thumb->>S3: Store thumbnails
+        Thumb->>Meta: Update thumbnail URLs
+
+        Q->>ML: Classify image content
+        ML->>ML: Object detection (dog, beach, car, food...)
+        ML->>ML: Scene classification (sunset, wedding, birthday)
+        ML->>ML: OCR (extract text from photos)
+        ML->>Meta: Store labels + confidence scores
+        ML->>Search: Index labels for search
+
+        Q->>Face: Detect faces in photo
+        Face->>Face: Extract face bounding boxes
+        Face->>Face: Generate 128-dim face embeddings
+        Face->>Cluster: Match embeddings to existing clusters
+        alt Known face (distance < threshold)
+            Cluster->>Meta: Associate photo with person_id
+        else New face
+            Cluster->>Cluster: Create new cluster (unnamed)
+            Cluster->>Meta: New person_id, associate photo
+        end
+    end
+
+    Note over ML,Search: All async; user sees photo immediately, features appear within seconds
+```
+
+### 2. Shared Album Collaboration
+
+```mermaid
+sequenceDiagram
+    participant A as User A (Owner)
+    participant B as User B (Member)
+    participant API as Album API
+    participant DB as Album DB
+    participant ACL as ACL Service
+    participant Event as Event Bus
+    participant Notify as Notification Service
+    participant Sync as Sync Service
+
+    A->>API: POST /albums {name: "Trip 2024", shared: true}
+    API->>DB: Create album record (owner: A)
+    API->>ACL: Set permissions (A: owner)
+    API-->>A: {album_id, share_link}
+
+    A->>API: POST /albums/{id}/members {user: B, role: contributor}
+    API->>ACL: Grant contributor access to B
+    API->>Event: Publish AlbumInvite event
+    Event->>Notify: Send notification to B
+    Notify-->>B: "User A invited you to Trip 2024"
+
+    B->>API: POST /albums/{id}/accept
+    API->>ACL: Activate B's membership
+
+    B->>API: POST /albums/{id}/photos {photo_ids: [p1, p2, p3]}
+    API->>ACL: Verify B has contributor role
+    API->>DB: Link photos to album (owner remains B)
+    API->>Event: Publish PhotosAdded {album_id, by: B, count: 3}
+
+    Event->>Sync: Notify all album members of update
+    Sync->>A: Real-time update (new photos in shared album)
+
+    A->>API: POST /albums/{id}/photos/{p2}/comment {text: "Great shot!"}
+    API->>DB: Store comment on photo
+    API->>Event: Publish CommentAdded
+    Event->>Notify: Notify photo owner (B)
+```
+
+### 3. Search by Content / Face / Place
+
+```mermaid
+sequenceDiagram
+    participant U as User
+    participant API as Search API
+    participant NLP as Query Understanding
+    participant Search as Search Index (Elasticsearch)
+    participant Face as Face Service
+    participant Geo as Geo Service
+    participant Meta as Metadata DB
+    participant ML as ML Re-ranker
+
+    U->>API: GET /search?q="dogs at the beach last summer"
+    API->>NLP: Parse query intent
+    NLP->>NLP: Extract entities: {object: dog, scene: beach, time: summer 2024}
+    NLP-->>API: Structured query
+
+    API->>Search: Bool query (labels:dog AND labels:beach AND date:2024-06-01..2024-08-31)
+    Search-->>API: Candidate photo IDs (top 500)
+
+    API->>ML: Re-rank candidates by relevance
+    ML-->>API: Scored results
+
+    API-->>U: Top 50 results with thumbnails
+
+    Note over U: User searches by face
+    U->>API: GET /search?face=person_42
+    API->>Face: Get all photos for face cluster person_42
+    Face->>Meta: Query photos linked to person_42
+    Meta-->>Face: Photo IDs (chronological)
+    Face-->>API: Results
+    API-->>U: All photos of that person
+
+    Note over U: User searches by place
+    U->>API: GET /search?q="Paris"
+    API->>Geo: Resolve "Paris" → bounding box (lat/lng)
+    Geo-->>API: Geo bounds
+    API->>Search: Geo query (within bounding box) + landmark detection labels
+    Search-->>API: Photos taken in Paris + photos with Eiffel Tower detected
+    API-->>U: Combined location results
+```
+
+---
+
+## Expanded Async Processing
+
+### Async Pipeline Details
+
+Google Photos relies heavily on async processing for all computationally expensive operations:
+
+**Upload Processing Pipeline (Pub/Sub → Cloud Tasks)**:
+1. Photo uploaded → immediate ACK to client
+2. Fan-out to parallel workers:
+   - Thumbnail generation (3 sizes) — ~200ms
+   - EXIF parsing + geo-reverse-coding — ~50ms
+   - ML classification (object/scene/OCR) — ~500ms
+   - Face detection + embedding — ~300ms
+   - Face cluster matching — ~200ms
+   - Duplicate detection (perceptual hash) — ~100ms
+3. Each worker independently updates metadata DB + search index
+4. Failures retry with exponential backoff (max 5 attempts)
+5. Dead-letter queue for persistent failures → manual investigation
+
+**Face Re-clustering (Periodic Batch)**:
+- As new photos arrive, face clusters may need merging/splitting
+- Nightly batch job: re-run DBSCAN on all embeddings per user
+- Merge clusters if centroid distance < threshold
+- Split clusters if intra-cluster variance exceeds limit
+- User-confirmed merges/splits are constraints in the algorithm
+
+**Storage Optimization (Background)**:
+- Deduplication: perceptual hash comparison, keep one copy + pointers
+- Quality tiering: after 60 days, move originals to cold storage (Nearline → Coldline)
+- "Storage saver" re-encoding: background HEIF conversion for users opting in
+- All async, invisible to user, reversible if user changes settings

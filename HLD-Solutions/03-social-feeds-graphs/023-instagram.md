@@ -133,6 +133,40 @@ GPU instances (ML):         ~5,000 (recommendations, content moderation)
 
 ## 4. Data Modeling
 
+### Entity-Relationship Diagram
+
+```mermaid
+erDiagram
+    USERS {
+        bigint user_id PK
+        varchar username
+        boolean is_private
+        boolean is_verified
+    }
+    FOLLOWS {
+        bigint follower_id PK
+        bigint followee_id PK
+        smallint status
+        boolean is_close_friend
+    }
+    POSTS {
+        bigint post_id PK
+        bigint user_id FK
+        smallint post_type
+        int like_count
+        timestamp created_at
+    }
+    POST_MEDIA {
+        bigint media_id PK
+        bigint post_id FK
+        smallint media_type
+        varchar media_url
+    }
+    USERS ||--o{ FOLLOWS : "follows"
+    USERS ||--o{ POSTS : "creates"
+    POSTS ||--o{ POST_MEDIA : "contains"
+```
+
 ### PostgreSQL - Users & Relationships (Sharded by user_id)
 
 ```sql
@@ -1381,6 +1415,128 @@ GDPR Compliance:
 - Reserved capacity for baseline load, on-demand for peaks
 - CDN cost: negotiate committed-use contracts at PB scale
 - Estimated infrastructure cost: ~$500M-$800M/year at scale
+
+---
+
+## Sequence Diagrams
+
+### 1. Photo Upload + CDN Distribution
+
+```mermaid
+sequenceDiagram
+    participant U as User
+    participant API as API Gateway
+    participant US as Upload Service
+    participant S3 as S3 (Origin)
+    participant IP as Image Processing (Lambda)
+    participant CDN as CloudFront CDN
+    participant PS as Post Service
+    participant K as Kafka
+    participant FO as Fanout Service
+
+    U->>API: POST /media/upload {image, caption, tags}
+    API->>US: initiateUpload(user_id, metadata)
+    US->>S3: putObject(original_image)
+    S3-->>US: upload_id, ETag
+
+    US->>K: publish MediaUploaded {upload_id, s3_key}
+    K->>IP: consume MediaUploaded
+
+    par Generate variants
+        IP->>IP: resize (150px, 320px, 640px, 1080px)
+        IP->>IP: apply filters if specified
+        IP->>S3: putObject(each variant)
+    and Content moderation
+        IP->>IP: run safety classifier
+    end
+
+    alt Content safe
+        IP->>CDN: invalidate/warm edge caches for variants
+        IP->>PS: finalizePost(post_id, media_urls, caption)
+        PS->>K: publish PostCreated
+        K->>FO: fanout to follower feeds
+        IP-->>U: 200 OK {post_id, media_url}
+    else Content flagged
+        IP-->>U: 422 Content Policy Violation
+    end
+```
+
+### 2. Explore Page Generation
+
+```mermaid
+sequenceDiagram
+    participant U as User
+    participant API as API Gateway
+    participant EX as Explore Service
+    participant RC as Redis Cache
+    participant CG as Candidate Generator
+    participant EM as Embedding Service (GPU)
+    participant RK as Ranking ML Model
+    participant CS as Cassandra
+
+    U->>API: GET /explore?cursor=xxx
+    API->>EX: getExplore(user_id, cursor)
+    EX->>RC: GET explore:{user_id}:{bucket}
+
+    alt Cache hit and fresh (<5min)
+        RC-->>EX: cached_posts[]
+    else Cache miss
+        EX->>CG: getCandidates(user_id, limit=1000)
+        Note over CG: Sources: trending, topic affinity, similar users, location
+        CG->>CS: fetch trending posts (engagement velocity)
+        CG->>EM: getUserEmbedding(user_id)
+        EM-->>CG: user_vector
+        CG->>EM: ANN search (top 500 similar content)
+        EM-->>CG: candidate_posts[]
+
+        CG-->>EX: 1000 candidates
+        EX->>RK: rank(candidates, user_interests, diversity_quota)
+        RK-->>EX: ranked_grid[]
+        EX->>RC: SET explore:{user_id}:{bucket} TTL=300
+    end
+
+    EX-->>API: explore_page[]
+    API-->>U: 200 OK {posts[], cursor}
+```
+
+### 3. Story View + Expiry
+
+```mermaid
+sequenceDiagram
+    participant U as Viewer
+    participant API as API Gateway
+    participant SS as Story Service
+    participant RC as Redis (Story Ring)
+    participant S3 as S3 + CDN
+    participant AS as Analytics Service
+    participant K as Kafka
+    participant TTL as TTL Expiry Worker
+
+    U->>API: GET /stories/feed
+    API->>SS: getStoryRing(user_id)
+    SS->>RC: SMEMBERS story_ring:{user_id}
+    RC-->>SS: active_stories[] (sorted by recency)
+
+    U->>API: GET /stories/{story_id}
+    API->>SS: viewStory(viewer_id, story_id)
+    SS->>RC: GET story:{story_id}
+
+    alt Story exists and not expired
+        RC-->>SS: story_metadata + CDN_url
+        SS->>RC: SADD story:{story_id}:viewers viewer_id
+        SS->>K: publish StoryViewed {story_id, viewer_id, timestamp}
+        K->>AS: increment view count
+        SS-->>API: 200 OK {media_url, viewers_count}
+    else Story expired
+        SS-->>API: 410 Gone
+    end
+
+    Note over TTL: Background TTL worker runs every minute
+    TTL->>RC: SCAN stories with created_at < now()-24h
+    TTL->>RC: DEL story:{expired_id}
+    TTL->>S3: move to archive/highlights if saved
+    TTL->>K: publish StoryExpired
+```
 
 ---
 

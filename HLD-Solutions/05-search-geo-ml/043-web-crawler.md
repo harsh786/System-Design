@@ -80,6 +80,45 @@ Dedup service:             50 nodes (in-memory fingerprint store)
 
 ## 5. Data Modeling
 
+### Entity-Relationship Diagram
+
+```mermaid
+erDiagram
+    URL_FRONTIER {
+        char url_hash PK
+        text url
+        varchar domain
+        smallint priority
+        varchar state
+        char discovered_from FK
+    }
+    CRAWLED_PAGES {
+        char url_hash PK
+        text url
+        varchar domain
+        char content_hash
+        bigint simhash
+        timestamp crawled_at
+    }
+    ROBOTS_CACHE {
+        varchar domain PK
+        int crawl_delay
+        jsonb disallow_rules
+        timestamp expires_at
+    }
+    DOMAIN_STATS {
+        varchar domain PK
+        bigint total_pages
+        bigint pages_crawled
+        float importance_score
+        float error_rate
+    }
+    URL_FRONTIER ||--o| CRAWLED_PAGES : "crawled into"
+    URL_FRONTIER }o--|| DOMAIN_STATS : "belongs to"
+    ROBOTS_CACHE ||--|| DOMAIN_STATS : "governs"
+    URL_FRONTIER }o--o| URL_FRONTIER : "discovered from"
+```
+
 ### URL Entry (Frontier)
 ```sql
 CREATE TABLE url_frontier (
@@ -1172,6 +1211,422 @@ Decision: Distributed with domain-based partitioning
 - Eliminates need for distributed locks on domain politeness
 - Consistent hashing for rebalancing
 ```
+
+---
+
+## 15. Sequence Diagrams
+
+### 15.1 URL Crawl Lifecycle
+
+```mermaid
+sequenceDiagram
+    participant Seed as Seed URLs
+    participant Frontier as URL Frontier
+    participant Sched as Scheduler
+    participant Worker as Crawler Worker
+    participant DNS as DNS Resolver (Cache)
+    participant Web as Target Website
+    participant Dedup as Deduplication Service
+    participant Store as Content Store (S3)
+    participant Index as Indexing Pipeline
+
+    Seed->>Frontier: Initial seed URLs (priority=HIGH)
+    loop Continuous Crawling
+        Sched->>Frontier: Pull next batch (respecting politeness)
+        Frontier-->>Sched: URLs grouped by domain (max 1 req/domain/sec)
+        Sched->>Worker: Assign URL batch
+        Worker->>DNS: Resolve hostname (cached)
+        DNS-->>Worker: IP address
+        Worker->>Web: GET /page (with robots.txt compliance)
+        Web-->>Worker: HTML response (200 OK)
+        Worker->>Dedup: Check content hash (SimHash)
+        alt New Content
+            Dedup-->>Worker: Not seen before
+            Worker->>Store: Store raw HTML + metadata
+            Worker->>Worker: Extract outlinks
+            Worker->>Frontier: Enqueue discovered URLs (with priority)
+            Worker->>Index: Send to indexing pipeline
+        else Duplicate
+            Dedup-->>Worker: Near-duplicate exists
+            Worker->>Worker: Skip, log duplicate
+        end
+    end
+```
+
+### 15.2 Politeness & robots.txt Enforcement
+
+```mermaid
+sequenceDiagram
+    participant Worker as Crawler Worker
+    participant RobotCache as Robots.txt Cache (Redis)
+    participant Web as example.com
+    participant PQueue as Politeness Queue
+    participant RateLimit as Rate Limiter
+
+    Worker->>RobotCache: GET robots rules for example.com
+    alt Cache miss or expired
+        RobotCache-->>Worker: Not cached
+        Worker->>Web: GET /robots.txt
+        Web-->>Worker: User-agent: * \n Disallow: /admin \n Crawl-delay: 2
+        Worker->>RobotCache: Cache rules (TTL=24h)
+    else Cached
+        RobotCache-->>Worker: {disallow: [/admin], crawl_delay: 2s}
+    end
+    Worker->>Worker: Check: is /products allowed? YES
+    Worker->>RateLimit: Can I crawl example.com now?
+    alt Rate limit OK
+        RateLimit-->>Worker: Proceed
+        Worker->>Web: GET /products
+        Web-->>Worker: 200 OK
+    else Must wait
+        RateLimit-->>Worker: Wait 1.5s (crawl-delay)
+        Worker->>PQueue: Re-enqueue with delay
+    end
+```
+
+### 15.3 Adaptive Re-crawl Scheduling
+
+```mermaid
+sequenceDiagram
+    participant Scheduler as Re-crawl Scheduler
+    participant History as Change History DB
+    participant Model as Freshness Model
+    participant Frontier as URL Frontier
+    participant Worker as Crawler Worker
+    participant Dedup as Content Differ
+
+    Scheduler->>History: Get crawl history for URL batch
+    History-->>Scheduler: [{url, last_crawl, change_count, avg_interval}]
+    Scheduler->>Model: Predict change probability for each URL
+    Model-->>Scheduler: [{url, P(changed)=0.85, priority=HIGH}, {url2, P=0.1, priority=LOW}]
+    Scheduler->>Frontier: Enqueue high-probability URLs first
+    Frontier->>Worker: Crawl URL
+    Worker->>Worker: Fetch page
+    Worker->>Dedup: Compare with last version (structural diff)
+    alt Content Changed
+        Dedup-->>Worker: Changed (SimHash distance > threshold)
+        Worker->>History: Update: change_count++, record timestamp
+        Worker->>Scheduler: Shorten re-crawl interval for this URL
+    else No Change
+        Dedup-->>Worker: Same content
+        Worker->>History: Update: no_change_count++
+        Worker->>Scheduler: Lengthen re-crawl interval (exponential backoff)
+    end
+```
+
+---
+
+## 16. Deep Dive: Crawling Algorithms
+
+### 16.1 URL Frontier Priority Queue
+
+**Multi-queue architecture:**
+```
+┌─────────────────────────────────────────────────────────────┐
+│                      URL FRONTIER                            │
+├─────────────────────────────────────────────────────────────┤
+│                                                             │
+│  FRONT QUEUES (Priority-based):                            │
+│  ┌──────────┐ ┌──────────┐ ┌──────────┐ ┌──────────┐     │
+│  │Priority 0│ │Priority 1│ │Priority 2│ │Priority 3│     │
+│  │(Critical)│ │ (High)   │ │(Medium)  │ │  (Low)   │     │
+│  │News sites│ │ Popular  │ │ Normal   │ │ Long-tail│     │
+│  │Fresh disc│ │ Changed  │ │ Re-crawl │ │ Archive  │     │
+│  └────┬─────┘ └────┬─────┘ └────┬─────┘ └────┬─────┘     │
+│       │             │            │             │            │
+│       └──────┬──────┴─────┬──────┴──────┬──────┘            │
+│              ▼            ▼             ▼                    │
+│  ┌─────────────────────────────────────────────────┐       │
+│  │           PRIORITY SELECTOR                      │       │
+│  │  Weighted random: P0=50%, P1=30%, P2=15%, P3=5% │       │
+│  └──────────────────────┬──────────────────────────┘       │
+│                         ▼                                    │
+│  BACK QUEUES (Politeness-based, one per domain):            │
+│  ┌──────────┐ ┌──────────┐ ┌──────────┐ ┌─────────┐      │
+│  │cnn.com   │ │wiki.org  │ │amazon.com│ │...10K+  │      │
+│  │ url1     │ │ url1     │ │ url1     │ │ domains │      │
+│  │ url2     │ │ url2     │ │ url2     │ │         │      │
+│  │ url3     │ │ url3     │ │          │ │         │      │
+│  └────┬─────┘ └────┬─────┘ └────┬─────┘ └────┬────┘      │
+│       │             │            │             │            │
+│  last_access:   last_access: last_access:                   │
+│  +1s (delay)    +5s (delay)  +2s (delay)                   │
+│                                                             │
+└─────────────────────────────────────────────────────────────┘
+```
+
+**Priority assignment:**
+```python
+def compute_priority(url, metadata):
+    score = 0
+
+    # PageRank-based importance
+    score += pagerank_bucket(url) * 40  # 0-40 points
+
+    # Freshness: how often does this page change?
+    change_rate = metadata.get('changes_per_day', 0)
+    score += min(change_rate * 10, 30)  # 0-30 points
+
+    # Discovery: newly found URLs get a boost
+    if metadata.get('first_seen_seconds_ago', 0) < 3600:
+        score += 20
+
+    # Depth penalty: deeper pages less important
+    depth = url.count('/') - 2
+    score -= depth * 3
+
+    # Map to priority bucket
+    if score > 70: return 0  # Critical
+    if score > 45: return 1  # High
+    if score > 20: return 2  # Medium
+    return 3                  # Low
+```
+
+---
+
+### 16.2 SimHash / MinHash for Deduplication
+
+**SimHash Step-by-Step Computation:**
+
+```
+Goal: Create a 64-bit fingerprint such that similar documents 
+      have similar fingerprints (small Hamming distance)
+
+Input document: "The quick brown fox jumps over the lazy dog"
+
+Step 1: Extract features (shingles/n-grams)
+  3-grams: ["The quick brown", "quick brown fox", "brown fox jumps", 
+            "fox jumps over", "jumps over the", "over the lazy", "the lazy dog"]
+
+Step 2: Hash each feature to 64-bit value
+  hash("The quick brown") = 1001...0110 (64 bits)
+  hash("quick brown fox") = 0110...1001
+  hash("brown fox jumps") = 1100...0011
+  ...
+
+Step 3: Initialize 64-dimensional vector V = [0, 0, 0, ..., 0]
+
+Step 4: For each feature hash:
+  - For each bit position i:
+    - If bit[i] = 1: V[i] += weight (usually 1)
+    - If bit[i] = 0: V[i] -= weight
+
+  After "The quick brown" (1001...0110):
+    V = [+1, -1, -1, +1, ..., +1, +1, -1]
+  
+  After "quick brown fox" (0110...1001):
+    V = [+1-1, -1+1, -1+1, +1-1, ..., +1-1, +1-1, -1+1]
+    V = [0, 0, 0, 0, ..., 0, 0, 0]  (simplified)
+  
+  ... accumulate all features
+
+Step 5: Final fingerprint: for each dimension i:
+  - If V[i] > 0: bit[i] = 1
+  - If V[i] ≤ 0: bit[i] = 0
+
+Result: SimHash = 1001011101...0110 (64 bits)
+```
+
+**Hamming distance threshold:**
+```python
+def is_near_duplicate(hash1, hash2, threshold=3):
+    """
+    Documents with Hamming distance ≤ 3 (out of 64 bits) are near-duplicates.
+    This means they share ~95% of their content.
+    """
+    xor = hash1 ^ hash2
+    hamming_distance = bin(xor).count('1')
+    return hamming_distance <= threshold
+
+# Efficient lookup: partition 64 bits into 4 blocks of 16 bits
+# Store in 4 hash tables. Near-duplicate must match in at least 1 block.
+# Reduces lookup from O(n) to O(n/65536) per table × 4 tables
+```
+
+**MinHash for Jaccard Similarity:**
+```python
+import hashlib
+
+def minhash_signature(document_shingles, num_hashes=128):
+    """
+    Create a MinHash signature that estimates Jaccard similarity.
+    P(minhash_A[i] == minhash_B[i]) = Jaccard(A, B)
+    """
+    signature = []
+
+    for i in range(num_hashes):
+        min_hash = float('inf')
+        for shingle in document_shingles:
+            # Different hash function per i (use seed)
+            h = hash_with_seed(shingle, seed=i)
+            min_hash = min(min_hash, h)
+        signature.append(min_hash)
+
+    return signature
+
+def estimate_jaccard(sig_a, sig_b):
+    """Estimate Jaccard similarity from MinHash signatures"""
+    matches = sum(1 for a, b in zip(sig_a, sig_b) if a == b)
+    return matches / len(sig_a)
+
+# Jaccard > 0.8 → near-duplicate (80% overlap in content shingles)
+```
+
+---
+
+### 16.3 Consistent Hashing for URL Distribution
+
+**How to distribute URLs across crawler nodes:**
+```
+Problem: 500 crawler workers, billions of URLs
+- Same domain should go to same worker (politeness)
+- Even load distribution
+- Graceful handling when workers join/leave
+
+Solution: Hash ring with domain-based assignment
+
+┌────────────────────────────────────────┐
+│            Hash Ring (0 to 2^32)        │
+│                                        │
+│           Worker A (3 vnodes)          │
+│    ●─────────●                         │
+│   ╱           ╲        Worker B        │
+│  ●             ●───────●              │
+│  │              │       │              │
+│  │   Worker C   │       │              │
+│  ●───●───●      │       ●              │
+│   ╲       ╲     │      ╱              │
+│    ●       ●────●─────●               │
+│     ╲                 ╱                │
+│      ●───────────────●                 │
+│                                        │
+└────────────────────────────────────────┘
+
+hash("cnn.com") → lands between Worker A's vnodes → assigned to A
+hash("bbc.co.uk") → lands between Worker C's vnodes → assigned to C
+```
+
+```python
+import hashlib
+from sortedcontainers import SortedList
+
+class ConsistentHashRing:
+    def __init__(self, virtual_nodes=150):
+        self.ring = SortedList()  # sorted positions
+        self.node_map = {}  # position → worker_id
+        self.vnodes = virtual_nodes
+
+    def add_worker(self, worker_id):
+        for i in range(self.vnodes):
+            key = f"{worker_id}:vnode{i}"
+            position = self._hash(key)
+            self.ring.add(position)
+            self.node_map[position] = worker_id
+
+    def remove_worker(self, worker_id):
+        for i in range(self.vnodes):
+            key = f"{worker_id}:vnode{i}"
+            position = self._hash(key)
+            self.ring.remove(position)
+            del self.node_map[position]
+
+    def get_worker(self, domain):
+        """Which worker handles this domain?"""
+        position = self._hash(domain)
+        # Find first node position >= domain's position
+        idx = self.ring.bisect_left(position)
+        if idx >= len(self.ring):
+            idx = 0  # Wrap around
+        return self.node_map[self.ring[idx]]
+
+    def _hash(self, key):
+        return int(hashlib.md5(key.encode()).hexdigest(), 16) % (2**32)
+```
+
+**Rebalancing when nodes join/leave:**
+- When Worker X dies: its domains automatically map to the next worker on the ring
+- Only ~1/N of total domains need reassignment (not all)
+- Virtual nodes ensure even distribution (150 vnodes per worker → <10% std deviation in load)
+- Domain-based hashing ensures politeness: same domain always hits same worker
+
+---
+
+## 17. Caching Strategy
+
+### 17.1 Multi-Level Cache Architecture
+
+| Layer | What's Cached | TTL | Size |
+|-------|--------------|-----|------|
+| DNS Cache | hostname → IP | 1 hour | 10M entries |
+| robots.txt Cache | domain → rules | 24 hours | 500K entries |
+| Content Hash Cache | URL → SimHash | Permanent | Bloom filter (10GB) |
+| Crawl State Cache | URL → {last_crawl, etag, status} | Permanent | 50GB Redis cluster |
+| Rendered DOM Cache | JS-heavy pages → rendered HTML | 1 hour | 100GB |
+
+### 17.2 DNS Caching (Critical for Performance)
+
+```python
+# Without DNS cache: 50-200ms per resolution × millions of fetches = bottleneck
+# With local DNS cache: <1ms for repeat domains
+
+class DNSCache:
+    def __init__(self):
+        self.cache = {}  # domain → (ip, expiry)
+        self.negative_cache = {}  # domain → expiry (NXDOMAIN)
+
+    def resolve(self, domain):
+        if domain in self.cache:
+            ip, expiry = self.cache[domain]
+            if time.time() < expiry:
+                return ip
+
+        ip = dns.resolve(domain)
+        self.cache[domain] = (ip, time.time() + 3600)
+        return ip
+```
+
+---
+
+## 18. Infrastructure Components
+
+### 18.1 Deployment Architecture
+
+```
+┌─────────────────────────────────────────────────────────────────┐
+│                    Crawler Infrastructure                         │
+├─────────────────────────────────────────────────────────────────┤
+│                                                                   │
+│  Control Plane:                                                   │
+│  ┌─────────────┐ ┌──────────────┐ ┌─────────────────────┐      │
+│  │ Scheduler   │ │ Frontier DB  │ │ Monitoring (Grafana) │      │
+│  │ (3 replicas)│ │ (Redis Cluster│ │ - Pages/sec          │      │
+│  │             │ │  64 shards)  │ │ - Error rates         │      │
+│  └─────────────┘ └──────────────┘ │ - Queue depths        │      │
+│                                    └─────────────────────┘      │
+│  Data Plane (500 workers across 5 regions):                      │
+│  ┌──────────────────────────────────────────────────────────┐   │
+│  │ Worker Pod (Kubernetes):                                   │   │
+│  │  - Fetcher (async HTTP client, 100 concurrent connections)│   │
+│  │  - Parser (HTML → links + text extraction)                │   │
+│  │  - Dedup checker (SimHash against Bloom filter)           │   │
+│  │  - Link extractor → enqueue to Frontier                   │   │
+│  └──────────────────────────────────────────────────────────┘   │
+│                                                                   │
+│  Storage:                                                         │
+│  ┌─────────────┐ ┌──────────────┐ ┌─────────────────────┐      │
+│  │ S3 (raw     │ │ Kafka (event │ │ PostgreSQL (crawl   │      │
+│  │  HTML)      │ │  bus)        │ │  metadata, history) │      │
+│  │ 50TB/month  │ │ 30 partitions│ │  10TB               │      │
+│  └─────────────┘ └──────────────┘ └─────────────────────┘      │
+└─────────────────────────────────────────────────────────────────┘
+```
+
+### 18.2 Failure Recovery
+
+- **Worker crash:** Heartbeat timeout (30s) → reassign domains to other workers via consistent hash ring
+- **Frontier Redis failure:** Redis Cluster with 3 replicas per shard; failover in <10s
+- **S3 write failure:** Retry with exponential backoff; buffer locally up to 1GB
+- **Kafka lag:** Back-pressure mechanism reduces crawl rate; alert at >5 min lag
 
 ---
 

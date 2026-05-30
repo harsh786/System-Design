@@ -81,6 +81,47 @@
 
 ## 4. Data Modeling
 
+### Entity-Relationship Diagram
+
+```mermaid
+erDiagram
+    NOTIFICATION_PREFERENCES {
+        uuid user_id PK
+        varchar channel PK
+        varchar category PK
+        boolean enabled
+        varchar frequency
+    }
+    NOTIFICATION_TEMPLATES {
+        uuid template_id PK
+        varchar name
+        varchar category
+        varchar channel
+        text body_template
+        varchar status
+    }
+    NOTIFICATION_LOG {
+        uuid user_id PK
+        date day_bucket PK
+        timeuuid notification_id PK
+        text category
+        text channel
+        text status
+    }
+    NOTIFICATION_EVENTS {
+        uuid event_id PK
+        uuid notification_id FK
+        uuid user_id FK
+        enum event_type
+        string channel
+        datetime timestamp
+    }
+
+    NOTIFICATION_PREFERENCES ||--o{ NOTIFICATION_LOG : "governs"
+    NOTIFICATION_TEMPLATES ||--o{ NOTIFICATION_LOG : "renders"
+    NOTIFICATION_LOG ||--o{ NOTIFICATION_EVENTS : "emits"
+```
+
 ### 4.1 Database Selection
 
 | Workload | Database | Justification |
@@ -1096,3 +1137,158 @@ Total e2e: 1.2 seconds (push), 2.1 seconds (email)
 | TCPA | Explicit opt-in for SMS; Time restrictions (no SMS 9pm-8am local) |
 | Apple/Google policies | Clear purpose for push permission; No silent push for ads |
 | Data minimization | Don't store notification body long-term; Purge PII after retention period |
+
+---
+
+## Sequence Diagrams
+
+### 1. Push Notification Delivery
+
+```mermaid
+sequenceDiagram
+    participant Src as Source Service
+    participant Q as Kafka (notifications topic)
+    participant NS as Notification Service
+    participant PS as Preference Service
+    participant Cache as Redis
+    participant TL as Template Service
+    participant PG as Push Gateway
+    participant FCM as FCM (Android)
+    participant APNs as APNs (iOS)
+    participant D as Device
+
+    Src->>Q: Publish notification event<br/>{user_id, type: "new_message", payload}
+    Q->>NS: Consume event
+    NS->>PS: Get user preferences (cached)
+    PS->>Cache: Lookup notification_prefs:{user_id}
+    Cache-->>PS: {push: enabled, quiet_hours: false, channels: {message: push+badge}}
+    PS-->>NS: Preferences
+
+    NS->>NS: Apply rate limiting (max 30 push/hour)
+    NS->>NS: Deduplicate (same event within 5s window)
+    NS->>TL: Render notification {template: "new_message", locale: "en", vars}
+    TL-->>NS: {title: "New message from Alice", body: "Hey, are you free?"}
+
+    NS->>Cache: Get device tokens for user
+    Cache-->>NS: [{platform: ios, token: xxx}, {platform: android, token: yyy}]
+
+    par iOS delivery
+        NS->>PG: Send to APNs
+        PG->>APNs: POST /3/device/{token} (HTTP/2)
+        APNs-->>PG: 200 OK
+        APNs->>D: Push notification
+    and Android delivery
+        NS->>PG: Send to FCM
+        PG->>FCM: POST /v1/projects/{id}/messages:send
+        FCM-->>PG: 200 OK {message_id}
+        FCM->>D: Push notification
+    end
+
+    alt Token expired/invalid
+        APNs-->>PG: 410 Gone (token invalid)
+        PG->>NS: Mark token invalid
+        NS->>Cache: Remove stale device token
+    end
+```
+
+### 2. Email/SMS Fallback Chain
+
+```mermaid
+sequenceDiagram
+    participant NS as Notification Service
+    participant Q as Kafka
+    participant DW as Delay Worker
+    participant Cache as Redis
+    participant ES as Email Service (SES)
+    participant SMS as SMS Service (Twilio)
+    participant U as User
+
+    NS->>Q: Publish notification {user_id, priority: high, channels: [push, email, sms]}
+    
+    Note over NS: Push sent first (previous diagram)
+    NS->>Cache: SET notification:{id}:status = push_sent, TTL=300s
+
+    Q->>DW: Schedule fallback check (delay: 5 minutes)
+    
+    Note over DW: Wait 5 minutes...
+    DW->>Cache: GET notification:{id}:status
+    
+    alt Push was read (app opened)
+        Cache-->>DW: status = read
+        Note over DW: No fallback needed, done
+    else Push not acknowledged
+        Cache-->>DW: status = push_sent (not read)
+        DW->>ES: Send email fallback
+        ES->>ES: Render HTML template
+        ES->>U: Deliver email via SES
+        DW->>Cache: SET status = email_sent
+
+        DW->>Q: Schedule SMS check (delay: 15 minutes)
+        
+        Note over DW: Wait 15 more minutes...
+        DW->>Cache: GET notification:{id}:status
+        
+        alt Still not read
+            DW->>SMS: Send SMS (critical notifications only)
+            SMS->>U: Deliver SMS via Twilio
+            DW->>Cache: SET status = sms_sent
+        else Read via email
+            Note over DW: User engaged, stop escalation
+        end
+    end
+```
+
+### 3. Preference-Based Routing
+
+```mermaid
+sequenceDiagram
+    participant Src as Source Service
+    participant NS as Notification Service
+    participant PR as Preference Router
+    participant Cache as Redis
+    participant DB as Postgres (Preferences)
+    participant QH as Quiet Hours Checker
+    participant AG as Aggregation Engine
+    participant Ch as Channel Dispatchers
+
+    Src->>NS: Notification event {user_id, type: "comment_reply", urgency: normal}
+    NS->>PR: Route notification
+
+    PR->>Cache: GET prefs:{user_id}:{type}
+    alt Cache hit
+        Cache-->>PR: Preferences loaded
+    else Cache miss
+        PR->>DB: SELECT * FROM notification_preferences WHERE user_id AND type
+        DB-->>PR: {channel: [in_app, email], frequency: batch_hourly, quiet_hours: 22:00-08:00}
+        PR->>Cache: SET with TTL 1h
+    end
+
+    PR->>QH: Check quiet hours (user timezone: America/New_York)
+    
+    alt Within quiet hours
+        QH-->>PR: QUIET (suppress non-critical)
+        alt Urgency = critical
+            PR->>Ch: Deliver anyway (emergency override)
+        else Normal urgency
+            PR->>AG: Queue for delivery after quiet hours
+            AG->>AG: Batch with other pending notifications
+        end
+    else Outside quiet hours
+        QH-->>PR: ACTIVE
+        PR->>AG: Check aggregation rules
+
+        alt Batch mode (hourly digest)
+            AG->>Cache: LPUSH digest:{user_id} notification
+            AG->>AG: Deliver at next batch window
+            Note over AG: Hourly cron compiles digest<br/>email with all batched notifications
+        else Immediate mode
+            AG->>Ch: Dispatch to configured channels
+            par
+                Ch->>Ch: Send in-app (WebSocket)
+            and
+                Ch->>Ch: Send email
+            end
+        end
+    end
+```
+

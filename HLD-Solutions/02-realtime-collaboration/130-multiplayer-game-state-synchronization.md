@@ -86,6 +86,46 @@
 
 ## 4. Data Model / Schema Design
 
+### Entity-Relationship Diagram
+
+```mermaid
+erDiagram
+    GAME_STATE {
+        int tick PK
+        float timestamp_ms
+    }
+    ENTITY_STATE {
+        int entity_id PK
+        enum entity_type
+        int owner_id FK
+        vector3 position
+        vector3 velocity
+        int health
+    }
+    PLAYER_INPUT {
+        int sequence_number PK
+        int tick FK
+        vector2 view_angles
+        bool fire
+        float client_timestamp_ms
+    }
+    SNAPSHOT {
+        int tick PK
+        int ack_sequence
+    }
+    ENTITY_DELTA {
+        int entity_id PK
+        int change_mask
+        vector3 position
+        int health
+    }
+
+    GAME_STATE ||--o{ ENTITY_STATE : "contains"
+    GAME_STATE ||--o{ PLAYER_INPUT : "processes"
+    GAME_STATE ||--o{ SNAPSHOT : "generates"
+    SNAPSHOT ||--o{ ENTITY_DELTA : "includes"
+```
+
 ### Game State
 ```python
 @dataclass
@@ -1046,3 +1086,162 @@ Total budget: 16.67ms
 - **Bandwidth per player**: should stay < 100 Kbps
 - **Interpolation buffer health**: % of frames with valid interpolation states
 - **Lag compensation rewind**: average ticks rewound per hit
+
+---
+
+## Sequence Diagrams
+
+### 1. Client Prediction + Server Reconciliation
+
+```mermaid
+sequenceDiagram
+    participant C as Client (Player)
+    participant Net as Network Layer (UDP)
+    participant GS as Game Server (Authoritative)
+    participant Sim as Server Simulation
+    participant OC as Other Clients
+
+    Note over C: Client runs at 60fps, sends input at 20Hz (tick rate)
+
+    C->>C: Player presses "move forward" (input #42)
+    C->>C: Client-side prediction: apply input locally<br/>Store in prediction buffer: {input#42, predicted_state}
+    C->>Net: Send input {seq:42, tick:1500, actions: [move_forward, jump]}
+    
+    Note over C: Client continues predicting (inputs #43, #44...)<br/>No waiting for server response
+
+    Net->>GS: Receive input (may arrive out of order)
+    GS->>Sim: Queue input for next server tick
+    
+    loop Server tick (64Hz / every 15.6ms)
+        Sim->>Sim: Process all queued inputs for this tick
+        Sim->>Sim: Run physics simulation
+        Sim->>Sim: Validate movements (anti-cheat: speed, collision)
+        
+        alt Input invalid (speed hack detected)
+            Sim->>Sim: Reject input, use last valid state
+        end
+    end
+
+    GS->>Net: Broadcast world state snapshot<br/>{tick:1500, player_states: [...], last_processed_input: {player1: 42}}
+    Net->>C: Receive authoritative state
+
+    C->>C: Reconciliation:<br/>1. Find last_processed_input (42) in prediction buffer<br/>2. Compare server state vs predicted state for input #42
+    
+    alt States match (prediction correct)
+        C->>C: Discard processed predictions (≤ #42)<br/>Keep pending predictions (#43, #44)
+        Note over C: No visual correction needed
+    else States diverge (prediction wrong)
+        C->>C: Snap to server state<br/>Re-apply pending inputs (#43, #44) on top of server state<br/>Interpolate visual correction over 100ms (avoid jitter)
+    end
+
+    GS->>OC: Send state for entity interpolation
+    OC->>OC: Interpolate other player positions<br/>(render 100ms in the past for smooth movement)
+```
+
+### 2. State Snapshot + Delta Compression
+
+```mermaid
+sequenceDiagram
+    participant GS as Game Server
+    participant SM as State Manager
+    participant Comp as Delta Compressor
+    participant Net as Network Layer (UDP)
+    participant C1 as Client 1 (Good connection)
+    participant C2 as Client 2 (High latency)
+
+    loop Every server tick (64Hz)
+        GS->>SM: Capture world state snapshot {tick: N}
+        SM->>SM: Store snapshot in circular buffer (last 64 ticks = 1 second)
+    end
+
+    SM->>Comp: Generate deltas for each client
+    
+    par Client 1 (last ACK'd tick: N-2)
+        Comp->>Comp: Diff snapshot[N] vs snapshot[N-2]<br/>Only changed entities + changed properties
+        Comp->>Comp: Bit-pack delta: entity_id(16bit) + changed_mask(8bit) + values
+        Comp->>Net: Send delta packet {base_tick: N-2, current_tick: N, delta: compressed}
+        Net->>C1: UDP packet (small, ~200 bytes for 10 entities)
+        C1->>C1: Apply delta to local state[N-2] → reconstruct state[N]
+        C1-->>Net: ACK {received_tick: N}
+    and Client 2 (last ACK'd tick: N-10, packet loss)
+        Comp->>Comp: Diff snapshot[N] vs snapshot[N-10] (larger delta)
+        
+        alt Delta too large (> MTU 1200 bytes)
+            Comp->>Comp: Prioritize by relevance:<br/>1. Player's own state (always full)<br/>2. Nearby entities (full delta)<br/>3. Far entities (position only, lower precision)
+            Comp->>Net: Send prioritized partial delta
+        else Fits in single packet
+            Comp->>Net: Send full delta
+        end
+        
+        Net->>C2: UDP packet
+        C2-->>Net: ACK {received_tick: N}
+    end
+
+    alt Client hasn't ACK'd for 1 second (extreme packet loss)
+        SM->>Comp: Fall back to full snapshot (keyframe)
+        Comp->>Net: Send full state (fragmented across multiple packets)
+        Net->>C2: Full snapshot (reliable delivery via redundancy)
+    end
+
+    Note over Comp: Compression stats:<br/>Full snapshot: ~2KB (100 entities)<br/>Typical delta: ~200 bytes (10% changed)<br/>Bandwidth per client: ~50 KB/s at 64Hz
+```
+
+### Caching Strategy
+
+| Layer | Store | Content | TTL | Eviction |
+|-------|-------|---------|-----|----------|
+| Snapshot Buffer | In-memory (ring buffer) | Last 64 world state snapshots | ~1 second | Circular overwrite |
+| Player Session | Redis | Player auth, matchmaking state, current server | Session duration | Cleanup on disconnect |
+| Matchmaking Queue | Redis Sorted Set | Players waiting, scored by MMR + wait time | 60s | Pop on match or timeout |
+| Leaderboard | Redis Sorted Set | Player rankings (real-time) | Indefinite | Update on match result |
+| Game Config | Redis | Maps, weapon stats, balance values | Until deploy | Invalidate on config push |
+| Replay Segments | Redis + S3 | Recent match state (hot) + archived (cold) | Hot: 1h, Cold: 30d | Move to S3 after match |
+| Anti-cheat State | In-memory | Player velocity history, action frequency | Match duration | Clear on match end |
+
+**Cache Patterns:**
+- **Ring buffer for snapshots**: Zero-allocation, predictable memory usage (64 × snapshot_size)
+- **Write-through for session state**: Redis updated on every meaningful state change
+- **Lazy load for game assets**: Stream assets to clients on first request, cache locally
+- **Predictive preload**: Load next map/zone data based on player position + velocity
+
+### Infrastructure Components
+
+| Component | Technology | Configuration | Purpose |
+|-----------|-----------|---------------|---------|
+| Game Server | Custom (C++ / Rust) | Dedicated per match, 64Hz tick rate | Authoritative simulation |
+| Load Balancer | L4 (UDP-aware) | Region-based routing | Route players to nearest server |
+| Matchmaking Service | Go + Redis | MMR-based, skill brackets | Form balanced matches |
+| WebSocket Gateway | Node.js | For lobby, chat, social features | Non-gameplay real-time |
+| CDN | CloudFront | Game assets, patches, replays | Asset delivery |
+| Fleet Manager | Kubernetes + Agones | Auto-scale game server pods | Server lifecycle management |
+| Relay/TURN | Custom UDP relay | For players behind strict NAT | NAT traversal fallback |
+
+**Game Server Details:**
+- **Dedicated servers**: One process per match (no shared state between matches)
+- **Tick rate**: 64Hz (competitive FPS), 20Hz (battle royale with 100 players)
+- **Connection**: UDP with custom reliability layer (selective ACK, no head-of-line blocking)
+- **Anti-DDoS**: Anycast IP, rate limiting, player IP hidden behind relay
+
+### Async Processing Architecture
+
+| Pipeline Stage | Technology | Input | Output | SLA |
+|---------------|-----------|-------|--------|-----|
+| Match Result Processing | Kafka consumers | Match end event | Updated MMR, stats, rewards | < 5s |
+| Replay Recording | Kafka → S3 | State snapshots (sampled at 10Hz) | Replay file (.dem) | Real-time record, async compress |
+| Anti-cheat Analysis | ML Pipeline (batch) | Player telemetry + actions | Ban/flag decisions | < 1 hour |
+| Analytics Ingestion | Kafka → ClickHouse | Game events (kills, deaths, items) | Queryable analytics | < 30s |
+| Leaderboard Update | Kafka → Redis | Match results | Global/regional rankings | < 2s |
+
+**Kafka Topics:**
+- `game.inputs` — raw player inputs (debugging, replay)
+- `game.events` — kills, deaths, objectives, items (analytics)
+- `game.match-results` — end-of-match summary (MMR, rewards)
+- `game.telemetry` — server performance, tick time, bandwidth
+- `game.anticheat` — suspicious activity reports
+
+**Server Scaling:**
+- Fleet auto-scales based on matchmaking queue depth
+- Peak: spin up 1000+ game server pods in < 2 minutes (Agones + pre-warmed pools)
+- Off-peak: scale to zero (no idle servers consuming resources)
+- Regional failover: redirect players to next-nearest region if primary overloaded
+

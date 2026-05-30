@@ -55,6 +55,94 @@
 
 ## 4. Data Modeling
 
+## 4. Data Modeling
+
+### Entity-Relationship Diagram
+
+```mermaid
+erDiagram
+    fact_journal_entries }o--|| dim_account : "posted to"
+    fact_journal_entries }o--|| dim_date : "on date"
+    fact_journal_entries }o--|| dim_entity : "for entity"
+    fact_journal_entries }o--|| dim_cost_center : "charged to"
+    fact_journal_entries }o--|| dim_currency : "in currency"
+    fact_account_balances }o--|| dim_account : "for account"
+    fact_account_balances }o--|| dim_period : "in period"
+    fact_account_balances }o--|| dim_entity : "for entity"
+    fact_cash_flows }o--|| dim_entity : "for entity"
+    data_lineage }o--o{ fact_journal_entries : "traces"
+
+    dim_account {
+        SERIAL account_key PK
+        VARCHAR account_id
+        VARCHAR account_name
+        VARCHAR account_type
+        VARCHAR fs_line_item
+        BOOLEAN is_current
+    }
+    dim_entity {
+        SERIAL entity_key PK
+        VARCHAR entity_id
+        VARCHAR entity_name
+        VARCHAR entity_type
+        VARCHAR reporting_currency
+    }
+    dim_date {
+        INT date_key PK
+        DATE full_date
+        INT fiscal_year
+        BOOLEAN is_month_end
+    }
+    dim_period {
+        INT period_key PK
+        INT year
+        INT month
+        BOOLEAN is_closed
+    }
+    dim_cost_center {
+        SERIAL cost_center_key PK
+        VARCHAR cost_center_id
+        VARCHAR department
+        VARCHAR division
+    }
+    dim_currency {
+        SERIAL currency_key PK
+        VARCHAR currency_code
+        VARCHAR currency_name
+    }
+    fact_journal_entries {
+        BIGINT journal_entry_id PK
+        INT account_key FK
+        INT entity_key FK
+        INT posting_date_key FK
+        DECIMAL debit_amount
+        DECIMAL credit_amount
+        VARCHAR source_system
+    }
+    fact_account_balances {
+        BIGSERIAL balance_id PK
+        INT account_key FK
+        INT period_key FK
+        DECIMAL opening_balance
+        DECIMAL closing_balance
+        DECIMAL budget_amount
+    }
+    fact_cash_flows {
+        BIGSERIAL cash_flow_id PK
+        INT entity_key FK
+        VARCHAR cash_flow_category
+        DECIMAL inflow_amount
+        DECIMAL outflow_amount
+    }
+    data_lineage {
+        UUID lineage_id PK
+        UUID batch_id
+        VARCHAR source_system
+        VARCHAR target_table
+        VARCHAR target_record_id
+    }
+```
+
 ### Dimensional Model (Star Schema)
 
 ```sql
@@ -913,3 +1001,137 @@ alerts:
 | Star schema | Kimball dimensional | Data vault | Finance team familiarity, simpler queries |
 | Report output | Templated (Jinja + SQL) | XBRL generators | Flexibility for custom reports |
 | SCD handling | Type 2 (full history) | Type 1 (overwrite) | Audit trail required for financial data |
+
+---
+
+## 12. Sequence Diagrams
+
+### Diagram 1: ETL Pipeline Run
+
+```mermaid
+sequenceDiagram
+    participant Airflow as Airflow Scheduler
+    participant Extract as Extractors
+    participant Sources as Source Systems (Ledger, Payments, etc.)
+    participant S3 as Data Lake (S3)
+    participant dbt as dbt Transform
+    participant DW as Data Warehouse (Redshift/Snowflake)
+    participant DQ as Data Quality (Great Expectations)
+    participant Alert as Alert System
+
+    Airflow->>Extract: Trigger daily ETL (date=2024-01-15, run_id=RUN_789)
+    
+    par Extract from multiple sources
+        Extract->>Sources: Pull ledger entries (date=Jan 15, incremental CDC)
+        Sources-->>S3: Raw: s3://lake/raw/ledger/2024-01-15/ (parquet)
+        Extract->>Sources: Pull payment transactions (date=Jan 15)
+        Sources-->>S3: Raw: s3://lake/raw/payments/2024-01-15/
+        Extract->>Sources: Pull customer master (full snapshot)
+        Sources-->>S3: Raw: s3://lake/raw/customers/2024-01-15/
+    end
+    
+    Airflow->>DQ: Run source quality checks
+    DQ->>S3: Validate: row counts, null rates, schema drift
+    DQ-->>Airflow: PASSED (row_count within 10% of yesterday, no schema changes)
+    
+    Airflow->>dbt: Run transformations (staging → intermediate → mart)
+    dbt->>DW: CREATE staging models (clean, typed, deduped)
+    dbt->>DW: CREATE intermediate (joins, business logic, SCD Type 2)
+    dbt->>DW: CREATE mart tables (fact_transactions, dim_customer, dim_time)
+    dbt-->>Airflow: Transform complete (42 models, 0 failures)
+    
+    Airflow->>DQ: Run mart quality checks
+    DQ->>DW: Validate: referential integrity, balance reconciliation
+    DQ->>DQ: Check: SUM(mart.revenue) == SUM(source.payments) ± $0.01
+    
+    alt Quality checks pass
+        DQ-->>Airflow: ALL PASSED
+        Airflow->>DW: SWAP staging mart → production mart (atomic)
+        Airflow->>Airflow: Mark run_id=RUN_789 as SUCCESS
+    else Quality checks fail
+        DQ-->>Airflow: FAILED (revenue mismatch: $5,231 discrepancy)
+        Airflow->>Alert: P1 Alert: ETL quality failure, reports NOT updated
+        Airflow->>Airflow: Mark RUN_789 as FAILED, keep previous mart live
+    end
+
+    Note over Airflow,Alert: Financial ETL is NEVER "just load it" — quality gates prevent<br/>publishing incorrect numbers. Failed ETL = stale (safe) not wrong (dangerous).
+```
+
+### Diagram 2: Report Generation with Caching
+
+```mermaid
+sequenceDiagram
+    participant User as Finance User
+    participant API as Reporting API
+    participant Cache as Report Cache (Redis)
+    participant Query as Query Engine
+    participant DW as Data Warehouse
+    participant PDF as PDF Generator
+    participant S3 as Report Archive (S3)
+
+    User->>API: GET /reports/monthly-P&L?period=2024-01&format=pdf
+    API->>Cache: CHECK report_cache:PnL:2024-01:v3 (v3 = latest ETL version)
+    
+    alt Cache hit (report already generated for this ETL version)
+        Cache-->>API: Cached PDF URL (s3://reports/PnL_2024-01_v3.pdf)
+        API-->>User: 200 (url=signed_s3_url, cached=true, data_as_of=2024-01-16T06:00Z)
+    else Cache miss (first request or ETL updated)
+        Cache-->>API: MISS
+        API->>Query: Execute P&L query (period=Jan 2024)
+        Query->>DW: SELECT revenue, COGS, opex, ... FROM fact_transactions JOIN dim_time...
+        DW-->>Query: Result set (500 rows, 12 columns)
+        Query-->>API: Structured data (revenue=5.2M, COGS=2.1M, gross_profit=3.1M)
+        
+        API->>PDF: Render report template (Jinja + data)
+        PDF-->>API: PDF generated (32 pages)
+        API->>S3: Store PDF (s3://reports/PnL_2024-01_v3.pdf)
+        API->>Cache: SET report_cache:PnL:2024-01:v3 = s3_url (TTL=until next ETL)
+        API-->>User: 200 (url=signed_s3_url, generated=true, data_as_of=2024-01-16T06:00Z)
+    end
+
+    Note over User,S3: Cache key includes ETL version → auto-invalidates when new data lands.<br/>Report always shows data_as_of timestamp so user knows freshness.
+```
+
+### Infrastructure Components
+
+```
+┌─────────────────────────────────────────────────────────────┐
+│ FINANCIAL REPORTING PIPELINE INFRASTRUCTURE                   │
+├─────────────────────────────────────────────────────────────┤
+│                                                              │
+│ ORCHESTRATION:                                               │
+│ ├── Apache Airflow (MWAA): DAG scheduling, dependency mgmt  │
+│ ├── dbt Cloud/Core: SQL transformations, lineage, testing    │
+│ └── Retry policy: 3 attempts with exponential backoff        │
+│                                                              │
+│ DATA LAKE:                                                   │
+│ ├── S3: Raw zone (immutable source copies)                   │
+│ ├── S3: Staging zone (cleaned, partitioned by date)          │
+│ ├── Format: Parquet (columnar, compressed)                   │
+│ └── Retention: Raw=7 years (regulatory), Staging=2 years     │
+│                                                              │
+│ DATA WAREHOUSE:                                              │
+│ ├── Snowflake/Redshift: Star schema (Kimball dimensional)    │
+│ ├── Fact tables: fact_transactions, fact_settlements          │
+│ ├── Dimension tables: dim_customer, dim_merchant, dim_time   │
+│ └── Materialized views for common aggregations               │
+│                                                              │
+│ CACHING & SERVING:                                           │
+│ ├── Redis: Query result cache (keyed by query_hash + ETL ver)│
+│ ├── S3: Generated report archive (PDF, XLSX, XBRL)          │
+│ └── CDN: Frequently accessed dashboards                      │
+│                                                              │
+│ DATA QUALITY:                                                │
+│ ├── Great Expectations: Schema, completeness, accuracy tests │
+│ ├── dbt tests: unique, not_null, relationships, custom SQL   │
+│ ├── Reconciliation: Cross-check totals against source systems│
+│ └── Alert: PagerDuty for failed quality gates                │
+│                                                              │
+│ COMPLIANCE:                                                   │
+│ ├── Audit trail: Every report generation logged              │
+│ ├── Access control: Row-level security (user sees own BU)    │
+│ ├── SOX compliance: Change management on report definitions  │
+│ └── Immutable archive: Reports once published cannot change  │
+│                                                              │
+└─────────────────────────────────────────────────────────────┘
+```

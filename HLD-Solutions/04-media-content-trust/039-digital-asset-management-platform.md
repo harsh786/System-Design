@@ -55,6 +55,71 @@
 
 ## 3. Data Modeling
 
+### Entity-Relationship Diagram
+
+```mermaid
+erDiagram
+    TENANTS {
+        uuid tenant_id PK
+        varchar name
+        varchar plan
+        bigint storage_quota_bytes
+    }
+    FOLDERS {
+        uuid folder_id PK
+        uuid tenant_id FK
+        uuid parent_id FK
+        varchar name
+        text path
+    }
+    ASSETS {
+        uuid asset_id PK
+        uuid tenant_id FK
+        uuid folder_id FK
+        varchar name
+        varchar asset_type
+        varchar status
+    }
+    ASSET_VERSIONS {
+        uuid version_id PK
+        uuid asset_id FK
+        int version_number
+        varchar branch
+        bigint file_size_bytes
+        varchar checksum_sha256
+    }
+    TAXONOMIES {
+        uuid taxonomy_id PK
+        uuid tenant_id FK
+        varchar name
+        varchar taxonomy_type
+    }
+    TAXONOMY_TERMS {
+        uuid term_id PK
+        uuid taxonomy_id FK
+        uuid parent_term_id FK
+        varchar label
+        text path
+    }
+    ASSET_TERMS {
+        uuid asset_id PK
+        uuid term_id PK
+        decimal confidence
+        varchar source
+    }
+
+    TENANTS ||--o{ FOLDERS : contains
+    TENANTS ||--o{ ASSETS : owns
+    FOLDERS ||--o{ ASSETS : holds
+    FOLDERS ||--o{ FOLDERS : "nested in"
+    ASSETS ||--o{ ASSET_VERSIONS : "versioned as"
+    TENANTS ||--o{ TAXONOMIES : defines
+    TAXONOMIES ||--o{ TAXONOMY_TERMS : contains
+    TAXONOMY_TERMS ||--o{ TAXONOMY_TERMS : "child of"
+    ASSETS ||--o{ ASSET_TERMS : "tagged with"
+    TAXONOMY_TERMS ||--o{ ASSET_TERMS : "applied to"
+```
+
 ### 3.1 PostgreSQL - Core Metadata
 
 ```sql
@@ -1181,3 +1246,182 @@ alerts:
 - **Milvus unavailable**: Visual similarity disabled; text/metadata search still works
 - **S3 regional failure**: Cross-region replication for originals; CDN serves from cache
 - **Elasticsearch lag**: New assets have delayed searchability; bounded by consumer lag alert
+
+---
+
+## Sequence Diagrams
+
+### 1. Asset Upload + Metadata Extraction
+
+```mermaid
+sequenceDiagram
+    participant U as User
+    participant API as Upload API
+    participant S3 as Object Store (S3)
+    participant Q as Processing Queue
+    participant Extract as Metadata Extractor
+    participant AI as AI Tagging Service
+    participant Embed as Embedding Service (CLIP)
+    participant Milvus as Vector DB (Milvus)
+    participant DB as Asset DB (Postgres)
+    participant ES as Elasticsearch
+
+    U->>API: POST /assets/upload {file, folder_id, custom_metadata}
+    API->>S3: Store original file (versioned bucket)
+    API->>DB: Create asset record (status: processing, user, folder)
+    API-->>U: 201 Created {asset_id, status: processing}
+
+    API->>Q: Publish AssetUploaded event
+
+    par Parallel metadata extraction
+        Q->>Extract: Extract technical metadata
+        Extract->>Extract: File type detection (magic bytes)
+        Extract->>Extract: EXIF/XMP/IPTC parsing (photos)
+        Extract->>Extract: MediaInfo probe (video: codec, bitrate, duration)
+        Extract->>Extract: PDF metadata (pages, fonts, embedded images)
+        Extract->>DB: Store technical metadata
+        Extract->>ES: Index metadata fields
+
+        Q->>AI: Auto-tag asset
+        AI->>AI: Object detection + scene classification
+        AI->>AI: OCR (text in images/PDFs)
+        AI->>AI: Color palette extraction
+        AI->>AI: Brand/logo detection
+        AI->>DB: Store AI-generated tags (with confidence scores)
+        AI->>ES: Index AI tags
+
+        Q->>Embed: Generate visual embedding
+        Embed->>Embed: CLIP model → 512-dim vector
+        Embed->>Milvus: Store vector (asset_id → embedding)
+    end
+
+    Q->>Extract: Generate renditions (thumbnail, preview, web-optimized)
+    Extract->>S3: Store renditions
+    Extract->>DB: Update asset (status: ready, rendition_urls)
+
+    Note over U: Asset searchable by text, metadata, visual similarity within seconds
+```
+
+### 2. Version Comparison + Approval Workflow
+
+```mermaid
+sequenceDiagram
+    participant D as Designer
+    participant API as Asset API
+    participant S3 as Object Store
+    participant DB as Asset DB
+    participant Diff as Diff/Compare Service
+    participant WF as Workflow Engine
+    participant Notify as Notification Service
+    participant R1 as Reviewer 1
+    participant R2 as Reviewer 2
+
+    D->>API: POST /assets/{id}/versions {file: updated_design.psd}
+    API->>S3: Store new version (v3)
+    API->>DB: Create version record (v3, parent: v2)
+    API->>DB: Link to same asset_id (version chain)
+    API-->>D: {version_id: v3, version_number: 3}
+
+    D->>API: POST /assets/{id}/compare {v2, v3}
+    API->>Diff: Generate visual diff
+    Diff->>S3: Download v2 rendered preview + v3 rendered preview
+    Diff->>Diff: Pixel-diff overlay (highlight changes in red)
+    Diff->>Diff: Side-by-side comparison render
+    Diff->>S3: Store comparison artifacts
+    Diff-->>API: Comparison URL
+    API-->>D: Comparison view (overlay + side-by-side)
+
+    D->>API: POST /assets/{id}/submit-for-approval {version: v3, reviewers: [R1, R2]}
+    API->>WF: Create approval workflow (requires: all reviewers approve)
+    WF->>DB: Create workflow instance (status: pending, required: 2 approvals)
+    WF->>Notify: Send review requests
+    Notify->>R1: "New version needs your review" (email + in-app)
+    Notify->>R2: "New version needs your review"
+
+    R1->>API: POST /workflows/{wf_id}/review {decision: approve, comment: "Looks good"}
+    API->>WF: Record approval (R1)
+    WF->>DB: Update (approvals: 1/2)
+
+    R2->>API: POST /workflows/{wf_id}/review {decision: request_changes, comment: "Fix the logo size", annotations: [...]}
+    API->>WF: Record request_changes (R2)
+    WF->>DB: Update workflow (status: changes_requested)
+    WF->>Notify: Notify designer of requested changes
+    Notify->>D: "Changes requested by R2" + annotations
+
+    D->>API: POST /assets/{id}/versions {file: fixed_design.psd}
+    Note over D,WF: Cycle repeats until all approve
+```
+
+### 3. Search by Visual Similarity
+
+```mermaid
+sequenceDiagram
+    participant U as User
+    participant API as Search API
+    participant Upload as Upload Service
+    participant Embed as Embedding Service (CLIP)
+    participant Milvus as Vector DB
+    participant DB as Asset DB
+    participant ACL as Permission Service
+    participant ES as Elasticsearch
+
+    alt Search by uploading reference image
+        U->>API: POST /search/visual {reference_image}
+        API->>Upload: Temporarily store reference
+        API->>Embed: Generate CLIP embedding for reference
+        Embed-->>API: Query vector (512-dim)
+    else Search by existing asset
+        U->>API: POST /search/visual {asset_id: existing_asset}
+        API->>Milvus: Lookup existing embedding for asset_id
+        Milvus-->>API: Query vector
+    end
+
+    API->>Milvus: ANN search (cosine similarity, top-K=100)
+    Milvus-->>API: Candidate asset_ids + similarity scores
+
+    API->>ACL: Filter by user permissions (batch check)
+    ACL-->>API: Permitted asset_ids (subset)
+
+    API->>DB: Fetch metadata for permitted assets
+    DB-->>API: Asset details (name, folder, tags, thumbnail_url)
+
+    alt Combined with text filters
+        U->>API: POST /search/visual {reference_image, filters: {format: "PSD", tag: "brand"}}
+        API->>ES: Pre-filter by text/metadata criteria
+        ES-->>API: Filtered asset_id set
+        API->>Milvus: ANN search within filtered set
+        Milvus-->>API: Visually similar within text-filtered results
+    end
+
+    API-->>U: Results ranked by visual similarity [{asset, score, thumbnail}, ...]
+```
+
+---
+
+### Caching Strategy
+
+**Multi-Layer Caching Architecture**:
+
+| Layer | Technology | TTL | Use Case |
+|-------|-----------|-----|----------|
+| CDN Edge | CloudFront/Fastly | 24h | Thumbnails, previews, public shared links |
+| Application Cache | Redis Cluster | 5-30min | Asset metadata, folder trees, search results |
+| Embedding Cache | Local LRU (worker) | 1h | Hot embeddings for repeated similarity searches |
+| Permission Cache | Redis | 2min | ACL results (short TTL for freshness) |
+| Search Result Cache | Redis | 60s | Identical query deduplication |
+
+**Cache Invalidation Patterns**:
+- Asset update/new version → invalidate asset metadata + thumbnail CDN cache
+- Permission change → invalidate all ACL cache entries for affected users
+- New asset indexed → invalidate folder listing cache + relevant search caches
+- Write-through for metadata; write-behind for search index updates
+
+**Hot Asset Optimization**:
+- Assets accessed >100 times/hour automatically promoted to hot tier
+- Hot tier: pre-warmed CDN, pinned Redis entries, pre-computed renditions at all sizes
+- Brand assets (logos, templates) permanently pinned in cache
+
+**Cache Warming**:
+- On workspace login: pre-fetch user's recent assets + starred items into Redis
+- On folder navigation: prefetch sibling assets and first-level children
+- Background job: warm cache for Monday morning (most common access patterns)

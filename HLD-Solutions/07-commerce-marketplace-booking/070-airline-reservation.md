@@ -57,6 +57,81 @@ Inventory updates: 100K/min (real-time yield management)
 
 ## 4. Data Modeling
 
+### Entity-Relationship Diagram
+
+```mermaid
+erDiagram
+    airlines {
+        CHAR airline_code PK
+        VARCHAR name
+        VARCHAR alliance
+    }
+    airports {
+        CHAR airport_code PK
+        VARCHAR name
+        VARCHAR city
+        VARCHAR timezone
+    }
+    flight_schedules {
+        UUID schedule_id PK
+        CHAR airline_code FK
+        CHAR departure_airport FK
+        CHAR arrival_airport FK
+        VARCHAR flight_number
+        INTEGER duration_minutes
+    }
+    flights {
+        UUID flight_id PK
+        UUID schedule_id FK
+        CHAR airline_code FK
+        DATE flight_date
+        VARCHAR status
+    }
+    fare_classes {
+        CHAR class_code PK
+        VARCHAR cabin
+        BOOLEAN refundable
+        INTEGER checked_bags_included
+    }
+    flight_inventory {
+        UUID flight_id FK
+        CHAR class_code FK
+        INTEGER authorized
+        INTEGER sold
+        VARCHAR status
+    }
+    pnrs {
+        UUID pnr_id PK
+        CHAR record_locator UK
+        CHAR creating_airline FK
+        VARCHAR status
+        INTEGER total_fare_cents
+    }
+    pnr_passengers {
+        UUID passenger_id PK
+        UUID pnr_id FK
+        VARCHAR first_name
+        VARCHAR last_name
+        VARCHAR passport_number
+    }
+    pnr_segments {
+        UUID segment_id PK
+        UUID pnr_id FK
+        UUID flight_id FK
+        CHAR booking_class FK
+        VARCHAR status
+    }
+
+    airlines ||--o{ flight_schedules : "operates"
+    airports ||--o{ flight_schedules : "departs from"
+    flight_schedules ||--o{ flights : "instances"
+    flights ||--o{ flight_inventory : "seat inventory"
+    fare_classes ||--o{ flight_inventory : "class allocation"
+    pnrs ||--o{ pnr_passengers : "travelers"
+    pnrs ||--o{ pnr_segments : "itinerary"
+    flights ||--o{ pnr_segments : "booked on"
+```
+
 ### Full Database Schemas
 
 ```sql
@@ -1153,3 +1228,405 @@ Data routing:
 - Elasticsearch for flexible date search and discovery
 - Graph DB for routing computation (pre-warmed)
 - CDN for static schedule data (changes once/season)
+
+---
+
+## 12. Sequence Diagrams
+
+### 12.1 Flight Search with Connections
+
+```mermaid
+sequenceDiagram
+    participant Traveler
+    participant API Gateway
+    participant SearchService
+    participant FlightGraphService
+    participant ScheduleDB
+    participant FareService
+    participant Cache(Redis)
+
+    Traveler->>API Gateway: GET /flights?from=BOS&to=LAX&date=Mar15&passengers=2
+    API Gateway->>SearchService: searchFlights(BOS, LAX, Mar15, 2 pax)
+
+    SearchService->>Cache(Redis): GET flights:BOS-LAX:Mar15
+    Cache(Redis)-->>SearchService: MISS
+
+    SearchService->>FlightGraphService: findRoutes(BOS, LAX, Mar15, max_stops=2)
+    FlightGraphService->>ScheduleDB: load active routes from BOS (Mar15)
+    ScheduleDB-->>FlightGraphService: BOS→LAX(direct), BOS→ORD, BOS→DFW, BOS→ATL...
+
+    Note over FlightGraphService: BFS/Dijkstra with pruning:<br/>- Max 2 stops<br/>- Min connection time 45min<br/>- Max total duration 14h<br/>- Same alliance preferred
+
+    FlightGraphService-->>SearchService: 8 valid itineraries found
+    
+    SearchService->>FareService: getFares(8 itineraries, 2 pax, all cabin classes)
+    FareService-->>SearchService: priced itineraries (Economy, Business, First)
+
+    SearchService->>Cache(Redis): SET flights:BOS-LAX:Mar15 (TTL=2min)
+    SearchService-->>API Gateway: sorted results (price, duration, stops)
+    API Gateway-->>Traveler: Flight options with prices
+```
+
+### 12.2 PNR Creation + Fare Lock
+
+```mermaid
+sequenceDiagram
+    participant Traveler
+    participant BookingService
+    participant InventoryService
+    participant FareService
+    participant PNRService
+    participant PaymentService
+    participant GDS
+    participant TicketingService
+
+    Traveler->>BookingService: POST /bookings {itinerary, passengers[], contact}
+    BookingService->>FareService: validateFare(fare_id, still_available?)
+    FareService-->>BookingService: fare valid (price=$450)
+
+    BookingService->>InventoryService: holdSeats(flight_segments[], 2 pax, ttl=20min)
+    InventoryService->>GDS: sell(flight_no, class, date, qty=2)
+    GDS-->>InventoryService: held (PNR segments reserved)
+    InventoryService-->>BookingService: hold_confirmed
+
+    BookingService->>PNRService: createPNR(passengers, segments, contact)
+    PNRService-->>BookingService: PNR = "ABC123"
+
+    alt Pay now
+        BookingService->>PaymentService: charge(2 × $450 = $900)
+        PaymentService-->>BookingService: paid
+        BookingService->>TicketingService: issueTickets(PNR=ABC123)
+        TicketingService->>GDS: ET (electronic ticketing)
+        TicketingService-->>BookingService: e-tickets issued
+        BookingService-->>Traveler: "Confirmed! PNR: ABC123, e-tickets attached"
+    else Fare lock (hold for 24-72h)
+        BookingService->>PNRService: setTicketTimeLimit(ABC123, +72h)
+        BookingService-->>Traveler: "Fare locked for 72h. Pay by Mar12 to confirm."
+    end
+```
+
+### 12.3 Check-in + Seat Assignment
+
+```mermaid
+sequenceDiagram
+    participant Passenger
+    participant CheckInService
+    participant PNRService
+    participant SeatMapService
+    participant BoardingPassService
+    participant DCS(Departure Control)
+    participant NotificationService
+
+    Note over Passenger: 24h before departure
+    Passenger->>CheckInService: POST /checkin {PNR: ABC123, passenger: PAX-1}
+    CheckInService->>PNRService: getPNR(ABC123)
+    PNRService-->>CheckInService: {passengers, segments, ticket_status=TICKETED}
+
+    CheckInService->>DCS(Departure Control): checkInPassenger(flight, pax)
+    DCS(Departure Control)-->>CheckInService: checked_in, sequence_number=47
+
+    CheckInService->>SeatMapService: getAvailableSeats(flight, cabin=Economy)
+    SeatMapService-->>CheckInService: available = [12A, 12C, 15D, 15F, 22A...]
+    CheckInService-->>Passenger: "Select your seat"
+
+    Passenger->>CheckInService: selectSeat(seat=15F)
+    CheckInService->>SeatMapService: assignSeat(flight, pax, seat=15F)
+    SeatMapService->>DCS(Departure Control): seatAssignment(pax, 15F)
+    DCS(Departure Control)-->>SeatMapService: confirmed
+
+    CheckInService->>BoardingPassService: generate(pax, flight, seat=15F, seq=47)
+    BoardingPassService-->>CheckInService: {boarding_pass_pdf, barcode}
+
+    CheckInService->>NotificationService: send(email + wallet pass)
+    NotificationService-->>Passenger: Boarding pass (PDF + Apple Wallet)
+    CheckInService-->>Passenger: "Checked in! Seat 15F, Gate B22"
+```
+
+## 13. Algorithm Deep Dives
+
+### 13.1 Fare Search with Graph Traversal
+
+#### The Problem
+Given an origin airport O, destination airport D, and travel date, find all valid itineraries (direct + connecting flights) within constraints. The global airline network has ~4,000 airports and ~70,000 active routes.
+
+#### Graph Representation
+```python
+# Flight network as a directed weighted graph
+# Nodes = airports, Edges = flight segments (time-dependent)
+
+class FlightGraph:
+    def __init__(self):
+        # Adjacency list: airport → [(destination, flights[])]
+        self.graph = defaultdict(list)
+    
+    def add_flight(self, flight):
+        """Add a scheduled flight as a directed edge"""
+        self.graph[flight.origin].append(Edge(
+            destination=flight.destination,
+            departure=flight.departure_time,
+            arrival=flight.arrival_time,
+            flight_no=flight.number,
+            available_seats=flight.seats_available,
+            fare_classes=flight.available_fares
+        ))
+```
+
+#### BFS/Dijkstra Approach for Connection Search
+
+**Modified Dijkstra with time-dependent edges:**
+```python
+import heapq
+from dataclasses import dataclass
+from datetime import datetime, timedelta
+
+@dataclass
+class SearchState:
+    current_airport: str
+    arrival_time: datetime
+    total_cost: float  # Can be optimized for price OR duration
+    segments: list     # Flight segments taken so far
+    stops: int
+
+def find_itineraries(origin, destination, departure_date, max_stops=2):
+    """
+    Modified Dijkstra's algorithm for flight search.
+    Key difference from standard Dijkstra: edges are TIME-DEPENDENT
+    (a connection is only valid if departure > arrival + min_connection_time)
+    """
+    MIN_CONNECTION_TIME = timedelta(minutes=45)  # MCT: Minimum Connection Time
+    MAX_TOTAL_DURATION = timedelta(hours=14)
+    MAX_RESULTS = 50
+    
+    results = []
+    
+    # Priority queue: (cost, state)
+    # Cost can be: price, duration, or composite score
+    start_time = datetime.combine(departure_date, time(0, 0))
+    end_time = datetime.combine(departure_date, time(23, 59))
+    
+    initial_state = SearchState(
+        current_airport=origin,
+        arrival_time=start_time,
+        total_cost=0,
+        segments=[],
+        stops=0
+    )
+    
+    pq = [(0, id(initial_state), initial_state)]  # (priority, tiebreaker, state)
+    
+    # Visited: (airport, time_bucket) → best cost seen
+    # Time bucket prevents re-exploring same airport at same time
+    visited = {}
+    
+    while pq and len(results) < MAX_RESULTS:
+        cost, _, state = heapq.heappop(pq)
+        
+        # Goal check
+        if state.current_airport == destination:
+            results.append(Itinerary(
+                segments=state.segments,
+                total_duration=state.arrival_time - start_time,
+                total_cost=state.total_cost,
+                stops=state.stops
+            ))
+            continue
+        
+        # Pruning: too many stops
+        if state.stops >= max_stops:
+            continue
+        
+        # Pruning: exceeded max duration
+        if state.arrival_time - start_time > MAX_TOTAL_DURATION:
+            continue
+        
+        # Visit check (with time bucket for state-space reduction)
+        time_bucket = state.arrival_time.hour  # Bucket by hour
+        visit_key = (state.current_airport, time_bucket)
+        if visit_key in visited and visited[visit_key] <= cost:
+            continue
+        visited[visit_key] = cost
+        
+        # Explore outgoing flights from current airport
+        for edge in graph[state.current_airport]:
+            # Time feasibility: can we catch this flight?
+            if state.stops == 0:
+                # First flight: must depart on requested date
+                if not (start_time <= edge.departure <= end_time):
+                    continue
+            else:
+                # Connection: must respect MCT
+                earliest_departure = state.arrival_time + MIN_CONNECTION_TIME
+                if edge.departure < earliest_departure:
+                    continue
+            
+            # Availability check
+            if edge.available_seats < required_passengers:
+                continue
+            
+            # Anti-loop: don't revisit airports already in itinerary
+            if edge.destination in [s.origin for s in state.segments]:
+                continue
+            
+            new_cost = state.total_cost + edge.lowest_fare
+            new_state = SearchState(
+                current_airport=edge.destination,
+                arrival_time=edge.arrival,
+                total_cost=new_cost,
+                segments=state.segments + [edge],
+                stops=state.stops + 1
+            )
+            
+            heapq.heappush(pq, (new_cost, id(new_state), new_state))
+    
+    return sorted(results, key=lambda r: r.total_cost)[:MAX_RESULTS]
+```
+
+#### Pruning Strategies (Critical for Performance)
+
+```python
+PRUNING_RULES = {
+    # 1. Geographic pruning: Don't fly away from destination
+    "direction": lambda edge, dest: (
+        haversine(edge.destination, dest) < haversine(edge.origin, dest) * 1.5
+    ),
+    
+    # 2. Time pruning: Don't consider flights departing too late
+    "time_window": lambda edge, max_arrival: (
+        edge.arrival < max_arrival
+    ),
+    
+    # 3. Cost pruning: Don't explore paths already more expensive than best found
+    "cost_bound": lambda current_cost, best_found: (
+        current_cost < best_found * 1.2  # Allow 20% slack for better connections
+    ),
+    
+    # 4. Alliance pruning: Prefer same alliance for connections (better MCT)
+    "alliance": lambda segments: (
+        len(set(s.alliance for s in segments)) <= 2  # Max 2 alliances
+    ),
+    
+    # 5. Airport pruning: Skip tiny airports unlikely to have connections
+    "hub_preference": lambda airport: (
+        airport.annual_passengers > 1_000_000 or airport == destination
+    ),
+}
+```
+
+#### Caching Strategy
+```python
+# Flight search results are cached at multiple levels:
+
+# L1: Exact query cache (TTL=2min) — same O/D/date/pax
+cache_key = f"search:{origin}:{dest}:{date}:{pax}"
+
+# L2: Route availability cache (TTL=5min) — which routes have seats
+route_key = f"route_avail:{origin}:{dest}:{date}"
+
+# L3: Schedule cache (TTL=24h) — flight schedules don't change often
+schedule_key = f"schedule:{origin}:{date}"
+
+# Cache invalidation: Triggered by booking events that reduce availability
+```
+
+#### Performance
+- **Direct flights**: < 50ms (simple index lookup)
+- **1-stop connections**: < 200ms (typical BFS depth=2)
+- **2-stop connections**: < 500ms (with aggressive pruning)
+- **Without pruning**: Would take 5-10 seconds (exponential state space)
+- **Graph size in memory**: ~500MB for global network
+
+---
+
+### 13.2 Revenue Management (Bid-Price Control)
+
+#### Concept
+Airlines use **bid-price control** to decide whether to sell a seat at a given fare class. The bid price is the minimum fare the airline should accept for the next seat, considering future demand.
+
+#### How It Works
+```python
+class RevenueManager:
+    def should_sell(self, flight, fare_class, days_to_departure):
+        """
+        Decide if we should sell a seat at this fare class.
+        Uses Expected Marginal Seat Revenue (EMSR-b model).
+        """
+        remaining_capacity = flight.available_seats
+        bid_price = self.calculate_bid_price(flight, days_to_departure)
+        fare = FARE_CLASSES[fare_class].price
+        
+        # Only sell if offered fare >= bid price
+        return fare >= bid_price
+    
+    def calculate_bid_price(self, flight, days_to_departure):
+        """
+        Bid price = expected revenue from selling the LAST seat to a
+        higher-fare passenger who might book later.
+        """
+        # Forecast remaining demand by fare class
+        demand_forecast = self.forecast_demand(flight, days_to_departure)
+        # e.g., {Y(full): 5 expected, B(business): 12, M(discount): 45, Q(deep): 80}
+        
+        # Calculate protection levels using EMSR-b
+        protection_levels = self.emsr_b(flight.capacity, demand_forecast)
+        
+        # Bid price = fare of the lowest protected class still being protected
+        seats_sold = flight.capacity - flight.available_seats
+        for fare_class, protection in sorted(protection_levels.items(), 
+                                              key=lambda x: -x[1]):
+            if seats_sold < protection:
+                return FARE_CLASSES[fare_class].price * 0.8  # 80% of class fare
+        
+        return MIN_FARE  # Accept any fare if no protection needed
+    
+    def emsr_b(self, capacity, demand_forecast):
+        """Expected Marginal Seat Revenue - version b"""
+        protection = {}
+        classes = sorted(demand_forecast.keys(), key=lambda c: -FARE_CLASSES[c].price)
+        
+        for i, high_class in enumerate(classes[:-1]):
+            lower_classes = classes[i+1:]
+            
+            # Weighted average fare of classes below
+            avg_lower_fare = np.average(
+                [FARE_CLASSES[c].price for c in lower_classes],
+                weights=[demand_forecast[c] for c in lower_classes]
+            )
+            
+            # Protection level: seats to protect for this class
+            # P(selling seat to higher class) > avg lower fare / higher fare
+            high_fare = FARE_CLASSES[high_class].price
+            critical_ratio = avg_lower_fare / high_fare
+            
+            # Inverse of demand distribution at critical ratio
+            mean_demand = demand_forecast[high_class]
+            std_demand = mean_demand * 0.3  # Assume 30% CV
+            protection[high_class] = norm.ppf(1 - critical_ratio, mean_demand, std_demand)
+        
+        return protection
+```
+
+#### Real Example
+```
+Flight: BOS→LAX, March 15, 180 seats total, 45 days to departure
+
+Fare Classes:
+  Y (Full Economy): $850, forecast demand = 8 pax
+  B (Flex):         $650, forecast demand = 15 pax
+  M (Standard):    $450, forecast demand = 40 pax
+  Q (Discount):    $250, forecast demand = 80 pax
+
+Protection levels (EMSR-b):
+  Protect 6 seats for Y class
+  Protect 18 seats for B class (cumulative: 24)
+  Protect 50 seats for M class (cumulative: 74)
+  Q gets remaining: 180 - 74 = 106 seats
+
+Current state (45 days out): 160 seats available
+→ Bid price = $250 (all classes open, plenty of capacity)
+
+At 7 days out: 40 seats available
+→ Bid price = $450 (Q class closed, only M and above)
+
+At 2 days out: 15 seats available
+→ Bid price = $650 (only Y and B available)
+```

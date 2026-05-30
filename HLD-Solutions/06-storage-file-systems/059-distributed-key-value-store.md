@@ -55,6 +55,42 @@ With burst: 3000 × 300 / 300 = instantaneous burst up to 5× for 5min
 
 ## 3. Data Modeling
 
+### Entity-Relationship Diagram
+
+```mermaid
+erDiagram
+    TABLE_SCHEMA {
+        string table_name PK
+        string billing_mode
+        string ttl_attribute
+    }
+    ITEM {
+        any partition_key PK
+        any sort_key PK
+        int version
+        int ttl
+    }
+    GSI_DEFINITION {
+        string index_name PK
+        string table_name FK
+        string projection_type
+    }
+    LSI_DEFINITION {
+        string index_name PK
+        string table_name FK
+    }
+    KEY_SCHEMA {
+        string attribute_name PK
+        string key_type
+        string attribute_type
+    }
+    TABLE_SCHEMA ||--|{ KEY_SCHEMA : "defines keys"
+    TABLE_SCHEMA ||--o{ ITEM : stores
+    TABLE_SCHEMA ||--o{ GSI_DEFINITION : "has GSIs"
+    TABLE_SCHEMA ||--o{ LSI_DEFINITION : "has LSIs"
+    GSI_DEFINITION ||--|{ KEY_SCHEMA : "indexes by"
+```
+
 ### Partition Key Routing
 
 ```python
@@ -1156,3 +1192,427 @@ Operational:
 - **Scan cost**: Full table scan consumes RCU for every item scanned, even if filtered out
 - **Item size limit**: 400KB max forces denormalization strategies; large items need S3 + pointer pattern
 - **Cost at scale**: Pay-per-request can be expensive for predictable workloads; provisioned + auto-scale is cheaper
+
+---
+
+## Sequence Diagrams
+
+### Write with Quorum (W=2, N=3)
+
+```mermaid
+sequenceDiagram
+    participant C as Client
+    participant Coord as Coordinator Node
+    participant N1 as Node-1 (replica)
+    participant N2 as Node-2 (replica)
+    participant N3 as Node-3 (replica)
+    participant HH as Hinted Handoff Queue
+
+    C->>Coord: PUT(key="user:123", value={name:"Alice"}, consistency=QUORUM)
+    Coord->>Coord: Hash(key) → token T → responsible nodes [N1, N2, N3]
+
+    par Write to all replicas
+        Coord->>N1: Write(key, value, timestamp=T1, vector_clock=[N1:5])
+        Coord->>N2: Write(key, value, timestamp=T1, vector_clock=[N1:5])
+        Coord->>N3: Write(key, value, timestamp=T1, vector_clock=[N1:5])
+    end
+
+    N1-->>Coord: ACK (written to memtable + WAL)
+    N2-->>Coord: ACK (written to memtable + WAL)
+    N3--xCoord: TIMEOUT (node slow/down)
+
+    Note over Coord: W=2 achieved (N1 + N2) → respond success
+    Coord-->>C: 200 OK (quorum met)
+
+    Note over Coord: Store hint for N3
+    Coord->>HH: StoreHint(target=N3, key, value, timestamp)
+    
+    Note over HH,N3: Later, when N3 recovers...
+    HH->>N3: ReplayHint(key, value, timestamp)
+    N3-->>HH: ACK (hint delivered)
+    HH->>HH: Delete hint
+```
+
+### Read Repair
+
+```mermaid
+sequenceDiagram
+    participant C as Client
+    participant Coord as Coordinator Node
+    participant N1 as Node-1
+    participant N2 as Node-2
+    participant N3 as Node-3
+
+    C->>Coord: GET(key="user:123", consistency=QUORUM)
+    Coord->>Coord: Responsible nodes: [N1, N2, N3], need R=2
+
+    par Read from all (read all, respond after R)
+        Coord->>N1: Read(key)
+        Coord->>N2: Read(key)
+        Coord->>N3: Read(key)
+    end
+
+    N1-->>Coord: {value: v2, vector_clock: [N1:5, N2:3]}
+    N2-->>Coord: {value: v2, vector_clock: [N1:5, N2:3]}
+    N3-->>Coord: {value: v1, vector_clock: [N1:4, N2:3]}  ← STALE!
+
+    Note over Coord: R=2 met, respond with latest version
+    Coord->>Coord: Compare vector clocks → v2 dominates v1
+    Coord-->>C: {value: v2} (latest)
+
+    Note over Coord: Background read repair for N3
+    Coord->>N3: Repair(key, value=v2, vector_clock=[N1:5, N2:3])
+    N3->>N3: Update local store with newer version
+    N3-->>Coord: ACK (repaired)
+```
+
+### Node Join + Data Rebalancing
+
+```mermaid
+sequenceDiagram
+    participant New as New Node (N4)
+    participant Seed as Seed Node
+    participant Ring as Hash Ring (Gossip)
+    participant N1 as Node-1 (donor)
+    participant N2 as Node-2 (donor)
+    participant Coord as Coordinator
+
+    New->>Seed: Join(my_id=N4, my_tokens=[T100, T250, T400, ...])
+    Seed->>Ring: Gossip: "N4 joining with tokens [T100, T250, T400...]"
+    Ring->>Ring: Propagate via gossip protocol (all nodes learn in ~3s)
+
+    Note over Ring: Token T100 splits range (T80, T120]<br/>N1 owned (T80, T120], now N4 owns (T80, T100]
+
+    Ring->>N1: StreamRange(T80, T100] to N4
+    Ring->>N2: StreamRange for other affected tokens to N4
+
+    N1->>N1: Scan SSTables for keys in range (T80, T100]
+    N1->>New: Stream data (anti-entropy transfer)
+    
+    loop Streaming in progress
+        N1->>New: Batch of key-value pairs (1MB batches)
+        New->>New: Write to local SSTables
+        New-->>N1: ACK batch
+    end
+
+    New->>Ring: Streaming complete for range (T80, T100]
+    Ring->>Ring: Update ownership: N4 now serves (T80, T100]
+    
+    Note over N1: After confirmation, N1 can delete transferred data
+    N1->>N1: Mark transferred range for compaction cleanup
+
+    Coord->>Coord: Update routing table: queries for (T80, T100] → N4
+```
+
+## Caching Strategy
+
+| Layer | Technology | What's Cached | TTL | Eviction |
+|-------|-----------|---------------|-----|----------|
+| Client SDK | Local LRU | Hot keys read by this client | Configurable (1-60s) | TTL + size-bounded |
+| Row cache | On-heap (node-local) | Frequently read rows | Access-based | LRU, size-limited (10% heap) |
+| Key cache | Off-heap | Partition index entries | Long-lived | LRU per SSTable |
+| Block cache | OS page cache | SSTable data blocks | Until evicted | OS LRU |
+| Bloom filter | Memory-mapped | Negative lookups (key NOT in SSTable) | Permanent per SSTable | Rebuilt on compaction |
+
+**DAX-style caching (DynamoDB Accelerator pattern):**
+- Write-through: writes go to cache + store simultaneously
+- Read: check cache first → on miss, read from store + populate cache
+- Invalidation: item-level (not partition-level) for precision
+- Consistency: cache entries carry vector clock → stale entries rejected
+
+## Infrastructure Components
+
+```
+┌─────────────────────────────────────────────────────────────────┐
+│              Distributed KV Store Infrastructure                  │
+├─────────────────────────────────────────────────────────────────┤
+│ Cluster Topology:                                                │
+│   12 nodes across 3 AZs (4 per AZ)                             │
+│   Each: 64 cores, 256GB RAM, 8× 4TB NVMe SSD                  │
+│   Replication factor: 3 (one replica per AZ)                    │
+│   Virtual nodes: 256 per physical node                          │
+│                                                                  │
+│ Storage Engine (per node):                                       │
+│   Memtable: 2GB (flush at 1GB)                                  │
+│   WAL: Dedicated SSD partition                                   │
+│   SSTables: Leveled compaction (L0→L6)                          │
+│   Bloom filters: 10 bits/key (1% FPR)                           │
+│                                                                  │
+│ Network:                                                         │
+│   Intra-AZ: 25 Gbps                                            │
+│   Cross-AZ: 5 Gbps (gossip + replication)                      │
+│   Client-facing: 10 Gbps (with connection pooling)              │
+│                                                                  │
+│ Operations:                                                      │
+│   Repair: Weekly anti-entropy (Merkle tree comparison)           │
+│   Compaction: Continuous (rate-limited to 50MB/s)               │
+│   Backup: Incremental snapshot to S3 every 6h                   │
+│   Monitoring: Per-node latency histograms, compaction debt      │
+└─────────────────────────────────────────────────────────────────┘
+```
+
+## Algorithm Deep Dive: Consistent Hashing with Virtual Nodes
+
+### Problem
+
+Distribute data across N nodes such that:
+1. Load is balanced (each node gets ~1/N of data)
+2. Adding/removing a node moves only ~1/N of data
+3. Heterogeneous nodes get proportional load
+
+### Naive Consistent Hashing Problems
+
+With only N points on the ring (one per node):
+- Standard deviation of load: O(1/√N) — with 10 nodes, expect 30%+ variance
+- When a node dies, its entire range goes to ONE neighbor (2x load spike)
+
+### Virtual Nodes Solution
+
+**Step 1: Assign V virtual nodes per physical node**
+
+```
+Physical Node A (8TB) → 200 virtual tokens:
+  hash("A-0")   = 0x0012... → position 18
+  hash("A-1")   = 0x04A3... → position 1187
+  hash("A-2")   = 0x0891... → position 2193
+  ...
+  hash("A-199") = 0xFF01... → position 65281
+
+Physical Node B (4TB) → 100 virtual tokens:
+  hash("B-0")   = 0x0234... → position 564
+  ...
+```
+
+**Step 2: Ring Lookup (O(log V×N) with sorted token list)**
+
+```
+key = "user:12345"
+token = hash(key) = 0x3F7A... → position 16250
+
+Binary search in sorted token list:
+  → First token >= 16250 is "A-47" at position 16301
+  → Key maps to Physical Node A
+
+For replication (RF=3):
+  Continue clockwise, skip same physical node:
+  → Next distinct physical: Node C at position 16555
+  → Next distinct physical: Node B at position 16820
+  → Preference list: [A, C, B]
+```
+
+**Step 3: Load Distribution Analysis**
+
+```
+With V virtual nodes per physical node:
+  Expected load per node: 1/N of total keys
+  Standard deviation: O(1/√(V×N))
+  
+  V=1:   stddev ≈ 30% (terrible)
+  V=50:  stddev ≈ 5%  (acceptable)
+  V=150: stddev ≈ 3%  (good)
+  V=256: stddev ≈ 2%  (excellent)
+  
+Memory overhead: V×N×(token_size + pointer) = 256×100×16B = 400KB (negligible)
+```
+
+**Step 4: Node Addition with Minimal Data Movement**
+
+```
+Before (3 nodes, V=256 each, 768 total tokens):
+  Each node owns ~1/3 of ring
+
+Add Node D (V=256 new tokens):
+  New tokens land between existing tokens
+  Each new token "steals" a small range from its clockwise neighbor
+  
+  Data moved: exactly 1/4 of total (the new node's fair share)
+  Each existing node gives up: 1/4 of its data to D
+  
+  Compare to modulo hashing (hash % N):
+  - Modulo: changing N remaps ~(N-1)/N = 75% of all keys!
+  - Consistent hashing: remaps only 1/N = 25%
+```
+
+## Algorithm Deep Dive: LSM Tree vs B-Tree
+
+### LSM Tree (Log-Structured Merge Tree)
+
+Used by: Cassandra, RocksDB, LevelDB, HBase, ScyllaDB
+
+```
+Write Path:
+  1. Append to WAL (sequential I/O) → durability
+  2. Insert into Memtable (in-memory sorted structure, e.g., skip list)
+  3. When Memtable full → flush to disk as immutable SSTable (sorted)
+  4. Background compaction merges SSTables
+
+Read Path:
+  1. Check Memtable (in-memory)
+  2. Check Bloom filters for each SSTable level
+  3. Binary search within candidate SSTables
+  4. Return most recent version found
+
+Level Structure:
+  L0: 4 SSTables (each ~64MB, may overlap)
+  L1: 10 SSTables (non-overlapping, ~640MB total)
+  L2: 100 SSTables (~6.4GB)
+  L3: 1000 SSTables (~64GB)
+  ...
+  
+  Size ratio (fanout): 10× per level
+  Max levels for 1TB: 4-5 levels
+```
+
+### B-Tree
+
+Used by: PostgreSQL, MySQL/InnoDB, SQLite, MongoDB (WiredTiger)
+
+```
+Write Path:
+  1. Find leaf page containing key (traverse from root)
+  2. If page has space: insert in-place
+  3. If page full: split into two pages, update parent
+  4. Write-Ahead Log for crash recovery
+
+Read Path:
+  1. Traverse from root → internal nodes → leaf (O(log_B N) I/Os)
+  2. Each level = one page read (typically cached above leaf level)
+```
+
+### Detailed Comparison
+
+| Dimension | LSM Tree | B-Tree |
+|-----------|----------|--------|
+| Write amplification | 10-30× (compaction rewrites data) | 2-3× (WAL + page write) |
+| Read amplification | 1-5× (check multiple levels) | 1× (direct traversal) |
+| Space amplification | 10-20% (temporary duplicates during compaction) | ~33% (page fill factor ~67%) |
+| Write throughput | Very high (sequential I/O only) | Moderate (random I/O for page updates) |
+| Read latency (point) | Higher (Bloom + multi-level) | Lower (direct path) |
+| Range scan | Efficient (sorted SSTables) | Very efficient (leaf page links) |
+| Space reclamation | Compaction (background CPU) | In-place (immediate) |
+| Write stalls | Yes (compaction backpressure) | Rare (page splits are fast) |
+| Compression | Excellent (sorted blocks compress well) | Good (per-page) |
+| Concurrency | Lock-free reads (immutable SSTables) | Page-level locking needed |
+
+### When to Choose What
+
+```
+Choose LSM when:
+  ✓ Write-heavy workload (>80% writes)
+  ✓ Keys are written once, rarely updated
+  ✓ Need high sustained write throughput
+  ✓ SSD storage (random reads are fast)
+  ✓ Can tolerate write amplification (SSD endurance)
+  
+Choose B-Tree when:
+  ✓ Read-heavy or mixed workload
+  ✓ Need predictable latency (no compaction stalls)
+  ✓ Frequent updates to existing keys
+  ✓ Transaction-heavy (row-level locking)
+  ✓ HDD storage (sequential advantage less relevant on SSD)
+```
+
+## Algorithm Deep Dive: Vector Clocks for Conflict Resolution
+
+### Problem
+
+In an eventually consistent system with concurrent writes to the same key on different nodes, how do we detect conflicts vs. causal ordering?
+
+### Vector Clock Structure
+
+```
+Vector clock = map of {node_id → logical_counter}
+
+Example: VC = {A:3, B:1, C:2}
+Meaning: "This version has seen 3 events from A, 1 from B, 2 from C"
+```
+
+### Step-by-Step Example
+
+```
+Initial state: key "user:123" doesn't exist
+
+Step 1: Client writes via Node A
+  A receives: PUT("user:123", {name:"Alice"})
+  A increments own counter: VC = {A:1}
+  Stored: (value={name:"Alice"}, VC={A:1})
+  Replicate to B, C
+
+Step 2: Client reads from A, then writes via Node A
+  Read: (value={name:"Alice"}, VC={A:1})
+  Write: PUT("user:123", {name:"Alice", age:30}, context=VC{A:1})
+  A increments: VC = {A:2}
+  Stored: (value={name:"Alice",age:30}, VC={A:2})
+
+Step 3: CONCURRENT write via Node B (hasn't seen Step 2 yet!)
+  B still has: (value={name:"Alice"}, VC={A:1})
+  Client writes via B: PUT("user:123", {name:"Alice", city:"NYC"}, context=VC{A:1})
+  B increments own counter: VC = {A:1, B:1}
+  Stored: (value={name:"Alice",city:"NYC"}, VC={A:1, B:1})
+```
+
+### Conflict Detection Rules
+
+```
+Comparing VC1={A:2} and VC2={A:1, B:1}:
+
+VC1 dominates VC2? ∀ node: VC1[node] >= VC2[node]?
+  A: 2 >= 1 ✓
+  B: 0 >= 1 ✗  → NO
+
+VC2 dominates VC1?
+  A: 1 >= 2 ✗  → NO
+
+Neither dominates → CONFLICT (concurrent writes)
+```
+
+### Resolution Strategies
+
+```
+Strategy 1: Last-Writer-Wins (LWW)
+  Use wall-clock timestamp as tiebreaker
+  Simple but LOSES DATA (one write silently discarded)
+  Used by: Cassandra (default)
+
+Strategy 2: Sibling Storage (client resolves)
+  Store BOTH values as "siblings"
+  On next read, return both + vector clocks to client
+  Client merges (e.g., set union: {name:"Alice", age:30, city:"NYC"})
+  Client writes merged value with combined context
+  Used by: Riak, Dynamo
+
+Strategy 3: CRDTs (Conflict-free Replicated Data Types)
+  Design data structure to be automatically mergeable
+  Example: G-Counter, OR-Set, LWW-Register
+  No conflicts possible by construction
+  Used by: Redis (CRDT mode), Riak (data types)
+```
+
+### Vector Clock Limitations and Solutions
+
+```
+Problem: Vector clocks grow unboundedly (one entry per writing node)
+  With 1000 nodes: each value carries 1000-entry vector clock!
+
+Solution 1: Timestamp-based pruning
+  Remove entries older than T (e.g., 7 days)
+  Risk: may incorrectly merge concurrent writes as causal
+
+Solution 2: Dotted Version Vectors (Riak 2.0+)
+  Track only the latest dot per node, not full history
+  Space: O(N) where N = nodes that wrote THIS key (typically 3)
+
+Solution 3: Hybrid Logical Clocks (HLC)
+  Combine physical time + logical counter
+  Single scalar (not vector) but preserves causality within bounded clock skew
+  Used by: CockroachDB, YugabyteDB
+```
+
+### Complexity
+
+| Operation | Time | Space |
+|-----------|------|-------|
+| Increment | O(1) | - |
+| Compare (dominance) | O(N) where N = distinct nodes | - |
+| Merge | O(N) | O(N) per key |
+| Storage overhead | - | O(N × keys) total |

@@ -86,6 +86,61 @@
 
 ## 4. Data Model / Schema Design
 
+### Entity-Relationship Diagram
+
+```mermaid
+erDiagram
+    AGENT_DEFINITION {
+        string agent_id PK
+        string name
+        int version
+        string org_id FK
+        string system_prompt
+        int max_iterations
+    }
+    TOOL_DEFINITION {
+        string tool_id PK
+        string name
+        string execution_type
+        boolean requires_approval
+    }
+    AGENT_SESSION {
+        string session_id PK
+        string agent_id FK
+        string org_id FK
+        string user_id FK
+        string status
+        int tokens_used
+        float estimated_cost_usd
+    }
+    MESSAGE {
+        string role
+        string content
+        datetime timestamp
+    }
+    TOOL_CALL {
+        string tool_call_id PK
+        string tool_name
+        string status
+        string result
+    }
+    MEMORY_ENTRY {
+        string memory_id PK
+        string agent_id FK
+        string user_id FK
+        string memory_type
+        float importance
+        string namespace
+    }
+
+    AGENT_DEFINITION ||--o{ TOOL_DEFINITION : has
+    AGENT_DEFINITION ||--o{ AGENT_SESSION : instantiated
+    AGENT_SESSION ||--o{ MESSAGE : contains
+    AGENT_SESSION ||--o{ TOOL_CALL : executes
+    AGENT_SESSION ||--o| AGENT_SESSION : "spawns child"
+    AGENT_DEFINITION ||--o{ MEMORY_ENTRY : accumulates
+```
+
 ### Agent Definition
 ```python
 @dataclass
@@ -1003,3 +1058,153 @@ spec:
 - **Latency breakdown**: LLM vs tools vs memory
 - **Guardrail trigger rate**: safety monitoring
 - **Human escalation rate**: automation effectiveness
+
+---
+
+## 12. Sequence Diagrams
+
+### 12.1 Multi-Agent Task Decomposition + Execution
+
+```mermaid
+sequenceDiagram
+    participant U as User
+    participant Orch as Orchestrator Agent
+    participant Plan as Planner (LLM)
+    participant A1 as Research Agent
+    participant A2 as Code Agent
+    participant A3 as Review Agent
+    participant Tools as Tool Registry
+    participant Mem as Shared Memory Store
+    participant Guard as Guardrails
+
+    U->>Orch: "Build a REST API for user management with tests"
+    Orch->>Plan: Decompose task into subtasks
+    Plan-->>Orch: Plan: [1. Research patterns, 2. Write code, 3. Write tests, 4. Review]
+    Orch->>Mem: Store plan + shared context
+    
+    Orch->>A1: Execute subtask 1: "Research REST API patterns for user management"
+    A1->>Tools: web_search("REST API user management best practices 2024")
+    Tools-->>A1: [search results]
+    A1->>Tools: read_file("existing_api_patterns.md")
+    Tools-->>A1: [file contents]
+    A1->>Mem: Store findings {patterns, recommendations}
+    A1-->>Orch: Subtask 1 complete
+    
+    Orch->>A2: Execute subtask 2: "Implement user API" (context from Memory)
+    A2->>Mem: Retrieve research findings
+    A2->>Tools: write_file("src/users/routes.ts", code)
+    A2->>Tools: write_file("src/users/service.ts", code)
+    A2->>Guard: Validate output (no secrets, follows patterns)
+    Guard-->>A2: PASS
+    A2->>Mem: Store generated code references
+    A2-->>Orch: Subtask 2 complete
+    
+    par Parallel execution
+        Orch->>A2: Execute subtask 3: "Write tests"
+        A2->>Tools: write_file("tests/users.test.ts", test_code)
+        A2-->>Orch: Subtask 3 complete
+    and
+        Orch->>A3: Execute subtask 4: "Review code quality"
+        A3->>Mem: Retrieve code from subtask 2
+        A3->>A3: Analyze: security, performance, patterns
+        A3-->>Orch: Review: {score: 8/10, suggestions: [...]}
+    end
+    
+    Orch->>Orch: Aggregate results, check all subtasks passed
+    Orch-->>U: "API implemented with tests. Review score: 8/10. Suggestions: ..."
+```
+
+### 12.2 Tool Calling + Human-in-the-Loop Approval
+
+```mermaid
+sequenceDiagram
+    participant U as User
+    participant Agent as Agent (LLM)
+    participant Orch as Orchestrator
+    participant Guard as Guardrails
+    participant Tool as Tool Executor (Sandbox)
+    participant HITL as Human-in-the-Loop Gate
+    participant Ext as External API (Production)
+
+    U->>Agent: "Delete all inactive users older than 2 years"
+    Agent->>Orch: Plan: [1. Query inactive users, 2. Confirm count, 3. Delete]
+    
+    Agent->>Orch: tool_call: db_query("SELECT count(*) FROM users WHERE last_active < NOW()-2yr")
+    Orch->>Guard: Assess risk(tool=db_query, operation=SELECT)
+    Guard-->>Orch: Risk: LOW (read-only) → auto-approve
+    Orch->>Tool: Execute in sandbox
+    Tool-->>Agent: Result: {count: 3,847}
+    
+    Agent->>Agent: "Found 3,847 users. Need to delete — this is destructive."
+    Agent->>Orch: tool_call: db_execute("DELETE FROM users WHERE last_active < NOW()-2yr")
+    Orch->>Guard: Assess risk(tool=db_execute, operation=DELETE, affected_rows=3847)
+    Guard-->>Orch: Risk: HIGH (destructive, >100 rows) → require human approval
+    
+    Orch->>HITL: Request approval {action: "DELETE 3,847 users", risk: HIGH}
+    HITL-->>U: "Agent wants to delete 3,847 inactive users. Approve? [Y/N/Modify]"
+    U-->>HITL: "Approve, but first export their data"
+    HITL-->>Orch: Approved with condition: export first
+    
+    Orch->>Agent: User approved with condition: "export data first"
+    Agent->>Orch: tool_call: db_query("SELECT * FROM users WHERE ...") → export_to_csv
+    Orch->>Guard: Risk: LOW → auto-approve
+    Orch->>Tool: Execute
+    Tool-->>Agent: Exported to users_backup_20240115.csv
+    
+    Agent->>Orch: tool_call: db_execute("DELETE FROM users WHERE ...")
+    Orch->>Guard: Risk: HIGH, but pre-approved in this flow
+    Orch->>Ext: Execute DELETE (production)
+    Ext-->>Agent: {deleted_rows: 3,847}
+    Agent-->>U: "Done. Exported 3,847 users to CSV, then deleted. Backup: users_backup_20240115.csv"
+```
+
+### Caching Strategy
+
+| Layer | Technology | Data Cached | TTL | Purpose |
+|-------|-----------|-------------|-----|---------|
+| LLM responses | Redis | Hash(prompt) → response (deterministic prompts only) | 1h | Avoid re-inference for identical tool descriptions, system prompts |
+| Tool schemas | Local (in-process) | Tool registry JSON schemas | Until deployment | Fast tool selection without network call |
+| Agent memory | Redis + PostgreSQL | Session context, summaries | Session lifetime | Cross-turn context without re-reading all history |
+| Embedding cache | Redis | text_hash → embedding vector | 24h | Avoid re-embedding for memory retrieval |
+| Guardrail rules | Local | Policy rules, risk classifications | 5 min refresh | Fast risk assessment without DB query |
+| RAG chunks | Redis | doc_hash → retrieved chunks | 1h | Avoid repeated vector searches for same context |
+
+### Infrastructure Components
+
+```
+┌────────────────────────────────────────────────────────────────────────┐
+│                    AI Agent Orchestration Platform                       │
+├────────────────────────────────────────────────────────────────────────┤
+│                                                                          │
+│  ┌─────────────────────┐  ┌────────────────────────────────────────┐  │
+│  │ Orchestration Layer   │  │  LLM Gateway (Multi-Provider)         │  │
+│  │ - Temporal (durable   │  │  - OpenAI, Anthropic, Local models    │  │
+│  │   execution)          │  │  - Load balancing + failover          │  │
+│  │ - DAG execution       │  │  - Token tracking + cost allocation   │  │
+│  │ - State machines      │  │  - Response caching (deterministic)   │  │
+│  │ - Max depth/iteration │  │  - Streaming multiplexer              │  │
+│  └─────────────────────┘  └────────────────────────────────────────┘  │
+│                                                                          │
+│  ┌─────────────────────┐  ┌────────────────────────────────────────┐  │
+│  │ Tool Execution        │  │  Memory & Context                      │  │
+│  │ - Firecracker μVMs   │  │  - Vector store (pgvector)             │  │
+│  │ - gVisor sandboxes   │  │  - Session store (Redis)               │  │
+│  │ - Network isolation   │  │  - Long-term memory (PostgreSQL)      │  │
+│  │ - Resource limits     │  │  - Context window management          │  │
+│  │ - Timeout enforcement │  │  - Summarization pipeline             │  │
+│  └─────────────────────┘  └────────────────────────────────────────┘  │
+│                                                                          │
+│  ┌─────────────────────┐  ┌────────────────────────────────────────┐  │
+│  │ Guardrails & Safety   │  │  Observability                         │  │
+│  │ - Input sanitization  │  │  - Trace per agent session (Jaeger)   │  │
+│  │ - Output validation   │  │  - Token/cost metrics (Prometheus)    │  │
+│  │ - PII detection       │  │  - Agent success rate dashboards      │  │
+│  │ - Human-in-the-loop  │  │  - Replay & debugging tools           │  │
+│  │ - Rate limiting       │  │  - Anomaly detection (loop, cost)     │  │
+│  └─────────────────────┘  └────────────────────────────────────────┘  │
+│                                                                          │
+│  Deployment: Kubernetes | Scaling: HPA on queue depth + GPU utilization  │
+│  Durability: Temporal workflows survive restarts | Multi-region active   │
+└────────────────────────────────────────────────────────────────────────┘
+```
+

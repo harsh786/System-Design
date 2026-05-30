@@ -70,6 +70,48 @@ Total per proxy: ~37MB (with delta xDS, incremental: <100KB per push)
 
 ## 4. Data Modeling
 
+### Entity-Relationship Diagram
+
+```mermaid
+erDiagram
+    SERVICE {
+        string name PK
+        string namespace
+        string labels
+    }
+    ENDPOINT {
+        string address PK
+        int port
+        string health_status
+        int weight
+    }
+    VIRTUAL_SERVICE {
+        string name PK
+        string hosts
+    }
+    HTTP_ROUTE {
+        string match PK
+        string destination
+        int weight
+        duration timeout
+    }
+    DESTINATION_RULE {
+        string host PK
+        string traffic_policy
+    }
+    WORKLOAD_CERTIFICATE {
+        string spiffe_id PK
+        string trust_domain
+        timestamp not_after
+    }
+
+    SERVICE ||--o{ ENDPOINT : has
+    VIRTUAL_SERVICE ||--o{ HTTP_ROUTE : defines
+    SERVICE ||--o| DESTINATION_RULE : configured_by
+    SERVICE ||--|| WORKLOAD_CERTIFICATE : identified_by
+    HTTP_ROUTE }o--|| SERVICE : routes_to
+```
+
 ### Service Registry Schema
 ```protobuf
 message Service {
@@ -1117,3 +1159,112 @@ Level 5: + Multi-cluster/multi-mesh federation
 - [ ] Telemetry pipeline sized for mesh traffic volume
 - [ ] Cert rotation alerts configured
 - [ ] Graceful degradation tested (control plane outage)
+
+---
+
+## Sequence Diagrams
+
+### 1. Request with Sidecar Proxy
+
+```mermaid
+sequenceDiagram
+    participant A as Service-A (Pod)
+    participant PA as Envoy Sidecar (A)
+    participant PB as Envoy Sidecar (B)
+    participant B as Service-B (Pod)
+    participant CP as Control Plane (Istiod)
+
+    Note over PA: Iptables intercepts all outbound traffic<br/>from Service-A container
+
+    A->>PA: HTTP request to service-b:8080 (intercepted via iptables)
+    PA->>PA: Route lookup (VirtualService rules from xDS)
+    PA->>PA: Apply policies: retry(3x), timeout(5s), circuit-breaker
+
+    PA->>PA: mTLS: encrypt with client cert (SPIFFE identity)
+    PA->>PB: mTLS connection (service-a.ns.cluster.local → service-b.ns.cluster.local)
+
+    PB->>PB: Verify client cert (AuthorizationPolicy check)
+    PB->>PB: Decrypt + apply inbound policies (rate limit, fault injection)
+    PB->>B: Plain HTTP to localhost:8080
+
+    B-->>PB: 200 OK (response)
+    PB-->>PA: Encrypted response
+
+    PA->>PA: Record metrics (latency, status, retries)
+    PA--)CP: Async telemetry push (OTLP)
+    PA-->>A: Plain HTTP response
+
+    Note over PA,PB: Total added latency: ~1-3ms per hop<br/>All observability automatic (no app code changes)
+```
+
+### 2. mTLS Handshake and Certificate Rotation
+
+```mermaid
+sequenceDiagram
+    participant Sidecar as Envoy Sidecar
+    participant SDS as SDS Server (Istiod)
+    participant CA as Mesh CA
+    participant Peer as Peer Envoy
+
+    Note over Sidecar: Pod starts → sidecar init
+
+    Sidecar->>SDS: SDS DiscoveryRequest {resource: "default"}
+    SDS->>SDS: Verify pod identity (Kubernetes ServiceAccount token)
+    SDS->>CA: CSR {SPIFFE ID: spiffe://cluster/ns/default/sa/order-svc}
+    CA->>CA: Sign cert (short-lived: 24h TTL)
+    CA-->>SDS: Signed X.509 cert + CA bundle
+    SDS-->>Sidecar: SDS response {cert, key, trust_bundle}
+
+    Sidecar->>Sidecar: Load cert into TLS context (hot reload, no restart)
+
+    Note over Sidecar,Peer: Connection establishment
+    Sidecar->>Peer: ClientHello (TLS 1.3, ALPN: h2)
+    Peer-->>Sidecar: ServerHello + Server cert
+    Sidecar->>Sidecar: Verify peer cert against trust bundle<br/>Check SPIFFE ID against AuthorizationPolicy
+    Sidecar->>Peer: Client cert
+    Peer->>Peer: Verify client SPIFFE ID
+    Sidecar-->>Peer: Finished (mutual authentication complete)
+
+    loop Certificate rotation (every 12h)
+        SDS->>Sidecar: Push new cert (before old expires)
+        Sidecar->>Sidecar: Graceful rotation:<br/>New connections use new cert<br/>Existing connections drain
+    end
+```
+
+### Caching Strategy
+
+#### Multi-Tier Caching
+- **L1 (Envoy route cache)**: Compiled route tables from xDS; in-memory, updated via push from control plane
+- **L2 (Endpoint cache)**: EDS endpoint lists cached per-cluster; TTL = xDS push interval (default 1s)
+- **L3 (Connection pool)**: Persistent HTTP/2 connections to upstreams; avoids per-request TLS handshake
+
+#### Cache Eviction Policies
+- **Route cache**: Replaced atomically on xDS config push (no TTL; push-based invalidation)
+- **Connection pool**: Idle connections closed after `idle_timeout` (default 1h); LRU when pool at `max_connections`
+- **DNS cache**: TTL from DNS response (respect upstream TTL); min 5s to prevent excessive lookups
+
+#### Cache Invalidation
+- **xDS push**: Control plane pushes updated config (CDS/EDS/LDS/RDS) on any change; sidecar applies atomically
+- **Health check**: Unhealthy endpoints removed from EDS cache immediately (outlier detection + active HC)
+- **Certificate rotation**: SDS push replaces cert material without connection disruption
+
+#### Thundering Herd Prevention
+- **Incremental xDS (Delta)**: Only changed resources pushed (not full config); prevents all sidecars re-parsing simultaneously
+- **Jittered reconnect**: Sidecars reconnect to control plane with random jitter (prevents thundering herd on Istiod restart)
+
+### Infrastructure Components
+
+#### Load Balancer
+- **North-South**: External LB (Istio Ingress Gateway = specialized Envoy) for traffic entering the mesh
+- **East-West**: Client-side load balancing by sidecar; algorithms: round-robin, least-requests, ring-hash, maglev
+- **Health checks**: Active (HTTP/gRPC probes) + passive (outlier detection: 5xx count, latency percentile)
+
+#### API Gateway (Ingress Gateway)
+- **Istio Ingress Gateway**: Envoy-based, configured via Gateway + VirtualService CRDs
+- **Features**: TLS termination, path-based routing, header manipulation, rate limiting (local + global via Envoy RLS)
+- **Auth**: JWT validation at ingress, OIDC integration, external auth (ext_authz filter)
+
+#### Control Plane Infrastructure
+- **Istiod**: 3 replicas (HA), each handling ~1000 sidecars; horizontal scaling by shard
+- **Config storage**: Kubernetes API server (CRDs) as source of truth; watched by Istiod
+- **Telemetry pipeline**: Envoy → OTLP → OpenTelemetry Collector → Prometheus/Jaeger/Loki

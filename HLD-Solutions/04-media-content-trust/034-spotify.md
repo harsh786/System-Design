@@ -100,6 +100,56 @@ Search:
 
 ## 5. Data Modeling
 
+### Entity-Relationship Diagram
+
+```mermaid
+erDiagram
+    ARTISTS {
+        bigint artist_id PK
+        varchar name
+        smallint popularity
+        bigint monthly_listeners
+    }
+    ALBUMS {
+        bigint album_id PK
+        varchar title
+        varchar album_type
+        date release_date
+    }
+    TRACKS {
+        bigint track_id PK
+        bigint album_id FK
+        varchar title
+        int duration_ms
+        smallint popularity
+    }
+    PLAYLISTS {
+        bigint playlist_id PK
+        bigint owner_id FK
+        varchar name
+        boolean is_public
+        bigint follower_count
+    }
+    PLAYLIST_ENTRIES {
+        bigint playlist_id PK
+        int position PK
+        bigint track_id FK
+        bigint added_by FK
+    }
+    LISTENING_HISTORY {
+        bigint user_id PK
+        bigint track_id FK
+        timestamp played_at
+    }
+
+    ARTISTS ||--o{ ALBUMS : releases
+    ALBUMS ||--o{ TRACKS : contains
+    ARTISTS }o--o{ TRACKS : performs
+    PLAYLISTS ||--o{ PLAYLIST_ENTRIES : contains
+    TRACKS ||--o{ PLAYLIST_ENTRIES : "included in"
+    TRACKS ||--o{ LISTENING_HISTORY : "played in"
+```
+
 ### 5.1 Tracks Table (PostgreSQL - Partitioned)
 
 ```sql
@@ -1366,3 +1416,137 @@ Healthy unit economics.
 ```
 
 ---
+
+---
+
+## Sequence Diagrams
+
+### 1. Song Playback + Buffer + Crossfade
+
+```mermaid
+sequenceDiagram
+    participant C as Client App
+    participant API as Playback API
+    participant Auth as Auth/Entitlement
+    participant Resolve as Track Resolver
+    participant CDN as CDN (Fastly)
+    participant Storage as Audio Storage
+    participant Cache as Local Cache (Client)
+
+    C->>API: POST /play {track_id, context: playlist}
+    API->>Auth: Validate session + subscription tier
+    Auth-->>API: OK (quality_cap: 320kbps OGG for premium)
+
+    API->>Resolve: Get audio file URLs for track
+    Resolve->>Resolve: Select format (OGG 320 / AAC 256 / OGG 96)
+    Resolve-->>API: Signed CDN URLs (multiple file parts)
+
+    API-->>C: Playback manifest {urls[], key, normalization_gain, crossfade_hint}
+
+    C->>CDN: GET audio_part_1 (Range: bytes=0-262144)
+    alt CDN hit
+        CDN-->>C: Audio data
+    else CDN miss
+        CDN->>Storage: Fetch from origin
+        Storage-->>CDN: Audio file
+        CDN-->>C: Audio data
+    end
+
+    C->>C: Decode + apply ReplayGain normalization
+    C->>C: Begin playback (buffer: 3-5 seconds ahead)
+
+    loop Prefetch remaining parts
+        C->>CDN: GET audio_part_N
+        CDN-->>C: Audio data
+        C->>Cache: Store decoded audio in local cache
+    end
+
+    Note over C: Track approaching end (last 5-12s)
+    C->>API: POST /play {next_track_id} (prefetch)
+    API-->>C: Next track manifest
+    C->>CDN: Prefetch next track first segments
+    CDN-->>C: Next track audio
+
+    C->>C: Crossfade (overlap: configurable 1-12s)
+    C->>API: POST /event {track_complete, listen_duration}
+```
+
+### 2. Playlist Creation + Collaborative Edit
+
+```mermaid
+sequenceDiagram
+    participant U1 as User A (Owner)
+    participant U2 as User B (Collaborator)
+    participant API as Playlist API
+    participant DB as Playlist DB (Cassandra)
+    participant Search as Search Index
+    participant Event as Event Bus
+    participant Notify as Notification Service
+    participant Sync as Real-time Sync (WebSocket)
+
+    U1->>API: POST /playlists {name, collaborative: true}
+    API->>DB: Create playlist (owner: U1, collab: true)
+    API->>Search: Index new playlist
+    API-->>U1: {playlist_id, invite_link}
+
+    U1->>API: POST /playlists/{id}/collaborators {user: U2}
+    API->>DB: Add collaborator record
+    API->>Event: Publish CollaboratorAdded
+    Event->>Notify: Send invite notification to U2
+
+    U2->>API: POST /playlists/{id}/tracks {track_id, position: 5}
+    API->>DB: Insert track at position (vector clock for ordering)
+    API->>Event: Publish TrackAdded {playlist_id, track, user: U2}
+
+    Event->>Sync: Broadcast to connected clients
+    Sync->>U1: WebSocket: playlist_updated {track_added, by: U2}
+
+    par Concurrent edit
+        U1->>API: DELETE /playlists/{id}/tracks/3
+        U2->>API: PATCH /playlists/{id}/tracks/3 {position: 7}
+    end
+
+    API->>DB: Resolve conflict via vector clock (last-write-wins per track)
+    API->>Event: Publish resolved state
+    Event->>Sync: Broadcast canonical order to both users
+    Sync->>U1: Synced playlist state
+    Sync->>U2: Synced playlist state
+```
+
+### 3. Discover Weekly Generation
+
+```mermaid
+sequenceDiagram
+    participant Sched as Weekly Scheduler (Monday 00:00 UTC)
+    participant Spark as Spark / Dataflow
+    participant Listen as Listening History Store
+    participant Graph as Taste Graph (user-track-artist)
+    participant CF as Collaborative Filter Model
+    participant NLP as NLP Track Embeddings
+    participant Filter as Freshness + Diversity Filter
+    participant DB as Playlist DB
+    participant Cache as CDN / Edge Cache
+    participant C as Client
+
+    Sched->>Spark: Trigger Discover Weekly pipeline
+    Spark->>Listen: Load 4 weeks of listening data (all users)
+    Spark->>Graph: Build bipartite user-track graph
+    Spark->>CF: Run ALS matrix factorization
+    CF-->>Spark: User latent vectors, Track latent vectors
+
+    loop For each of ~400M users
+        Spark->>Spark: Score candidate tracks (dot product with user vector)
+        Spark->>NLP: Boost tracks with similar audio features to recent listens
+        Spark->>Filter: Remove already-listened tracks
+        Spark->>Filter: Apply diversity (max 3 per artist, genre spread)
+        Spark->>Filter: Ensure freshness (>50% released in last 2 years)
+        Spark->>DB: Write 30 tracks to user's Discover Weekly playlist
+    end
+
+    Note over Spark,DB: Pipeline completes in ~4 hours for all users
+
+    C->>API: GET /playlists/discover-weekly
+    API->>DB: Fetch personalized track list
+    API->>Cache: Serve from edge if recently fetched
+    API-->>C: 30 personalized tracks
+```

@@ -66,6 +66,44 @@ Response (20 thumbnails × 15 KB): 100K × 300 KB = 30 GB/s outbound (CDN-served
 
 ## 3. Data Modeling
 
+### Entity-Relationship Diagram
+
+```mermaid
+erDiagram
+    IMAGES {
+        bigint image_id PK
+        text source_url
+        varchar domain
+        text title
+        char content_hash
+        float safe_search_score
+        float quality_score
+    }
+    IMAGE_LABELS {
+        bigint image_id FK
+        varchar label PK
+        float confidence
+        varchar source
+    }
+    IMAGE_FACES {
+        bigint face_id PK
+        bigint image_id FK
+        float bbox_x
+        float bbox_y
+        varchar embedding_ref
+    }
+    SEARCH_FEEDBACK {
+        bigint feedback_id PK
+        bigint image_id FK
+        char query_hash
+        varchar action
+        int position
+    }
+    IMAGES ||--o{ IMAGE_LABELS : "tagged with"
+    IMAGES ||--o{ IMAGE_FACES : contains
+    IMAGES ||--o{ SEARCH_FEEDBACK : "feedback on"
+```
+
 ### 3.1 Image Metadata (PostgreSQL - sharded by image_id)
 ```sql
 CREATE TABLE images (
@@ -969,4 +1007,138 @@ Phase 1 (MVP): Text search + basic reverse image search (1B images)
 Phase 2: Multi-modal search, CLIP integration, 5B images
 Phase 3: Real-time personalization, 10B images, video frame search
 Phase 4: Generative search (text-to-image generation as fallback)
+```
+
+---
+
+## 12. Sequence Diagrams
+
+### 12.1 Image Upload + Embedding Generation
+
+```mermaid
+sequenceDiagram
+    participant User
+    participant API as API Gateway
+    participant Upload as Upload Service
+    participant S3 as Object Storage (S3)
+    participant Queue as Processing Queue (SQS)
+    participant Embed as Embedding Service (GPU)
+    participant Model as CLIP/ViT Model
+    participant VecDB as Vector DB (Milvus/Pinecone)
+    participant MetaDB as Metadata DB (PostgreSQL)
+
+    User->>API: POST /images/upload {image_file, tags, description}
+    API->>Upload: Process upload
+    Upload->>S3: Store original image + generate thumbnails
+    S3-->>Upload: image_url, thumbnail_urls
+    Upload->>MetaDB: INSERT image record (id, url, tags, user_id)
+    Upload->>Queue: Enqueue embedding job {image_id, s3_path}
+    Upload-->>User: 202 Accepted {image_id, status: "processing"}
+
+    Queue->>Embed: Dequeue job
+    Embed->>S3: Download image
+    S3-->>Embed: Image bytes
+    Embed->>Embed: Preprocess: resize 224×224, normalize
+    Embed->>Model: Forward pass through vision encoder
+    Model-->>Embed: 512-dim embedding vector
+    Embed->>VecDB: Upsert(image_id, vector, metadata_filter_fields)
+    Embed->>MetaDB: UPDATE images SET embedding_status='ready' WHERE id=image_id
+    
+    Note over VecDB: Image is now searchable by visual similarity
+```
+
+### 12.2 Visual Similarity Search
+
+```mermaid
+sequenceDiagram
+    participant User
+    participant API as API Gateway
+    participant Search as Search Service
+    participant Model as CLIP Model (GPU)
+    participant VecDB as Vector DB (HNSW Index)
+    participant MetaDB as Metadata DB
+    participant Rank as Re-ranker
+    participant Cache as Result Cache
+
+    alt Text-to-Image Search
+        User->>API: GET /search?q="red sports car on mountain road"
+        API->>Search: textSearch(query)
+        Search->>Model: Encode text → 512-dim vector (CLIP text encoder)
+        Model-->>Search: query_vector
+    else Reverse Image Search
+        User->>API: POST /search/reverse {image_file}
+        API->>Search: reverseSearch(image)
+        Search->>Model: Encode image → 512-dim vector (CLIP image encoder)
+        Model-->>Search: query_vector
+    end
+    
+    Search->>Cache: Check (vector_hash + filters)
+    alt Cache Miss
+        Search->>VecDB: ANN search(query_vector, k=100, filters={license: "free"})
+        Note over VecDB: HNSW graph traversal: O(log n) with ef_search=128
+        VecDB-->>Search: Top-100 results with distances
+        Search->>MetaDB: Batch fetch metadata for 100 results
+        MetaDB-->>Search: Titles, URLs, dimensions, tags
+        Search->>Rank: Re-rank by relevance + quality + freshness
+        Rank-->>Search: Final top-20
+        Search->>Cache: Store (TTL=10min)
+    end
+    Search-->>API: Results with thumbnails + similarity scores
+    API-->>User: {results: [{image_url, similarity: 0.92, ...}, ...]}
+```
+
+---
+
+## 13. Deep Dive: Visual Embedding & ANN Search
+
+### 13.1 CLIP Embedding Pipeline
+
+```
+CLIP (Contrastive Language-Image Pre-training):
+- Jointly trains image encoder + text encoder
+- Same embedding space: text and images are directly comparable
+- cosine_similarity(encode_image(cat_photo), encode_text("a photo of a cat")) ≈ 0.85
+
+Image Encoder (ViT-L/14):
+  Input: 224×224 RGB image
+  → Patch embedding (14×14 patches = 256 tokens)
+  → 24 transformer layers
+  → Output: 768-dim → projection to 512-dim
+
+Text Encoder:
+  Input: tokenized text (max 77 tokens)
+  → 12 transformer layers  
+  → Output: 512-dim (same space as image)
+
+Why CLIP is powerful for search:
+- "Red car" query finds red cars even if no text metadata says "red car"
+- Cross-modal: search images with text, or find similar images
+```
+
+### 13.2 HNSW (Hierarchical Navigable Small World) for ANN
+
+```
+Structure: Multi-layer graph where each layer is a "small world" network
+
+Layer 2 (sparse, long-range links):     ●─────────────────●
+                                         │                 │
+Layer 1 (medium density):        ●───●───●───●─────●──────●───●
+                                 │   │   │   │     │      │   │
+Layer 0 (all points, short links): ●●●●●●●●●●●●●●●●●●●●●●●●●●●
+
+Search algorithm (greedy):
+1. Enter at top layer, find nearest node using few long-range links
+2. Drop to next layer, use current best as starting point
+3. At layer 0, do fine-grained local search
+
+Time complexity: O(log n) average for k-NN query
+Build complexity: O(n log n)
+Space: O(n × M) where M = max connections per node (typically 16-64)
+
+Tuning parameters:
+- M (max connections): 16 (low memory) to 64 (high recall)
+- ef_construction: 200 (build quality, higher = better graph)
+- ef_search: 128 (query quality, higher = better recall, slower)
+
+At 10B images: recall@10 ≈ 0.95, query time ≈ 5ms (with quantization)
 ```

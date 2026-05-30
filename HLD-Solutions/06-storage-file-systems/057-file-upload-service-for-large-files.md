@@ -45,6 +45,52 @@
 
 ## 3. Data Modeling
 
+### Entity-Relationship Diagram
+
+```mermaid
+erDiagram
+    UPLOAD_SESSIONS {
+        uuid session_id PK
+        uuid user_id FK
+        string file_name
+        bigint file_size
+        int total_chunks
+        string status
+    }
+    UPLOAD_CHUNKS {
+        uuid session_id PK
+        int chunk_number PK
+        int chunk_size
+        string status
+        string checksum
+    }
+    USER_QUOTAS {
+        uuid user_id PK
+        string plan_type
+        bigint max_storage
+        bigint used_storage
+        bigint reserved_storage
+    }
+    QUOTA_TRANSACTIONS {
+        uuid txn_id PK
+        uuid user_id FK
+        uuid session_id FK
+        string txn_type
+        bigint amount
+    }
+    SCAN_RESULTS {
+        uuid scan_id PK
+        uuid session_id FK
+        string status
+        string threat_name
+    }
+    UPLOAD_SESSIONS ||--|{ UPLOAD_CHUNKS : "divided into"
+    UPLOAD_SESSIONS ||--o| SCAN_RESULTS : "scanned by"
+    USER_QUOTAS ||--o{ QUOTA_TRANSACTIONS : "tracked via"
+    UPLOAD_SESSIONS ||--o{ QUOTA_TRANSACTIONS : "reserves"
+    USER_QUOTAS ||--o{ UPLOAD_SESSIONS : "owns"
+```
+
 ### Upload Sessions (PostgreSQL)
 ```sql
 CREATE TABLE upload_sessions (
@@ -973,3 +1019,106 @@ class ProgressWebSocket:
 | Virus scan | Post-assembly, pre-finalize | Adds latency before file available but prevents malware distribution |
 | Quota enforcement | Reserve on initiate, commit on complete | Prevents over-subscription but holds quota during long uploads |
 | Edge upload | CDN edge POPs | Reduces latency for first byte but adds CDN cost and complexity |
+
+---
+
+## Sequence Diagrams
+
+### Resumable Upload with tus Protocol
+
+```mermaid
+sequenceDiagram
+    participant C as Client
+    participant TUS as tus Server
+    participant Store as Chunk Store
+    participant MS as Metadata Service
+
+    C->>TUS: POST /uploads (Upload-Length: 5GB, metadata: filename=video.mp4)
+    TUS->>MS: CreateUpload(size=5GB, metadata)
+    MS-->>TUS: upload_id=abc123
+    TUS-->>C: 201 Created (Location: /uploads/abc123)
+
+    C->>TUS: PATCH /uploads/abc123 (Upload-Offset: 0, 64MB chunk)
+    TUS->>Store: Write bytes [0, 64MB)
+    Store-->>TUS: Written
+    TUS->>MS: UpdateOffset(abc123, offset=64MB)
+    TUS-->>C: 204 (Upload-Offset: 67108864)
+
+    C->>TUS: PATCH /uploads/abc123 (Upload-Offset: 64MB, 64MB chunk)
+    TUS->>Store: Write bytes [64MB, 128MB)
+    TUS-->>C: 204 (Upload-Offset: 134217728)
+
+    Note over C,TUS: Network interruption! Client crashes at 2GB uploaded
+
+    C->>TUS: HEAD /uploads/abc123 (resume - where did I leave off?)
+    TUS->>MS: GetOffset(abc123)
+    MS-->>TUS: offset=2147483648 (2GB)
+    TUS-->>C: 200 (Upload-Offset: 2147483648, Upload-Length: 5368709120)
+
+    Note over C: Resume from 2GB (skip already uploaded)
+    C->>TUS: PATCH /uploads/abc123 (Upload-Offset: 2GB, next 64MB)
+    TUS->>Store: Write bytes [2GB, 2GB+64MB)
+    TUS-->>C: 204
+
+    Note over C,TUS: Continue until complete...
+    C->>TUS: PATCH (final chunk, offset reaches 5GB)
+    TUS->>MS: MarkComplete(abc123)
+    TUS->>Store: Assemble final object
+    TUS-->>C: 204 (Upload complete)
+```
+
+### Parallel Multipart Assembly
+
+```mermaid
+sequenceDiagram
+    participant C as Client (multi-threaded)
+    participant LB as Load Balancer
+    participant W1 as Upload Worker 1
+    participant W2 as Upload Worker 2
+    participant W3 as Upload Worker 3
+    participant PS as Part Store
+    participant Asm as Assembly Service
+    participant Final as Final Store
+
+    C->>LB: InitiateMultipartUpload(file=10GB, part_size=100MB)
+    LB-->>C: upload_id, presigned_urls[0..99]
+
+    par 6 concurrent uploads
+        C->>W1: PUT part 0 (100MB) + Content-MD5
+        C->>W2: PUT part 1 (100MB) + Content-MD5
+        C->>W3: PUT part 2 (100MB) + Content-MD5
+        C->>W1: PUT part 3 (100MB) + Content-MD5
+        C->>W2: PUT part 4 (100MB) + Content-MD5
+        C->>W3: PUT part 5 (100MB) + Content-MD5
+    end
+
+    W1->>PS: Store part 0 (verify MD5)
+    W1-->>C: ETag_0
+    W2->>PS: Store part 1
+    W2-->>C: ETag_1
+    W3->>PS: Store part 2
+    W3-->>C: ETag_2
+
+    Note over C: All 100 parts uploaded...
+
+    C->>LB: CompleteMultipartUpload(upload_id, [{partNum:0, ETag_0}, ...])
+    LB->>Asm: Assemble(upload_id, part_manifest)
+    Asm->>PS: Read all 100 parts (parallel, verify ETags)
+    Asm->>Asm: Concatenate in order + compute final SHA-256
+    Asm->>Final: Write assembled 10GB object
+    Final-->>Asm: final_blob_ref
+    Asm->>PS: Delete temporary parts
+    Asm-->>C: 200 OK (ETag: composite-hash, size: 10GB)
+```
+
+## Caching Strategy
+
+| Layer | What's Cached | Technology | TTL | Purpose |
+|-------|---------------|-----------|-----|---------|
+| Upload offset | Last confirmed offset per upload_id | Redis | 7 days (upload expiry) | Instant resume without scanning storage |
+| Part ETags | Computed checksums for uploaded parts | Redis Hash | Until complete/abort | Avoid re-reading parts during assembly |
+| Presigned URLs | Pre-generated upload URLs | In-memory LRU | 1 hour | Avoid re-signing for retries |
+| Rate limit state | Per-user upload bandwidth/count | Redis sliding window | Rolling 1 min | Enforce fair usage |
+| Virus scan results | Scan verdict per content hash | Redis | 24h | Skip re-scan for duplicate uploads |
+
+**Key Insight:** Upload offset caching is critical — without it, resume requires scanning storage to find the last written byte (expensive for multi-TB uploads on cold storage).

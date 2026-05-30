@@ -75,6 +75,38 @@
 
 ## 4. Data Modeling
 
+### Entity-Relationship Diagram
+
+```mermaid
+erDiagram
+    USER {
+        uuid user_id PK
+        string status
+        string custom_text
+    }
+    CONNECTION {
+        string connection_id PK
+        uuid user_id FK
+        string device_id
+        string gateway_id
+        int last_heartbeat
+    }
+    PRESENCE_SUBSCRIPTION {
+        uuid target_user_id PK
+        uuid subscriber_id PK
+        text source
+    }
+    USER_WATCHING {
+        uuid user_id PK
+        uuid target_user_id PK
+        timestamp subscribed_at
+    }
+
+    USER ||--o{ CONNECTION : "maintains"
+    USER ||--o{ PRESENCE_SUBSCRIPTION : "subscribed to"
+    USER ||--o{ USER_WATCHING : "watches"
+```
+
 ### 4.1 Database Selection
 
 | Workload | Database | Justification |
@@ -1373,3 +1405,98 @@ Total: p99 < 50ms for fanout processing
 - Redis: Scale when memory > 70% or latency p99 > 2ms
 - Kafka: Scale when consumer lag > 10K for > 2 minutes
 - Fanout: Scale when queue depth > 50K
+
+---
+
+## Sequence Diagrams
+
+### 1. Connection Lifecycle + Heartbeat
+
+```mermaid
+sequenceDiagram
+    participant C as Client
+    participant LB as Load Balancer (L4)
+    participant GW as WebSocket Gateway
+    participant Auth as Auth Service
+    participant PS as Presence Service
+    participant Cache as Redis Cluster
+    participant Q as Kafka
+    participant Sub as Subscribers
+
+    C->>LB: HTTP Upgrade (WebSocket handshake)
+    LB->>GW: Route (least-connections algorithm)
+    GW->>Auth: Validate JWT token
+    Auth-->>GW: {user_id, scopes, ttl}
+    GW-->>C: 101 Switching Protocols
+
+    GW->>PS: Register connection {user_id, gateway_id, conn_id}
+    PS->>Cache: SET user:{id}:presence = ONLINE, TTL=35s
+    PS->>Cache: SADD gateway:{gw_id}:connections user_id
+    PS->>Q: Publish presence.online {user_id, timestamp}
+
+    loop Every 30 seconds
+        C->>GW: PING (heartbeat)
+        GW-->>C: PONG
+        GW->>Cache: EXPIRE user:{id}:presence 35s (refresh TTL)
+    end
+
+    alt Client disconnects gracefully
+        C->>GW: Close frame
+        GW->>PS: Unregister connection
+        PS->>Cache: DEL user:{id}:presence
+        PS->>Q: Publish presence.offline {user_id}
+    else Heartbeat timeout (no PING for 35s)
+        GW->>GW: Connection timeout detected
+        GW->>PS: Mark user offline
+        PS->>Cache: DEL user:{id}:presence
+        PS->>Q: Publish presence.offline {user_id, reason: timeout}
+    else Gateway crash
+        Note over Cache: TTL expires after 35s (no refresh)
+        Cache->>Cache: Key expires automatically
+        Q->>PS: Presence sweeper detects expired keys
+        PS->>Q: Publish presence.offline {user_id, reason: gateway_crash}
+    end
+```
+
+### 2. Presence Fanout to Subscribers
+
+```mermaid
+sequenceDiagram
+    participant U as User (goes online)
+    participant PS as Presence Service
+    participant Q as Kafka (presence topic)
+    participant FS as Fanout Service
+    participant Cache as Redis
+    participant GW1 as Gateway Node 1
+    participant GW2 as Gateway Node 2
+    participant S1 as Subscriber (Friend 1)
+    participant S2 as Subscriber (Friend 2)
+
+    U->>PS: Status change → ONLINE
+    PS->>Q: Publish presence.changed {user_id, status: online}
+
+    Q->>FS: Consume presence event
+    FS->>Cache: GET user:{id}:subscribers (friends/contacts list)
+    FS->>FS: Partition subscribers by gateway affinity
+
+    Note over FS: For users with many subscribers (celebrities),<br/>use tiered fanout: immediate (close friends) + delayed (others)
+
+    par Fanout to Gateway 1 subscribers
+        FS->>GW1: Batch presence update {user_id: online, targets: [friend1, friend3]}
+        GW1-->>S1: presence_update {user: U, status: online}
+    and Fanout to Gateway 2 subscribers
+        FS->>GW2: Batch presence update {user_id: online, targets: [friend2]}
+        GW2-->>S2: presence_update {user: U, status: online}
+    end
+
+    Note over FS: Optimization: Suppress rapid flapping<br/>(offline→online within 5s = no fanout for offline)
+
+    S1->>GW1: Subscribe to U's presence (implicit via contact list)
+    
+    alt High-fanout user (>10K subscribers)
+        FS->>FS: Pull-based model (subscribers poll on viewport focus)
+    else Normal user
+        FS->>FS: Push-based model (immediate fanout)
+    end
+```
+

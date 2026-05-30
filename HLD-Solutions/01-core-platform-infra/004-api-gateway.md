@@ -85,6 +85,65 @@ Log ingestion: Kafka cluster with 12 brokers
 
 ## 4. Data Modeling
 
+### Entity-Relationship Diagram
+
+```mermaid
+erDiagram
+    TENANTS {
+        uuid id PK
+        string name
+    }
+    ROUTES {
+        uuid id PK
+        uuid tenant_id FK
+        uuid upstream_service_id FK
+        string path_pattern
+        uuid auth_policy_id FK
+        uuid rate_limit_policy_id FK
+    }
+    SERVICES {
+        uuid id PK
+        uuid tenant_id FK
+        string name
+        string base_url
+        string load_balance_strategy
+    }
+    API_KEYS {
+        uuid id PK
+        uuid tenant_id FK
+        string key_hash
+        string scopes
+        timestamp expires_at
+    }
+    RATE_LIMIT_POLICIES {
+        uuid id PK
+        uuid tenant_id FK
+        string algorithm
+        string scope
+    }
+    AUTH_POLICIES {
+        uuid id PK
+        uuid tenant_id FK
+        string auth_type
+        string jwks_url
+    }
+    ACCESS_LOGS {
+        uuid request_id PK
+        uuid tenant_id FK
+        uuid route_id FK
+        int status_code
+        int latency_ms
+    }
+
+    TENANTS ||--o{ ROUTES : owns
+    TENANTS ||--o{ SERVICES : registers
+    TENANTS ||--o{ API_KEYS : issues
+    SERVICES ||--o{ ROUTES : upstream_for
+    AUTH_POLICIES ||--o{ ROUTES : secures
+    RATE_LIMIT_POLICIES ||--o{ ROUTES : limits
+    ROUTES ||--o{ ACCESS_LOGS : generates
+```
+
 ### Database Choice Rationale
 | Data | Store | Why |
 |------|-------|-----|
@@ -1546,3 +1605,127 @@ Dashboard 5: Infrastructure
 3. **Service mesh integration**: Gateway as north-south traffic, Envoy sidecars for east-west
 4. **AI-powered**: ML-based anomaly detection for auto-blocking and traffic shaping
 5. **Developer portal**: Self-service API key management, documentation, sandbox environments
+
+---
+
+## Sequence Diagrams
+
+### 1. Request Routing Flow
+
+```mermaid
+sequenceDiagram
+    participant Client
+    participant DNS
+    participant LB as Load Balancer (L7)
+    participant GW as API Gateway
+    participant Auth as Auth Service
+    participant SR as Service Registry
+    participant Backend
+
+    Client->>DNS: Resolve api.example.com
+    DNS-->>Client: LB IP (geo-routed)
+    Client->>LB: HTTPS request
+    LB->>GW: Forward (sticky session by client_id)
+
+    GW->>GW: Parse path, match route (/v2/orders/*)
+    GW->>Auth: Validate JWT token
+    Auth-->>GW: {valid: true, scopes: [orders.read], tenant_id: T1}
+
+    GW->>GW: Apply plugins (rate limit, request transform, logging)
+    GW->>SR: Resolve backend for route
+    SR-->>GW: orders-service.internal:8080 (3 healthy instances)
+
+    GW->>Backend: Forward (with X-Tenant-Id, X-Request-Id headers)
+    Backend-->>GW: 200 OK {order data}
+    GW->>GW: Response transform + add CORS headers
+    GW-->>Client: 200 OK
+```
+
+### 2. Authentication & Authorization Flow
+
+```mermaid
+sequenceDiagram
+    participant Client
+    participant GW as API Gateway
+    participant Cache as Token Cache (Redis)
+    participant IDP as Identity Provider
+    participant Policy as OPA Policy Engine
+
+    Client->>GW: Request with Bearer token
+
+    GW->>Cache: Lookup token hash
+    alt Token cached & valid
+        Cache-->>GW: {claims, expiry}
+    else Token not cached
+        GW->>IDP: Introspect / verify JWT signature
+        IDP-->>GW: {active: true, sub, scopes, exp}
+        GW->>Cache: Cache claims (TTL = min(token_exp, 5min))
+    end
+
+    GW->>Policy: Evaluate {method, path, claims, ip}
+    Note over Policy: OPA Rego rules:<br/>- Scope check (orders.write needed)<br/>- Tenant isolation<br/>- IP allowlist for admin routes
+    Policy-->>GW: {allow: true, filters: [tenant_id=T1]}
+
+    alt Authorized
+        GW->>GW: Inject tenant filter into request
+        GW-->>Client: Forward to backend
+    else Denied
+        GW-->>Client: 403 Forbidden {reason}
+    end
+```
+
+### 3. WebSocket Upgrade Flow
+
+```mermaid
+sequenceDiagram
+    participant Client
+    participant GW as API Gateway
+    participant Auth as Auth Service
+    participant WS as WebSocket Service
+    participant Redis as Pub/Sub (Redis)
+
+    Client->>GW: GET /ws/notifications (Upgrade: websocket)
+    GW->>Auth: Validate connection token (one-time ticket)
+    Auth-->>GW: {valid, user_id: U1, channels: [orders, alerts]}
+
+    GW->>GW: Check concurrent WS connections for user (max 5)
+
+    alt Under limit
+        GW->>WS: Upgrade connection (pass user context)
+        WS-->>Client: 101 Switching Protocols
+        WS->>Redis: SUBSCRIBE user:U1:notifications
+
+        loop While connected
+            Redis-->>WS: New message on channel
+            WS-->>Client: WebSocket frame {event data}
+        end
+
+        Note over WS: Heartbeat every 30s<br/>Close idle connections after 5min
+        Client->>WS: Close frame
+        WS->>Redis: UNSUBSCRIBE
+    else Over limit
+        GW-->>Client: 429 Too Many Connections
+    end
+```
+
+### Async Processing (Expanded)
+
+#### Message Queue / Kafka Topic Design
+- **Topics**: `api.requests.dlq`, `api.audit.events`, `api.config.changes`, `api.analytics.raw`
+- **Partitioning**: `api.audit.events` partitioned by `tenant_id` (ensures ordering per tenant)
+- **Retention**: Audit events 90 days, analytics 7 days, DLQ 30 days
+
+#### Consumer Group Strategy
+- **Config propagation**: Single consumer group `gw-config-sync` — all gateway instances consume all partitions (broadcast)
+- **Analytics**: Consumer group `gw-analytics-processor` with auto-scaling (1 consumer per partition, max 32)
+- **Audit**: Consumer group `audit-writer` with exactly-once semantics (idempotent writes to audit DB)
+
+#### Dead Letter Queues
+- Failed auth webhook callbacks → `auth.webhooks.dlq` (retry 3x with exponential backoff: 1s, 10s, 60s)
+- Failed request transformations → `transform.errors.dlq` (alert on > 100/min)
+- Manual replay tool for DLQ inspection and selective re-processing
+
+#### Exactly-Once Semantics
+- Idempotency key (X-Request-Id) stored in Redis with 24h TTL
+- Kafka transactional producer for audit events (enable.idempotence=true, transactional.id per instance)
+- Consumer offset commits within same transaction as downstream writes

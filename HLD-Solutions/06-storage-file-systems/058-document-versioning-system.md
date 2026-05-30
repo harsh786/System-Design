@@ -45,6 +45,56 @@
 
 ## 3. Data Modeling
 
+### Entity-Relationship Diagram
+
+```mermaid
+erDiagram
+    DOCUMENTS {
+        uuid doc_id PK
+        uuid owner_id FK
+        uuid workspace_id FK
+        string name
+        string doc_type
+        uuid current_version_id FK
+    }
+    VERSIONS {
+        uuid version_id PK
+        uuid doc_id FK
+        uuid branch_id FK
+        bigint version_number
+        string storage_type
+        string content_hash
+    }
+    BRANCHES {
+        uuid branch_id PK
+        uuid doc_id FK
+        string name
+        uuid head_version_id FK
+        string status
+    }
+    MERGE_RECORDS {
+        uuid merge_id PK
+        uuid doc_id FK
+        uuid source_branch FK
+        uuid target_branch FK
+        uuid result_version FK
+        string merge_strategy
+    }
+    VERSION_AUDIT {
+        uuid doc_id PK
+        timestamp event_time PK
+        string event_type
+        uuid version_id FK
+        uuid user_id FK
+    }
+    DOCUMENTS ||--o{ BRANCHES : "has branches"
+    DOCUMENTS ||--o{ VERSIONS : "versioned as"
+    BRANCHES ||--o{ VERSIONS : contains
+    BRANCHES ||--o{ MERGE_RECORDS : "source of"
+    BRANCHES ||--o{ MERGE_RECORDS : "target of"
+    DOCUMENTS ||--o{ VERSION_AUDIT : "audited in"
+```
+
 ### Documents (PostgreSQL)
 ```sql
 CREATE TABLE documents (
@@ -834,3 +884,105 @@ class DiffService:
 | Merge strategy | Three-way with LCA | Standard approach; could use operational merge for structured docs but complex |
 | Conflict markers | Git-style inline | Familiar to developers; structured conflict objects better for non-text but harder to render |
 | Garbage collection | Keep all labeled, compact unlabeled after 90d | Preserves important versions; could lose intermediate states |
+
+---
+
+## Sequence Diagrams
+
+### Create Version + DAG Update
+
+```mermaid
+sequenceDiagram
+    participant C as Client
+    participant API as Version API
+    participant DAG as DAG Service
+    participant Store as Content Store
+    participant Meta as Metadata DB
+    participant Evt as Event Bus
+
+    C->>API: CreateVersion(doc_id, parent_version=v5, content, message="Add chapter 3")
+    API->>Store: ComputeDelta(parent_v5_content, new_content)
+    Store->>Store: Binary diff (bsdiff algorithm)
+    Store-->>API: delta (12KB vs 500KB full)
+    API->>Store: StoreDelta(doc_id, v6, delta, compressed=zstd)
+    Store-->>API: delta_ref
+
+    API->>DAG: AddNode(doc_id, version=v6, parents=[v5])
+    DAG->>Meta: INSERT version (v6, parent_ids=[v5], delta_ref, timestamp, author)
+    DAG->>Meta: UPDATE doc SET head_version=v6 WHERE doc_id=X AND head=v5
+    
+    alt Optimistic lock success (no concurrent commit)
+        Meta-->>DAG: Updated (1 row affected)
+        DAG-->>API: Version v6 created (linear history)
+    else Concurrent commit detected (head already moved to v6')
+        Meta-->>DAG: 0 rows affected (head != v5)
+        DAG-->>API: CONFLICT (head is now v6', need merge)
+        API-->>C: 409 Conflict (must merge with v6')
+    end
+
+    API->>Evt: Publish(VersionCreated, {doc_id, v6, author})
+    API-->>C: 201 Created (version=v6, parents=[v5])
+
+    Note over DAG: Check if snapshot needed
+    DAG->>DAG: Count versions since last snapshot
+    alt > 50 versions since snapshot
+        DAG->>Store: CreateSnapshot(v6, full_content)
+        DAG->>Meta: Mark v6 as snapshot_version
+    end
+```
+
+### Three-Way Merge Conflict Resolution
+
+```mermaid
+sequenceDiagram
+    participant CA as Client A
+    participant CB as Client B
+    participant API as Version API
+    participant Merge as Merge Engine
+    participant DAG as DAG Service
+    participant Store as Content Store
+
+    Note over CA,CB: Both branch from v5 (common ancestor)
+    CA->>API: CreateVersion(parent=v5, content_A) → v6 created
+    CB->>API: CreateVersion(parent=v5, content_B) → CONFLICT (head=v6)
+
+    API->>Merge: ThreeWayMerge(base=v5, ours=v6, theirs=content_B)
+    
+    Merge->>Store: Fetch content at v5 (reconstruct from snapshots + deltas)
+    Store-->>Merge: base_content
+    Merge->>Store: Fetch content at v6
+    Store-->>Merge: ours_content
+
+    Merge->>Merge: Diff3(base, ours, theirs)
+    
+    Note over Merge: Line-by-line three-way diff:
+    Note over Merge: 1. Find LCA (Lowest Common Ancestor) = v5
+    Note over Merge: 2. Compute diff(base→ours) and diff(base→theirs)
+    Note over Merge: 3. Apply non-conflicting hunks automatically
+    Note over Merge: 4. Mark overlapping hunks as conflicts
+
+    alt All hunks non-overlapping (auto-mergeable)
+        Merge-->>API: merged_content (clean merge)
+        API->>DAG: AddNode(v7, parents=[v6, content_B_version])
+        DAG-->>API: Merge commit v7 (diamond in DAG)
+        API-->>CB: 201 Created (v7, auto-merged)
+    else Overlapping edits (conflict)
+        Merge-->>API: partial_merge + conflict_markers
+        API-->>CB: 409 Conflict + conflict_diff
+        CB->>CB: User resolves conflicts manually
+        CB->>API: CreateVersion(parents=[v6, v6B], resolved_content)
+        API->>DAG: AddNode(v7, parents=[v6, v6B], merge_commit=true)
+        API-->>CB: 201 Created (v7, manual merge)
+    end
+```
+
+## Async Processing
+
+| Operation | Mechanism | Purpose | SLA |
+|-----------|-----------|---------|-----|
+| Snapshot creation | Background worker (every 50 versions) | Fast reconstruction | < 5 min after trigger |
+| Delta compaction | Nightly batch job | Reduce chain length | Overnight window |
+| Garbage collection | Mark-and-sweep (unreachable versions) | Reclaim storage | Weekly |
+| Search re-indexing | Event-driven (on version create) | Keep search current | < 10s |
+| Branch cleanup | TTL-based (stale branches > 90d) | Reduce DAG complexity | Daily scan |
+| Audit log export | Kafka consumer | Compliance | Near real-time |

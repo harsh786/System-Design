@@ -43,6 +43,54 @@
 
 ## 3. Data Modeling
 
+### Entity-Relationship Diagram
+
+```mermaid
+erDiagram
+    LIFECYCLE_POLICIES {
+        uuid policy_id PK
+        uuid org_id FK
+        string name
+        string status
+        int priority
+        jsonb rules
+    }
+    OBJECT_INVENTORY {
+        string bucket PK
+        string key PK
+        string version_id PK
+        bigint size_bytes
+        string current_tier
+        string hold_status
+    }
+    TRANSITION_JOBS {
+        uuid job_id PK
+        uuid policy_id FK
+        string job_type
+        string status
+        string source_tier
+        string target_tier
+    }
+    COMPLIANCE_HOLDS {
+        uuid hold_id PK
+        uuid org_id FK
+        string hold_type
+        string status
+        jsonb scope
+    }
+    STORAGE_COSTS {
+        uuid org_id PK
+        string bucket PK
+        timestamptz measured_at PK
+        decimal storage_cost
+        decimal retrieval_cost
+    }
+    LIFECYCLE_POLICIES ||--o{ TRANSITION_JOBS : triggers
+    LIFECYCLE_POLICIES }o--o{ OBJECT_INVENTORY : "applies to"
+    COMPLIANCE_HOLDS }o--o{ OBJECT_INVENTORY : "holds"
+    OBJECT_INVENTORY ||--o{ STORAGE_COSTS : "incurs"
+```
+
 ### Lifecycle Policies (PostgreSQL)
 ```sql
 CREATE TABLE lifecycle_policies (
@@ -984,3 +1032,90 @@ class AuditLogger:
 | Cost modeling | Per-prefix aggregation | Useful granularity for recommendations; per-object too expensive at scale |
 | Simulation accuracy | 1% sampling extrapolated | Fast but may miss edge cases; full simulation accurate but takes hours |
 | Multi-cloud | Abstract storage interface | Flexibility but LCD of features across clouds; could optimize per-cloud but complex |
+
+---
+
+## Sequence Diagrams
+
+### Policy Evaluation + Tier Transition
+
+```mermaid
+sequenceDiagram
+    participant Sched as Policy Scheduler (Cron)
+    participant PE as Policy Engine
+    participant Idx as Object Index (metadata DB)
+    participant Rules as Rule Store
+    participant Trans as Transition Worker
+    participant Hot as Hot Tier (SSD)
+    participant Warm as Warm Tier (HDD)
+    participant Cold as Cold Tier (Glacier)
+    participant Audit as Audit Log
+
+    Sched->>PE: TriggerEvaluation(bucket="media-assets")
+    PE->>Rules: GetPolicies(bucket="media-assets")
+    Rules-->>PE: [{rule: "move to Warm after 30d"}, {rule: "move to Cold after 90d"}, {rule: "delete after 365d"}]
+
+    PE->>Idx: Query objects matching rule criteria
+    Note over PE,Idx: SELECT * FROM objects<br/>WHERE bucket='media-assets'<br/>AND last_access < now()-30d<br/>AND current_tier='HOT'<br/>LIMIT 10000
+    Idx-->>PE: [obj1, obj2, ... obj8500] (candidates)
+
+    PE->>PE: Filter: exclude legal holds, active locks, min-age violations
+    PE-->>Trans: TransitionBatch([obj1..obj7200], HOT→WARM)
+
+    loop For each batch of 100 objects
+        Trans->>Hot: CopyObject(obj_id) → stream data
+        Trans->>Warm: WriteObject(obj_id, data, metadata)
+        Warm-->>Trans: Written (new_location)
+        Trans->>Idx: UpdateTier(obj_id, tier=WARM, location=new_loc)
+        Trans->>Hot: DeleteObject(obj_id) [after confirm]
+        Trans->>Audit: Log(obj_id, HOT→WARM, timestamp, policy_id)
+    end
+
+    PE-->>Sched: Evaluation complete (7200 transitioned, 1300 excluded)
+```
+
+### Cost Optimization Scan
+
+```mermaid
+sequenceDiagram
+    participant Cron as Weekly Cost Scanner
+    participant Ana as Cost Analyzer
+    participant Idx as Object Index
+    participant Metrics as Access Metrics (time-series)
+    participant Rec as Recommendation Engine
+    participant Admin as Admin Dashboard
+
+    Cron->>Ana: RunCostAnalysis(all_buckets)
+    Ana->>Idx: GetStorageDistribution()
+    Idx-->>Ana: {HOT: 500TB, WARM: 2PB, COLD: 10PB, total_objects: 50B}
+
+    Ana->>Metrics: GetAccessPatterns(last_90d, sample=1%)
+    Metrics-->>Ana: {HOT_objects_never_accessed_30d: 120TB, COLD_frequently_accessed: 5TB}
+
+    Ana->>Rec: AnalyzeMisplacements(access_data, current_tiers)
+    
+    Rec->>Rec: Calculate cost savings:
+    Note over Rec: 120TB HOT→WARM: save $2,400/mo (storage) - $50 (retrieval) = $2,350/mo
+    Note over Rec: 5TB COLD→WARM: cost $500/mo more storage but save $3,000/mo retrieval fees
+    
+    Rec-->>Ana: Recommendations:<br/>1. Move 120TB HOT→WARM (save $2,350/mo)<br/>2. Move 5TB COLD→WARM (save $2,500/mo)<br/>3. Enable intelligent tiering on bucket "logs" (save $800/mo)
+
+    Ana->>Admin: PublishReport(total_savings_opportunity: $5,650/mo)
+    Admin-->>Admin: Display recommendations with one-click apply
+    
+    Note over Admin: Admin approves recommendation #1
+    Admin->>Ana: ApplyRecommendation(id=1, schedule=off-peak)
+    Ana->>Cron: ScheduleTransition(120TB, HOT→WARM, window=02:00-06:00)
+```
+
+## Caching Strategy
+
+| Layer | What's Cached | Technology | TTL | Purpose |
+|-------|---------------|-----------|-----|---------|
+| Policy rules | Parsed policy definitions | In-memory (per worker) | 5 min | Avoid DB round-trip per object evaluation |
+| Object metadata | Tier, size, last_access, holds | Redis | 1 hour | Fast policy evaluation without index scan |
+| Legal hold status | Hold flags per object/bucket | Redis bitmap | 1 min (short!) | Safety: prevent accidental transitions |
+| Cost rates | Per-tier pricing, API costs | Config cache | 24h | Cost calculations |
+| Transition state | In-progress transitions | Redis | Until complete | Prevent duplicate transitions, resume on crash |
+
+**Critical safety invariant:** Legal hold cache has 1-min TTL — if a hold is placed, worst case the object could be in-flight for transition. Solution: double-check hold status before final delete of source copy.

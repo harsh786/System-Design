@@ -57,6 +57,59 @@
 
 ## 4. Data Modeling
 
+### Entity-Relationship Diagram
+
+```mermaid
+erDiagram
+    JOBS {
+        uuid job_id PK
+        uuid tenant_id
+        varchar queue_name FK
+        varchar status
+        uuid parent_job_id FK
+        int priority
+    }
+    JOB_STAGES {
+        uuid stage_id PK
+        uuid job_id FK
+        int stage_number
+        varchar stage_type
+        varchar status
+    }
+    TASKS {
+        uuid task_id PK
+        uuid stage_id FK
+        uuid job_id FK
+        varchar status
+        varchar executor_id
+    }
+    RESOURCE_QUEUES {
+        varchar queue_name PK
+        uuid tenant_id
+        varchar scheduling_policy
+        int max_cores
+    }
+    WORKER_NODES {
+        varchar node_id PK
+        varchar hostname
+        int total_cores
+        varchar status
+    }
+    SHUFFLE_BLOCKS {
+        uuid shuffle_id PK
+        int map_id PK
+        int reduce_id PK
+        varchar node_id FK
+    }
+
+    JOBS ||--o{ JOB_STAGES : contains
+    JOB_STAGES ||--o{ TASKS : splits-into
+    JOBS ||--o{ JOBS : parent-child
+    RESOURCE_QUEUES ||--o{ JOBS : schedules
+    WORKER_NODES ||--o{ TASKS : executes
+    WORKER_NODES ||--o{ SHUFFLE_BLOCKS : stores
+```
+
 ### PostgreSQL Schemas
 
 ```sql
@@ -1092,3 +1145,95 @@ groups:
 ---
 
 *Total lines: 500+ | Covers all 11 standard sections with full depth*
+
+---
+
+## 12. Sequence Diagrams
+
+### Diagram 1: Job Submission + Resource Allocation
+
+```mermaid
+sequenceDiagram
+    participant Client
+    participant RM as ResourceManager
+    participant Scheduler as Fair Scheduler
+    participant NM1 as NodeManager-1
+    participant NM2 as NodeManager-2
+    participant AM as ApplicationMaster
+
+    Client->>RM: Submit job (JAR, config, resource requirements)
+    RM->>RM: Validate job, assign application_id
+    RM->>Scheduler: Enqueue in tenant queue (DRF policy)
+    RM-->>Client: 202 Accepted (application_id)
+
+    Note over Scheduler: Scheduling round (1s interval)
+    Scheduler->>Scheduler: Calculate DRF shares per queue
+    Scheduler->>RM: Allocate container for AM (1 vCPU, 2GB)
+    RM->>NM1: Launch ApplicationMaster container
+    NM1-->>RM: AM running (host:port)
+
+    AM->>RM: Register + request resources (50 containers × 4 vCPU, 8GB)
+    RM->>Scheduler: Capacity check across nodes
+
+    loop Resource Allocation Rounds
+        Scheduler->>RM: Grant 10 containers on NM1 (rack-local)
+        Scheduler->>RM: Grant 8 containers on NM2 (data-local)
+        RM->>AM: Container grants (node, port, token)
+        AM->>NM1: Launch task containers (map tasks with data splits)
+        AM->>NM2: Launch task containers
+    end
+
+    NM1-->>AM: Task complete (output location)
+    NM2-->>AM: Task complete
+    AM->>RM: Unregister, release all resources
+    AM-->>Client: Job SUCCEEDED (output path)
+```
+
+### Diagram 2: Shuffle Stage + Data Locality Optimization
+
+```mermaid
+sequenceDiagram
+    participant Map1 as Mapper (Node A)
+    participant Map2 as Mapper (Node B)
+    participant SM as Shuffle Manager
+    participant Sort as Sort/Merge
+    participant Red1 as Reducer (Node C)
+    participant Red2 as Reducer (Node D)
+    participant HDFS as HDFS
+
+    Note over Map1,Map2: Map phase completes
+
+    Map1->>Map1: Partition output by reducer (hash % num_reducers)
+    Map1->>Map1: Sort within each partition (sort buffer = 100MB)
+    Map1->>Map1: Spill to local disk when buffer full
+    Map1->>SM: Register shuffle output (partition → file locations)
+
+    Map2->>Map2: Same partition + sort + spill
+    Map2->>SM: Register shuffle output
+
+    Note over SM: Shuffle metadata available
+
+    Red1->>SM: Request partition 0 locations
+    SM-->>Red1: [{Map1: offset 0-500MB}, {Map2: offset 0-300MB}]
+
+    par Parallel Shuffle Pull
+        Red1->>Map1: HTTP GET partition 0 (with checksum)
+        Red1->>Map2: HTTP GET partition 0
+        Red2->>Map1: HTTP GET partition 1
+        Red2->>Map2: HTTP GET partition 1
+    end
+
+    Map1-->>Red1: Partition 0 data (compressed LZ4)
+    Map2-->>Red1: Partition 0 data
+
+    Red1->>Sort: Merge-sort streams from all mappers
+    Sort-->>Red1: Sorted partition ready
+
+    Red1->>Red1: Apply reduce function
+    Red1->>HDFS: Write final output (3x replication)
+    HDFS-->>Red1: ACK (block locations)
+
+    Note over Red1: If straggler detected (>1.5× median)
+    Red1->>SM: Launch speculative copy on faster node
+```
+

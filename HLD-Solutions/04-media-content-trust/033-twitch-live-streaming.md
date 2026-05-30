@@ -88,6 +88,61 @@ Edge CDN nodes:
 
 ## 5. Data Modeling
 
+### Entity-Relationship Diagram
+
+```mermaid
+erDiagram
+    USERS {
+        bigint user_id PK
+        varchar username
+        varchar broadcaster_type
+        boolean is_verified
+    }
+    CHANNELS {
+        bigint channel_id PK
+        bigint user_id FK
+        varchar title
+        boolean is_live
+        bigint follower_count
+    }
+    STREAMS {
+        bigint stream_id PK
+        bigint channel_id FK
+        varchar title
+        int peak_viewers
+        varchar stream_type
+    }
+    CHAT_MESSAGES {
+        bigint channel_id PK
+        timeuuid message_id PK
+        bigint user_id FK
+        text message_body
+    }
+    SUBSCRIPTIONS {
+        bigint subscription_id PK
+        bigint subscriber_id FK
+        bigint channel_id FK
+        smallint tier
+        boolean is_active
+    }
+    CLIPS {
+        varchar clip_id PK
+        bigint stream_id FK
+        bigint channel_id FK
+        bigint creator_id FK
+        varchar title
+        bigint view_count
+    }
+
+    USERS ||--|| CHANNELS : owns
+    CHANNELS ||--o{ STREAMS : broadcasts
+    CHANNELS ||--o{ CHAT_MESSAGES : has
+    USERS ||--o{ SUBSCRIPTIONS : subscribes
+    CHANNELS ||--o{ SUBSCRIPTIONS : "subscribed to"
+    STREAMS ||--o{ CLIPS : "clipped from"
+    USERS ||--o{ CLIPS : creates
+```
+
 ### 5.1 Users Table (PostgreSQL - Sharded by user_id)
 
 ```sql
@@ -1346,3 +1401,140 @@ Revenue offset:
 6. **Multi-view**: Allow viewers to watch 4 streams simultaneously with synchronized audio switching
 
 ---
+
+---
+
+## Sequence Diagrams
+
+### 1. Go Live + Ingest + Transcode
+
+```mermaid
+sequenceDiagram
+    participant S as Streamer (OBS)
+    participant Ingest as Ingest Server (POP)
+    participant Auth as Auth Service
+    participant Router as Stream Router
+    participant Trans as Transcoder Cluster
+    participant Origin as Origin (Segment Store)
+    participant CDN as CDN Edge
+    participant V as Viewer
+
+    S->>Ingest: RTMP CONNECT + stream key
+    Ingest->>Auth: Validate stream key + channel status
+    alt Invalid key / banned
+        Auth-->>Ingest: REJECT
+        Ingest-->>S: Connection refused
+    else Valid
+        Auth-->>Ingest: OK (channel_id, ingest_config)
+    end
+
+    Ingest->>Router: Register stream (channel_id, ingest_pop)
+    Router->>Router: Select transcoder (least-loaded, geo-aware)
+    Router-->>Ingest: Assigned transcoder endpoint
+
+    loop Continuous stream
+        S->>Ingest: RTMP frames (video + audio)
+        Ingest->>Ingest: Demux, timestamp alignment
+        Ingest->>Trans: Forward raw frames (SRT/internal protocol)
+        Trans->>Trans: Encode to multiple qualities (source, 720p, 480p, 360p)
+        Trans->>Trans: Segment into 2-second HLS chunks
+        Trans->>Origin: Push segments + update manifest
+    end
+
+    V->>CDN: GET /channel/master.m3u8
+    CDN->>Origin: Fetch latest manifest
+    Origin-->>CDN: Manifest (live edge)
+    CDN-->>V: Manifest
+    V->>CDN: GET segment_N.ts
+    CDN-->>V: Segment (latency: 2-5s from capture)
+
+    Note over S,V: End-to-end glass-to-glass: ~3-8 seconds
+```
+
+### 2. Chat Message at Scale
+
+```mermaid
+sequenceDiagram
+    participant U as Viewer
+    participant WS as WebSocket Gateway
+    participant Rate as Rate Limiter
+    participant Filter as Chat Filter (ML + rules)
+    participant Pub as Pub/Sub (NATS/Kafka)
+    participant Room as Room State Service
+    participant Fan as Fanout Workers
+    participant Viewers as Connected Viewers (100K+)
+
+    U->>WS: Send chat message {channel_id, text}
+    WS->>Rate: Check rate limit (user, channel)
+    alt Rate exceeded
+        Rate-->>WS: THROTTLE
+        WS-->>U: Message dropped (silent / notice)
+    else OK
+        Rate-->>WS: PASS
+    end
+
+    WS->>Filter: Classify message
+    Filter->>Filter: Check banned words, regex, ML toxicity
+    Filter->>Room: Check user state (subscriber, mod, banned, slow-mode)
+    alt Filtered out
+        Filter-->>WS: REJECT (automod hold / banned term)
+        WS-->>U: Message held for review
+    else Approved
+        Filter-->>WS: PASS (with badges, emote parsing)
+    end
+
+    WS->>Pub: Publish chat event {channel_id, user, rendered_msg}
+
+    Pub->>Fan: Distribute to fanout workers
+    Fan->>Fan: Partition viewers by connection server
+    loop For each connection server partition
+        Fan->>Viewers: Batch push messages (WebSocket frames)
+    end
+
+    Note over Fan,Viewers: 100K viewers receive message in <200ms from send
+```
+
+### 3. Clip Creation from Live Stream
+
+```mermaid
+sequenceDiagram
+    participant U as Viewer / Mod
+    participant API as Clip API
+    participant Meta as Metadata Service
+    participant Seg as Segment Store (Origin)
+    participant Clip as Clip Worker
+    participant S3 as Permanent Storage (S3)
+    participant CDN as CDN
+    participant DB as Clip DB
+
+    U->>API: POST /clips {channel_id, offset: -30s, duration: 60s}
+    API->>Meta: Resolve stream timeline → segment range
+    Meta-->>API: Segments [seg_101 ... seg_131], timestamps
+
+    API->>DB: Create clip record (status: processing)
+    API-->>U: 202 Accepted {clip_id, preview_url: pending}
+
+    API->>Clip: Queue clip job
+
+    Clip->>Seg: Download required segments
+    Seg-->>Clip: Raw TS segments
+    Clip->>Clip: Trim to exact timestamps (re-encode boundaries)
+    Clip->>Clip: Generate thumbnail at highlight moment
+    Clip->>Clip: Encode clip (720p, 1080p)
+
+    alt Encoding succeeds
+        Clip->>S3: Upload final clip + thumbnail
+        Clip->>DB: Update clip (status: ready, URL, duration, thumbnail)
+        Clip->>CDN: Warm cache for clip URL
+    else Encoding fails
+        Clip->>Clip: Retry (max 2x)
+        alt Still fails
+            Clip->>DB: Update clip (status: failed)
+            Note over Clip: Alert + manual investigation
+        end
+    end
+
+    U->>API: GET /clips/{clip_id}
+    API->>DB: Fetch clip metadata
+    API-->>U: Clip URL, thumbnail, share link
+```

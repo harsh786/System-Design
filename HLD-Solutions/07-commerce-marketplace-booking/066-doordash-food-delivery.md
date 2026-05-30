@@ -57,6 +57,55 @@ Picked Up → Dasher En Route to Customer → Delivered
 
 ## 4. Data Modeling
 
+### Entity-Relationship Diagram
+
+```mermaid
+erDiagram
+    restaurants {
+        UUID restaurant_id PK
+        VARCHAR name
+        GEOGRAPHY location
+        VARCHAR status
+        DECIMAL avg_rating
+        DECIMAL commission_rate
+    }
+    menu_categories {
+        UUID category_id PK
+        UUID restaurant_id FK
+        VARCHAR name
+        INTEGER sort_order
+    }
+    menu_items {
+        UUID item_id PK
+        UUID restaurant_id FK
+        UUID category_id FK
+        VARCHAR name
+        DECIMAL base_price
+        BOOLEAN is_available
+    }
+    orders {
+        UUID order_id PK
+        UUID customer_id FK
+        UUID restaurant_id FK
+        UUID dasher_id FK
+        VARCHAR status
+        DECIMAL total
+    }
+    order_items {
+        UUID order_item_id PK
+        UUID order_id FK
+        UUID menu_item_id FK
+        INTEGER quantity
+        DECIMAL unit_price
+    }
+
+    restaurants ||--o{ menu_categories : "has"
+    menu_categories ||--o{ menu_items : "contains"
+    restaurants ||--o{ orders : "receives"
+    orders ||--o{ order_items : "contains"
+    menu_items ||--o{ order_items : "ordered as"
+```
+
 ### Restaurant Schema
 ```sql
 CREATE TABLE restaurants (
@@ -1268,3 +1317,307 @@ alerts:
 | Assignment | Python + scipy | Optimization algorithms |
 | Monitoring | Prometheus + Grafana | Operational metrics |
 | Routing | OSRM | Self-hosted for low-latency ETAs |
+
+---
+
+## 12. Sequence Diagrams
+
+### 12.1 Order Placement + Restaurant Confirmation
+
+```mermaid
+sequenceDiagram
+    participant Customer
+    participant API Gateway
+    participant OrderService
+    participant RestaurantService
+    participant PaymentService
+    participant Kafka
+    participant RestaurantTablet
+
+    Customer->>API Gateway: POST /orders {restaurant_id, items[], address}
+    API Gateway->>OrderService: createOrder(payload)
+    OrderService->>PaymentService: authorizePayment(customer_id, amount=$32.50)
+    PaymentService-->>OrderService: auth_id (hold placed)
+
+    OrderService->>Kafka: publish("order.created", {order_id, restaurant_id, items})
+    OrderService-->>API Gateway: {order_id: ORD-100, status: PENDING_RESTAURANT}
+    API Gateway-->>Customer: Order placed! Waiting for restaurant...
+
+    Kafka->>RestaurantService: consume("order.created")
+    RestaurantService->>RestaurantTablet: Push notification: New order ORD-100
+
+    alt Restaurant accepts (within 3 min)
+        RestaurantTablet-->>RestaurantService: ACCEPT {prep_time: 20min}
+        RestaurantService->>Kafka: publish("order.accepted", {prep_time: 20min})
+        Kafka->>OrderService: updateStatus(PREPARING, ready_at=now+20min)
+        OrderService-->>Customer: Push: "Restaurant is preparing your order!"
+    else Restaurant rejects / timeout
+        RestaurantService->>Kafka: publish("order.rejected")
+        Kafka->>OrderService: updateStatus(CANCELLED)
+        OrderService->>PaymentService: voidAuth(auth_id)
+        OrderService-->>Customer: "Sorry, restaurant unavailable. Refund issued."
+    end
+```
+
+### 12.2 Dasher Assignment Optimization
+
+```mermaid
+sequenceDiagram
+    participant Kafka
+    participant AssignmentService
+    participant LocationService
+    participant MLService
+    participant Redis
+    participant Dasher
+    participant OrderService
+
+    Kafka->>AssignmentService: consume("order.accepted", ready_at=18:40)
+
+    Note over AssignmentService: Trigger assignment 10min before ready_at
+
+    AssignmentService->>LocationService: getAvailableDashers(restaurant_lat_lng, radius=3km)
+    LocationService-->>AssignmentService: [D-1, D-2, D-5, D-8, D-11]
+
+    AssignmentService->>MLService: predictDeliveryTime(each dasher → restaurant → customer)
+    MLService-->>AssignmentService: ETAs: [D-1:22min, D-2:25min, D-5:18min, D-8:30min, D-11:20min]
+
+    AssignmentService->>Redis: GET dasher:{id}:current_orders (check batch capacity)
+    Note over AssignmentService: Bipartite matching:<br/>Score = f(ETA, rating, current_load, route_efficiency)<br/>D-5 wins: best ETA + can batch with nearby pickup
+
+    AssignmentService->>Dasher: Push to D-5: "New delivery $8.50, 2.1 mi"
+    Dasher-->>AssignmentService: ACCEPT
+
+    AssignmentService->>OrderService: assignDasher(ORD-100, dasher=D-5)
+    AssignmentService->>Redis: SADD dasher:D-5:orders ORD-100
+    OrderService-->>Customer: Push: "Dasher assigned! D-5 is on the way"
+```
+
+### 12.3 Real-Time Delivery Tracking
+
+```mermaid
+sequenceDiagram
+    participant DasherApp
+    participant WebSocket Gateway
+    participant LocationService
+    participant Redis
+    participant ETAService
+    participant CustomerApp
+    participant OrderService
+
+    DasherApp->>OrderService: POST /orders/ORD-100/pickup-confirmed
+    OrderService-->>CustomerApp: Push: "Dasher picked up your order!"
+
+    loop Every 5 seconds during delivery
+        DasherApp->>WebSocket Gateway: {lat, lng, speed, heading}
+        WebSocket Gateway->>LocationService: updateDasherLocation(D-5, coords)
+        LocationService->>Redis: GEOADD dashers:active lng lat D-5
+        LocationService->>Redis: RPUSH location_history:ORD-100 {coords, ts}
+    end
+
+    LocationService->>ETAService: recalculate(D-5 location → customer address)
+    ETAService-->>WebSocket Gateway: {ETA: "3 min", distance_remaining: 0.8mi}
+    WebSocket Gateway->>CustomerApp: Real-time map update + ETA
+
+    Note over DasherApp: Arrives at customer
+    DasherApp->>OrderService: POST /orders/ORD-100/delivered {photo_proof}
+    OrderService->>Redis: DEL location_history:ORD-100
+    OrderService-->>CustomerApp: "Your order has been delivered!"
+```
+
+## 13. Algorithm Deep Dives
+
+### 13.1 Bipartite Matching for Delivery Assignment
+
+#### Problem Statement
+Given N available orders ready for pickup and M available Dashers, find the optimal assignment that minimizes total delivery time while respecting constraints (capacity, distance, batching).
+
+#### Why Bipartite Matching?
+This is a classic **assignment problem**: two sets (orders, dashers) with weighted edges (cost of assigning a dasher to an order). We want to find the minimum-cost perfect matching.
+
+#### Simplified Hungarian Algorithm Approach
+
+**Step 1: Build the cost matrix**
+```python
+# N orders, M dashers → N×M cost matrix
+# Cost = weighted combination of factors
+
+def build_cost_matrix(orders, dashers):
+    matrix = []
+    for order in orders:
+        row = []
+        for dasher in dashers:
+            cost = calculate_assignment_cost(order, dasher)
+            row.append(cost)
+        matrix.append(row)
+    return matrix
+
+def calculate_assignment_cost(order, dasher):
+    # ETA from dasher current location to restaurant
+    pickup_eta = routing.get_eta(dasher.location, order.restaurant.location)
+    
+    # ETA from restaurant to customer
+    delivery_eta = routing.get_eta(order.restaurant.location, order.customer.location)
+    
+    # Total time (lower is better)
+    total_time = pickup_eta + order.remaining_prep_time + delivery_eta
+    
+    # Penalties/bonuses
+    late_penalty = max(0, total_time - order.promised_time) * 2.0  # Heavy penalty
+    batch_bonus = -5 if can_batch(dasher, order) else 0  # Negative = good
+    rating_factor = (5.0 - dasher.rating) * 3  # Lower rating = higher cost
+    capacity_penalty = 10 if dasher.current_orders >= 2 else 0
+    
+    return total_time + late_penalty + batch_bonus + rating_factor + capacity_penalty
+```
+
+**Step 2: DoorDash's practical approach (not pure Hungarian)**
+
+Pure Hungarian is O(n³) — too slow for real-time with thousands of dashers/orders. DoorDash uses a **greedy auction-based approach**:
+
+```python
+def assign_orders_greedy_auction(orders, dashers):
+    assignments = {}
+    unassigned_orders = list(orders)
+    
+    # Sort orders by urgency (closest to promised time first)
+    unassigned_orders.sort(key=lambda o: o.promised_delivery_time)
+    
+    for order in unassigned_orders:
+        best_dasher = None
+        best_score = float('inf')
+        
+        for dasher in available_dashers:
+            if dasher.id in assignments.values():
+                continue  # Already assigned in this batch
+            
+            score = calculate_assignment_cost(order, dasher)
+            
+            # Check hard constraints
+            if not meets_constraints(order, dasher):
+                continue
+                
+            if score < best_score:
+                best_score = score
+                best_dasher = dasher
+        
+        if best_dasher:
+            assignments[order.id] = best_dasher.id
+            # Update dasher state for subsequent iterations
+            best_dasher.current_orders += 1
+            best_dasher.location = order.restaurant.location  # Projected
+    
+    return assignments
+```
+
+**Step 3: Batching optimization (stacking orders)**
+```python
+def can_batch(dasher, new_order):
+    """Check if new order can be efficiently batched with dasher's current orders"""
+    if dasher.current_orders >= 2:
+        return False  # Max 2 active deliveries
+    
+    if not dasher.active_orders:
+        return False  # Nothing to batch with
+    
+    current_order = dasher.active_orders[0]
+    
+    # Restaurant proximity: both pickups within 500m
+    restaurant_distance = haversine(
+        current_order.restaurant.location,
+        new_order.restaurant.location
+    )
+    if restaurant_distance > 0.5:  # km
+        return False
+    
+    # Delivery proximity: both drop-offs within 1km
+    delivery_distance = haversine(
+        current_order.customer.location,
+        new_order.customer.location
+    )
+    if delivery_distance > 1.0:
+        return False
+    
+    # Time constraint: batching won't make first order late
+    additional_time = estimate_detour(current_order, new_order)
+    if current_order.time_remaining - additional_time < 5:  # min buffer
+        return False
+    
+    return True
+```
+
+**Step 4: Real-time reassignment**
+```python
+def reassignment_check(interval=60):  # Every 60 seconds
+    """Re-evaluate current assignments as conditions change"""
+    active_assignments = get_all_active()
+    
+    for assignment in active_assignments:
+        # Skip if dasher already picked up food
+        if assignment.status == "PICKED_UP":
+            continue
+        
+        # Check if a better dasher became available
+        current_cost = calculate_assignment_cost(assignment.order, assignment.dasher)
+        
+        nearby_dashers = get_available_dashers(assignment.order.restaurant, radius=2km)
+        for dasher in nearby_dashers:
+            new_cost = calculate_assignment_cost(assignment.order, dasher)
+            if new_cost < current_cost * 0.7:  # 30% improvement threshold
+                reassign(assignment.order, dasher)
+                break
+```
+
+#### Performance
+- **Assignment latency**: < 200ms for batch of 50 orders
+- **Reassignment frequency**: Every 60s
+- **Improvement over FIFO**: ~18% reduction in average delivery time
+- **Batching rate**: ~15% of deliveries are batched in dense urban areas
+
+---
+
+### 13.2 Delivery Time Prediction (ML Model)
+
+#### Feature Engineering
+```python
+features = {
+    # Order features
+    "num_items": 3,
+    "total_item_prep_complexity": 7.2,  # ML-derived per menu item
+    "is_new_restaurant": False,
+    
+    # Restaurant features
+    "restaurant_avg_prep_time": 18.5,  # Historical rolling average
+    "current_queue_depth": 4,  # Orders being prepared now
+    "restaurant_rating": 4.3,
+    "cuisine_type_encoded": 5,  # One-hot or embedding
+    
+    # Dasher features
+    "dasher_avg_delivery_speed": 1.2,  # Relative to baseline
+    "dasher_experience_orders": 850,
+    "dasher_vehicle_type": "car",  # vs bike, scooter
+    
+    # Route features
+    "pickup_distance_km": 1.8,
+    "delivery_distance_km": 3.2,
+    "route_complexity": 0.7,  # Turns, traffic signals
+    
+    # Contextual features
+    "day_of_week": 5,  # Friday
+    "hour_of_day": 18,  # 6 PM
+    "is_peak_hour": True,
+    "weather_condition": "rain",
+    "current_zone_demand_level": 0.8,  # 0-1 normalized
+    
+    # Real-time signals
+    "live_traffic_delay_factor": 1.3,
+    "restaurant_recent_delay_rate": 0.15,  # 15% of recent orders late
+}
+```
+
+#### Model Architecture
+- **Model**: Gradient Boosted Trees (LightGBM) — interpretable, fast inference
+- **Target**: Total delivery time in minutes (order placed → delivered)
+- **Training data**: Millions of historical deliveries
+- **Update frequency**: Retrained daily, features updated in real-time
+- **Inference latency**: < 5ms per prediction
+- **MAE**: ~3.2 minutes on average

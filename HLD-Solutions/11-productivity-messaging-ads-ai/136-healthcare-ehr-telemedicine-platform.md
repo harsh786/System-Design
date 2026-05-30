@@ -72,6 +72,72 @@ Storage Total:
 
 ## 4. Data Modeling
 
+### Entity-Relationship Diagram
+
+```mermaid
+erDiagram
+    PATIENTS {
+        uuid patient_id PK
+        varchar mrn
+        varchar given_name
+        varchar family_name
+        date date_of_birth
+        uuid primary_provider_id FK
+        uuid tenant_id FK
+    }
+    FHIR_RESOURCES {
+        uuid resource_id PK
+        varchar resource_type
+        varchar fhir_id
+        jsonb content
+        uuid tenant_id FK
+    }
+    ENCOUNTERS {
+        uuid encounter_id PK
+        uuid patient_id FK
+        uuid provider_id FK
+        varchar encounter_type
+        varchar status
+        timestamptz start_time
+    }
+    OBSERVATIONS {
+        uuid observation_id PK
+        uuid patient_id FK
+        uuid encounter_id FK
+        varchar category_code
+        varchar code
+        decimal value_quantity
+        varchar interpretation
+    }
+    APPOINTMENTS {
+        uuid appointment_id PK
+        uuid patient_id FK
+        uuid provider_id FK
+        varchar appointment_type
+        varchar status
+        timestamptz start_time
+        uuid video_room_id
+    }
+    CLAIMS {
+        uuid claim_id PK
+        uuid encounter_id FK
+        uuid patient_id FK
+        uuid provider_id FK
+        uuid payer_id FK
+        varchar status
+        decimal total_charge
+    }
+
+    PATIENTS ||--|| FHIR_RESOURCES : "represented by"
+    PATIENTS ||--o{ ENCOUNTERS : visits
+    PATIENTS ||--o{ OBSERVATIONS : "has vitals"
+    PATIENTS ||--o{ APPOINTMENTS : schedules
+    PATIENTS ||--o{ CLAIMS : "billed for"
+    ENCOUNTERS ||--o{ OBSERVATIONS : records
+    ENCOUNTERS ||--o{ CLAIMS : generates
+    APPOINTMENTS ||--o| ENCOUNTERS : "becomes"
+```
+
 ### 4.1 FHIR Resources (Core Clinical)
 
 ```sql
@@ -1125,3 +1191,222 @@ alerts:
 - SMART on FHIR Authorization Framework
 - ONC Interoperability Standards Advisory
 - WebRTC 1.0 (W3C Recommendation)
+
+---
+
+## 12. Sequence Diagrams
+
+### 12.1 Patient Registration + FHIR Resource Creation
+
+```mermaid
+sequenceDiagram
+    participant Staff as Registration Staff
+    participant UI as Registration UI
+    participant API as API Gateway (SMART on FHIR)
+    participant MPI as Master Patient Index
+    participant FHIR as FHIR Server
+    participant Consent as Consent Service
+    participant Audit as Audit Log (Immutable)
+    participant Insurance as Insurance Verification
+
+    Staff->>UI: Enter patient demographics (name, DOB, SSN, insurance)
+    UI->>API: POST /Patient {name, birthDate, identifier, contact}
+    API->>MPI: Search for existing patient (probabilistic matching)
+    MPI->>MPI: Match algorithm: name(30%) + DOB(25%) + SSN(35%) + address(10%)
+    
+    alt Match found (score > 0.85)
+        MPI-->>API: Potential duplicate {existing_patient_id, score: 0.92}
+        API-->>UI: "Possible duplicate found. Merge or create new?"
+        Staff-->>API: Confirm: link to existing record
+    else No match
+        MPI-->>API: No match, create new
+        API->>FHIR: POST /Patient (FHIR R4 resource)
+        FHIR-->>API: {resourceType: "Patient", id: "pat-12345"}
+    end
+    
+    API->>Consent: Create default consent directives
+    Consent->>FHIR: POST /Consent {patient: pat-12345, scope: treatment}
+    API->>Insurance: Verify coverage (270/271 eligibility check)
+    Insurance-->>API: {active: true, plan: "BlueCross PPO", copay: $30}
+    API->>FHIR: POST /Coverage {patient: pat-12345, payor: "BlueCross", plan}
+    
+    API->>Audit: Log {action: "CREATE", resource: "Patient/pat-12345", actor: staff_id, timestamp}
+    API-->>UI: 201 Created {patient_id: "pat-12345", MRN: "MRN-2024-78901"}
+```
+
+### 12.2 Telemedicine Session + Prescription
+
+```mermaid
+sequenceDiagram
+    participant P as Patient (Mobile App)
+    participant Video as Video Service (WebRTC)
+    participant API as API Gateway
+    participant FHIR as FHIR Server
+    participant Enc as Encounter Service
+    participant Rx as Prescription Service (EPCS)
+    participant Pharm as Pharmacy (NCPDP SCRIPT)
+    participant Audit as Audit Log
+
+    P->>API: POST /appointments/{id}/join (token-based auth)
+    API->>Enc: Create Encounter {type: "virtual", patient, practitioner}
+    Enc->>FHIR: POST /Encounter {status: "in-progress", class: "VR"}
+    
+    P->>Video: Join WebRTC room (DTLS-SRTP encrypted)
+    Note over Video: End-to-end encrypted video session (HIPAA-compliant)
+    
+    Note over P,Video: Clinical consultation occurs (15 min)
+    
+    Video->>Enc: Session ended (duration: 15m03s)
+    Enc->>FHIR: PATCH /Encounter/{id} {status: "finished", period.end}
+    
+    Note over API: Physician prescribes medication
+    API->>Rx: POST /prescribe {patient, medication: "Lisinopril 10mg", sig: "1 tab daily"}
+    Rx->>Rx: Validate: drug interactions (against active med list)
+    Rx->>Rx: Validate: allergy check (penicillin allergy OK for this med)
+    Rx->>Rx: EPCS: two-factor auth for controlled substances (if applicable)
+    Rx->>FHIR: POST /MedicationRequest {status: "active", medication, dosage}
+    
+    Rx->>Pharm: Send via NCPDP SCRIPT 2017071 (NewRx message)
+    Pharm-->>Rx: Acknowledged (prescription received)
+    
+    Rx->>P: Push notification: "Prescription sent to CVS Pharmacy #4521"
+    Rx->>Audit: Log {prescriber, patient, medication, pharmacy, timestamp}
+    
+    API->>FHIR: POST /ClinicalImpression {encounter, summary, assessment, plan}
+```
+
+### 12.3 Lab Result Integration + Notification
+
+```mermaid
+sequenceDiagram
+    participant Lab as External Lab (Quest/LabCorp)
+    participant HL7 as HL7 Interface Engine (Mirth)
+    participant FHIR as FHIR Server
+    participant CDS as Clinical Decision Support
+    participant Notify as Notification Service
+    participant Provider as Provider (EHR Dashboard)
+    participant Patient as Patient Portal
+    participant Audit as Audit Log
+
+    Lab->>HL7: HL7v2 ORU^R01 message (lab results)
+    HL7->>HL7: Parse ORU → map to FHIR (Observation, DiagnosticReport)
+    HL7->>HL7: Terminology mapping: local codes → LOINC
+    HL7->>FHIR: POST /Observation {code: LOINC:2345-7, value: 142 mg/dL, status: "final"}
+    HL7->>FHIR: POST /DiagnosticReport {result: [Observation/obs-123], conclusion}
+    
+    FHIR->>CDS: Trigger CDS rules (event: new lab result)
+    CDS->>CDS: Evaluate: glucose=142 > threshold(126) → flag "elevated"
+    CDS->>CDS: Check: patient has diabetes diagnosis? Yes → expected range different
+    CDS-->>FHIR: POST /Flag {category: "lab-alert", code: "elevated-glucose"}
+    
+    CDS->>Notify: Alert provider {priority: ROUTINE, patient, result_summary}
+    Notify->>Provider: In-app notification + inbox message
+    Provider-->>Provider: Reviews result in EHR dashboard
+    
+    Note over Notify: Patient notification (configurable delay for provider review)
+    Notify->>Notify: Wait 4 hours (allow provider to review first)
+    Notify->>Patient: "New lab results available in your portal"
+    Patient->>FHIR: GET /DiagnosticReport/{id} (patient-facing view)
+    FHIR-->>Patient: Results with patient-friendly reference ranges
+    
+    Audit->>Audit: Log all access: lab submission, provider view, patient view
+```
+
+### Caching Strategy
+
+| Layer | Technology | Data Cached | TTL | Invalidation |
+|-------|-----------|-------------|-----|--------------|
+| Patient demographics | Redis | Frequently accessed patients (active encounters) | 15 min | On registration update |
+| FHIR resources | Redis | Active CarePlan, MedicationList, Allergies | 5 min | On any FHIR write to resource |
+| Terminology lookups | Local + Redis | ICD-10, SNOMED, LOINC code descriptions | 24h | On terminology version update |
+| Provider schedules | Redis | Available appointment slots | 2 min | On booking/cancellation |
+| Insurance eligibility | Redis | Coverage verification results | 1h | On coverage change event |
+| CDS rules | Local (per service) | Clinical decision support rule sets | 5 min | On rule publish |
+
+**Healthcare-Specific Caching Constraints:**
+- **Never cache beyond consent scope**: If patient revokes consent, invalidate ALL cached data for that patient
+- **Audit cache access**: Even cache hits must be audit-logged for HIPAA compliance
+- **Stale data risk**: Clinical data must show "last refreshed" timestamp — stale lab values can harm patients
+- **Cache encryption**: All cached PHI must be encrypted at rest (AES-256) even in Redis
+
+### Async Processing Patterns
+
+```
+Healthcare systems require extensive async processing due to:
+1. External system integration (labs, pharmacies, insurance) — unreliable, slow
+2. Regulatory processing (audit logging, compliance checks) — cannot block clinical workflow
+3. Notification orchestration — complex rules about who/when/how to notify
+
+Key Async Workflows:
+┌─────────────────────────────────────────────────────────────────┐
+│ Event-Driven Architecture (Kafka)                                │
+├─────────────────────────────────────────────────────────────────┤
+│                                                                   │
+│ Topic: patient-events                                            │
+│   → Consumer: Audit Logger (write to immutable audit store)      │
+│   → Consumer: CDS Engine (evaluate clinical rules)               │
+│   → Consumer: Notification Router (determine who to alert)       │
+│   → Consumer: Insurance Pre-auth (trigger prior authorization)   │
+│                                                                   │
+│ Topic: lab-results                                               │
+│   → Consumer: FHIR Writer (persist as Observation/DiagReport)    │
+│   → Consumer: Abnormal Result Alerter (critical value workflow)  │
+│   → Consumer: Quality Measure Calculator (population health)     │
+│                                                                   │
+│ Topic: medication-events                                         │
+│   → Consumer: Drug Interaction Checker (background re-check)     │
+│   → Consumer: Pharmacy Integration (send Rx via NCPDP)           │
+│   → Consumer: Refill Reminder Scheduler                          │
+│                                                                   │
+│ Guarantees:                                                       │
+│   - At-least-once delivery (idempotent consumers)                │
+│   - Ordering within patient partition (partition by patient_id)  │
+│   - 7-year retention for compliance (tiered: hot → warm → cold)  │
+└─────────────────────────────────────────────────────────────────┘
+
+Critical Value Workflow (async but urgent):
+  1. Lab result arrives with critical flag (e.g., potassium > 6.5)
+  2. Immediate page to ordering provider (bypass normal queue)
+  3. If no acknowledgment in 15 min → escalate to covering provider
+  4. If no ack in 30 min → escalate to department chief + nursing
+  5. All escalation steps logged for regulatory compliance
+```
+
+### Infrastructure Components
+
+```
+┌────────────────────────────────────────────────────────────────────────────┐
+│                    Healthcare EHR + Telemedicine Platform                    │
+├────────────────────────────────────────────────────────────────────────────┤
+│                                                                              │
+│  ┌──────────────────────┐  ┌────────────────────────────────────────────┐ │
+│  │ FHIR Server Cluster   │  │  Video Platform (WebRTC)                   │ │
+│  │ - HAPI FHIR (Java)    │  │  - TURN/STUN servers (global)             │ │
+│  │ - PostgreSQL backend   │  │  - SFU for group sessions                 │ │
+│  │ - SMART on FHIR auth  │  │  - Recording (encrypted, consent-based)   │ │
+│  │ - Subscription (push) │  │  - Audio-only fallback (low bandwidth)    │ │
+│  └──────────────────────┘  └────────────────────────────────────────────┘ │
+│                                                                              │
+│  ┌──────────────────────┐  ┌────────────────────────────────────────────┐ │
+│  │ Integration Engine     │  │  Security & Compliance                     │ │
+│  │ - Mirth Connect (HL7) │  │  - HSM for encryption keys                │ │
+│  │ - FHIR R4 APIs        │  │  - OAuth 2.0 + SMART scopes              │ │
+│  │ - NCPDP (pharmacy)    │  │  - Immutable audit log (7yr retention)    │ │
+│  │ - X12 (insurance)     │  │  - Data residency (region-locked)         │ │
+│  │ - Direct messaging    │  │  - BAA management (vendor tracking)       │ │
+│  └──────────────────────┘  └────────────────────────────────────────────┘ │
+│                                                                              │
+│  ┌──────────────────────┐  ┌────────────────────────────────────────────┐ │
+│  │ Data Layer             │  │  Observability & DR                        │ │
+│  │ - PostgreSQL (FHIR)    │  │  - Prometheus + Grafana                   │ │
+│  │ - Redis (cache + pub)  │  │  - ELK (audit search)                    │ │
+│  │ - Kafka (event bus)    │  │  - Active-active (2 regions)             │ │
+│  │ - S3 (documents, DICOM)│  │  - RTO < 15min, RPO < 1s                │ │
+│  │ - TimescaleDB (vitals) │  │  - Chaos testing (GameDay)               │ │
+│  └──────────────────────┘  └────────────────────────────────────────────┘ │
+│                                                                              │
+│  Compliance: HIPAA, HITRUST, SOC2 Type II, FedRAMP (if govt)                │
+│  Deployment: Private cloud or dedicated tenancy (no shared infrastructure)   │
+└────────────────────────────────────────────────────────────────────────────┘
+```
+

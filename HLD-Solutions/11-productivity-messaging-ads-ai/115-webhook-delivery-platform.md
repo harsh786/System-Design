@@ -63,6 +63,52 @@
 
 ## 4. Data Modeling
 
+### Entity-Relationship Diagram
+
+```mermaid
+erDiagram
+    WEBHOOK_SUBSCRIPTIONS {
+        uuid subscription_id PK
+        uuid account_id FK
+        varchar url
+        varchar secret
+        varchar auth_type
+        varchar circuit_state
+        varchar status
+        integer max_retries
+    }
+    WEBHOOK_EVENTS {
+        uuid event_id PK
+        varchar event_type
+        varchar source
+        jsonb payload
+        varchar idempotency_key
+        integer subscriber_count
+    }
+    DELIVERIES {
+        uuid delivery_id PK
+        uuid event_id FK
+        uuid subscription_id FK
+        varchar status
+        integer attempts
+        timestamptz delivered_at
+    }
+    DELIVERY_ATTEMPTS {
+        uuid attempt_id PK
+        uuid delivery_id FK
+        uuid event_id FK
+        uuid subscription_id FK
+        integer attempt_number
+        integer response_status
+        varchar status
+        integer duration_ms
+    }
+
+    WEBHOOK_SUBSCRIPTIONS ||--o{ DELIVERIES : receives
+    WEBHOOK_EVENTS ||--o{ DELIVERIES : "fanned out to"
+    DELIVERIES ||--o{ DELIVERY_ATTEMPTS : "retried via"
+```
+
 ```sql
 -- Webhook subscriptions (endpoints)
 CREATE TABLE webhook_subscriptions (
@@ -1236,3 +1282,134 @@ This converts O(1) produce to O(K) where K = subscription shards, not individual
 | Ordering key hot spot | Head-of-line blocking | Auto-detect hot keys, suggest subscriber splits ordering |
 
 ---
+
+---
+
+## 12. Sequence Diagrams
+
+### 12.1 Webhook Registration + First Delivery
+
+```mermaid
+sequenceDiagram
+    participant Dev as Developer
+    participant API as API Gateway
+    participant Reg as Registration Service
+    participant DB as PostgreSQL
+    participant Verify as Verification Worker
+    participant Endpoint as Customer Endpoint
+    participant Cache as Redis (Subscription Cache)
+
+    Dev->>API: POST /webhooks {url: "https://example.com/hook", events: ["order.created"], secret: "whsec_..."}
+    API->>Reg: CreateSubscription(tenant_id, payload)
+    Reg->>Reg: Validate URL (no private IPs, HTTPS only, DNS resolves)
+    Reg->>DB: INSERT subscription (status=pending_verification)
+    Reg->>Verify: Queue verification challenge
+    Verify->>Endpoint: POST https://example.com/hook {type: "verification", challenge: "ch_abc123"}
+    Endpoint-->>Verify: 200 {challenge: "ch_abc123"}
+    Verify->>DB: UPDATE subscription SET status=active
+    Verify->>Cache: SET sub:{tenant}:{event_type} → [endpoint configs]
+    Verify-->>Dev: Webhook verified and active
+
+    Note over API: Later, an event occurs...
+    
+    API->>Cache: GET sub:*:order.created → [subscription_1]
+    API->>API: Build payload, sign with HMAC-SHA256(secret, body)
+    API->>Endpoint: POST https://example.com/hook {event: "order.created", data: {...}}
+    Note over API: Headers: X-Webhook-Signature: sha256=abcdef..., X-Webhook-ID: evt_123
+    Endpoint-->>API: 200 OK
+    API->>DB: Log delivery {status: success, latency: 245ms}
+```
+
+### 12.2 Retry with Exponential Backoff + Dead Letter Queue
+
+```mermaid
+sequenceDiagram
+    participant Worker as Delivery Worker
+    participant Endpoint as Customer Endpoint
+    participant Queue as Retry Queue (Kafka)
+    participant DLQ as Dead Letter Queue
+    participant Alert as Alert Service
+    participant DB as PostgreSQL
+    participant Dashboard as Developer Dashboard
+
+    Worker->>Endpoint: POST webhook payload (attempt 1)
+    Endpoint-->>Worker: 500 Internal Server Error
+    Worker->>DB: Log attempt 1: failed (500)
+    Worker->>Queue: Schedule retry (delay: 30s)
+    
+    Note over Queue: After 30s...
+    Queue->>Worker: Retry attempt 2
+    Worker->>Endpoint: POST webhook payload (attempt 2)
+    Endpoint-->>Worker: Connection timeout (10s)
+    Worker->>DB: Log attempt 2: failed (timeout)
+    Worker->>Queue: Schedule retry (delay: 120s)
+    
+    Note over Queue: After 120s...
+    Queue->>Worker: Retry attempt 3
+    Worker->>Endpoint: POST webhook payload (attempt 3)
+    Endpoint-->>Worker: 503 Service Unavailable
+    Worker->>DB: Log attempt 3: failed (503)
+    Worker->>Queue: Schedule retry (delay: 600s)
+    
+    Note over Queue: Retries continue: 30s, 2m, 10m, 1h, 4h, 8h, 24h (7 attempts total)
+    
+    Queue->>Worker: Final attempt (attempt 7)
+    Worker->>Endpoint: POST webhook payload
+    Endpoint-->>Worker: 500 Error (still failing)
+    Worker->>DLQ: Move to Dead Letter Queue {event, attempts: 7, last_error: 500}
+    Worker->>DB: Mark delivery: exhausted
+    Worker->>Alert: Notify tenant: webhook endpoint failing
+    DLQ-->>Dashboard: Available for manual retry / inspection
+    
+    Note over Dashboard: Developer can: inspect payload, fix endpoint, trigger manual re-delivery
+```
+
+### Caching Strategy
+
+| Layer | Technology | Data Cached | TTL | Invalidation |
+|-------|-----------|-------------|-----|--------------|
+| Subscription lookup | Redis Cluster | event_type → [subscription configs] | 30s | On subscription CRUD |
+| Endpoint health | Redis | endpoint:{url_hash} → {status, failure_count} | 5 min | On delivery result |
+| Rate limit counters | Redis | ratelimit:{tenant}:{window} | Window size | Auto-expire |
+| Signature keys | Local (per worker) | tenant → signing secret | 5 min | On secret rotation event |
+| DNS resolution | Local DNS cache | endpoint domain → IP | 60s | Standard DNS TTL |
+
+**Key Caching Patterns:**
+- **Subscription fan-out cache**: On event publish, lookup which subscriptions match without DB query
+- **Circuit breaker state**: Cached in Redis, shared across workers — if endpoint fails 5x consecutively, open circuit (skip delivery, queue for later)
+- **Negative cache for disabled endpoints**: Don't attempt delivery to known-disabled subscriptions
+
+### Infrastructure Components
+
+```
+┌─────────────────────────────────────────────────────────────────────────┐
+│                        Webhook Delivery Platform                         │
+├─────────────────────────────────────────────────────────────────────────┤
+│                                                                          │
+│  ┌──────────────┐   ┌──────────────────────────────────────────────┐   │
+│  │ API Gateway   │   │  Kafka Cluster (3 brokers, RF=3)             │   │
+│  │ (Kong/Envoy)  │   │  - events topic (partitioned by tenant)      │   │
+│  │ - Rate limit  │   │  - retry topic (delayed delivery)            │   │
+│  │ - Auth        │   │  - dlq topic (exhausted deliveries)          │   │
+│  └──────────────┘   └──────────────────────────────────────────────┘   │
+│                                                                          │
+│  ┌──────────────────────────────┐  ┌───────────────────────────────┐   │
+│  │ Delivery Workers (stateless)  │  │  Redis Cluster (6 nodes)      │   │
+│  │ - 50 workers per AZ           │  │  - Subscription cache         │   │
+│  │ - HTTP client pool (keep-alive│  │  - Rate limiting              │   │
+│  │ - 10s connect, 30s read timeout│ │  - Circuit breaker state      │   │
+│  │ - Mutual TLS support          │  │  - Deduplication (idempotency)│   │
+│  └──────────────────────────────┘  └───────────────────────────────┘   │
+│                                                                          │
+│  ┌──────────────────────────────┐  ┌───────────────────────────────┐   │
+│  │ PostgreSQL (Primary + 2 Read) │  │  Observability                │   │
+│  │ - Subscriptions               │  │  - Prometheus (delivery metrics│   │
+│  │ - Delivery logs (partitioned) │  │  - Grafana dashboards         │   │
+│  │ - Tenant configs              │  │  - PagerDuty (SLA alerts)     │   │
+│  └──────────────────────────────┘  └───────────────────────────────┘   │
+│                                                                          │
+│  Deployment: Kubernetes (3 AZs), HPA on queue depth                     │
+│  Networking: NAT Gateway (static egress IPs for customer whitelisting)  │
+└─────────────────────────────────────────────────────────────────────────┘
+```
+

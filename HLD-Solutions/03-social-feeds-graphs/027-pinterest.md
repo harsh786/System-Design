@@ -92,6 +92,42 @@ CDN offloads 95% → Origin egress: ~7 Gbps
 
 ## 5. Data Modeling
 
+### Entity-Relationship Diagram
+
+```mermaid
+erDiagram
+    PINS {
+        bigint pin_id PK
+        bigint user_id FK
+        bigint board_id FK
+        varchar image_url
+        varchar link_url
+        boolean is_shopping
+    }
+    BOARDS {
+        bigint board_id PK
+        bigint user_id FK
+        varchar name
+        enum privacy
+        int pin_count
+    }
+    BOARD_PINS {
+        bigint board_id PK
+        bigint pin_id PK
+        bigint added_by FK
+        int position
+    }
+    BOARD_COLLABORATORS {
+        bigint board_id PK
+        bigint user_id PK
+        enum role
+    }
+    BOARDS ||--o{ BOARD_PINS : "contains"
+    PINS ||--o{ BOARD_PINS : "saved to"
+    BOARDS ||--o{ BOARD_COLLABORATORS : "has"
+    PINS }o--|| BOARDS : "primary board"
+```
+
 ### 5.1 Pin Schema (MySQL/Vitess sharded by pin_id)
 
 ```sql
@@ -957,4 +993,169 @@ alerts:
 | Analytics | ClickHouse | Petabyte-scale |
 | ML Serving | TorchServe + Triton | 3,500 embeddings/sec |
 | Recommendations | Spark + Real-time | 5,800 feed req/sec |
+
+---
+
+## Sequence Diagrams
+
+### 1. Pin Creation + Visual Similarity Indexing
+
+```mermaid
+sequenceDiagram
+    participant U as User
+    participant API as API Gateway
+    participant PS as Pin Service
+    participant S3 as Object Store
+    participant K as Kafka
+    participant IP as Image Pipeline
+    participant VS as Visual Search (GPU)
+    participant VDB as Vector DB (Milvus)
+    participant DB as MySQL (Sharded)
+
+    U->>API: POST /pins {image, board_id, description, link}
+    API->>PS: createPin(user_id, board_id, content)
+    PS->>S3: upload original image
+    PS->>DB: INSERT pin metadata
+    PS->>K: publish PinCreated {pin_id, s3_key, board_id}
+
+    par Image processing
+        K->>IP: consume PinCreated
+        IP->>IP: generate thumbnails (236w, 564w, originals)
+        IP->>IP: extract dominant colors, aspect ratio
+        IP->>S3: store variants
+    and Visual embedding
+        K->>VS: consume PinCreated
+        VS->>VS: generate 512-dim embedding (CNN)
+        VS->>VDB: upsert(pin_id, embedding_vector)
+        VS->>DB: UPDATE pin SET visual_tags, categories
+    and Content safety
+        K->>IP: nudity/spam classifier
+    end
+
+    Note over VDB: Pin now discoverable via visual similarity search
+    PS-->>API: 201 Created {pin_id, pin_url}
+```
+
+### 2. Board Follow + Home Feed Generation
+
+```mermaid
+sequenceDiagram
+    participant U as User
+    participant API as API Gateway
+    participant FS as Follow Service
+    participant GS as Graph Store
+    participant K as Kafka
+    participant HF as Home Feed Service
+    participant RC as Redis Cache
+    participant RK as Ranking Service
+
+    U->>API: POST /boards/{board_id}/follow
+    API->>FS: followBoard(user_id, board_id)
+    FS->>GS: addEdge(user, FOLLOWS_BOARD, board)
+    FS->>K: publish BoardFollowed {user_id, board_id}
+    FS-->>API: 200 OK
+
+    Note over U: User opens home feed
+    U->>API: GET /homefeed?cursor=xxx
+    API->>HF: getFeed(user_id, cursor)
+    HF->>RC: GET feed:{user_id}
+
+    alt Cache miss
+        HF->>GS: getFollowedBoards(user_id) + getFollowedUsers(user_id)
+        GS-->>HF: source_ids[]
+        HF->>HF: fetch recent pins from each source (last 72h)
+        HF->>RK: rank(pins, user_interests, engagement_history)
+        Note over RK: Signals: visual similarity to saved pins, topic affinity, freshness, engagement
+        RK-->>HF: ranked_pins[]
+        HF->>RC: SET feed:{user_id} TTL=300
+    end
+
+    HF-->>API: pin_grid[] + cursor
+    API-->>U: 200 OK
+```
+
+### 3. Related Pins Recommendation
+
+```mermaid
+sequenceDiagram
+    participant U as User
+    participant API as API Gateway
+    participant RP as Related Pins Service
+    participant RC as Redis Cache
+    participant VDB as Vector DB
+    participant GS as Graph Co-occurrence
+    participant RK as Ranking Service
+    participant ML as PinSage Model
+
+    U->>API: GET /pins/{pin_id}/related
+    API->>RP: getRelated(pin_id, user_id)
+    RP->>RC: GET related:{pin_id}
+
+    alt Cache hit
+        RC-->>RP: cached_related[]
+    else Generate related pins
+        par Visual similarity
+            RP->>VDB: ANN(pin_embedding, top_k=200)
+            VDB-->>RP: visually_similar[]
+        and Graph-based (PinSage)
+            RP->>ML: getNeighborEmbeddings(pin_id)
+            ML-->>RP: graph_similar[] (co-saved, co-clicked)
+        and Board co-occurrence
+            RP->>GS: pinsOnSameBoards(pin_id, limit=100)
+            GS-->>RP: co_occurring_pins[]
+        end
+
+        RP->>RK: mergeAndRank(visual + graph + co_occur, user_context)
+        RK-->>RP: top_50_related
+        RP->>RC: SET related:{pin_id} TTL=3600
+    end
+
+    RP-->>API: related_pins[]
+    API-->>U: 200 OK
+```
+
+---
+
+## Caching Strategy
+
+### Multi-Tier Cache Architecture
+
+| Tier | Technology | TTL | Use Case |
+|------|-----------|-----|----------|
+| L1 - CDN Edge | CloudFront | 24h | Pin images, thumbnails, static boards |
+| L2 - Regional | Redis Cluster | 5-60 min | Home feed, related pins, user session |
+| L3 - Application | Memcached | 1-6h | Pin metadata, board info, user profiles |
+| L4 - Embedding | Local SSD cache | Days | Frequently accessed vectors for ANN |
+
+### Eviction & Invalidation
+
+- **Pin images**: Immutable after creation; versioned URL on re-upload
+- **Home feed**: TTL 300s; force rebuild on new follow/unfollow
+- **Related pins**: TTL 1h for popular pins; 6h for long-tail; event invalidate on pin delete
+- **Board data**: Write-through cache; invalidate on pin add/remove from board
+
+---
+
+## Async Processing - Kafka Topic Design
+
+| Topic | Partitions | Key | Consumers |
+|-------|-----------|-----|-----------|
+| `pin.created` | 128 | pin_id | Image pipeline, Visual indexing, Feed fanout |
+| `engagement.events` | 256 | pin_id | Ranking signals, Analytics, Anti-spam |
+| `board.updated` | 64 | board_id | Feed invalidation, Search re-index |
+| `follow.changed` | 32 | user_id | Feed rebuild, Recommendations |
+| `visual.indexed` | 64 | pin_id | Related pins rebuild, Search update |
+
+---
+
+## Infrastructure Components
+
+| Component | Technology | Purpose |
+|-----------|-----------|---------|
+| CDN | CloudFront + Akamai | Image delivery, 97% cache hit ratio |
+| Load Balancer | AWS ALB + NLB | HTTP/gRPC routing, health checks |
+| API Gateway | Envoy + custom (Python) | Rate limiting, auth, A/B routing |
+| GPU Cluster | NVIDIA A100 (EKS) | Embedding generation, visual search |
+| Vector Search | Milvus (distributed) | Billion-scale ANN for visual similarity |
+| Service Mesh | Envoy sidecar | Circuit breaking, retries, observability |
 

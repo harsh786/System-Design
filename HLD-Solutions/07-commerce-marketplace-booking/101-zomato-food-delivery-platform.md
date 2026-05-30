@@ -59,6 +59,64 @@ Restaurant confirmations: 3000/s
 
 ## 4. Data Modeling
 
+### Entity-Relationship Diagram
+
+```mermaid
+erDiagram
+    restaurants {
+        UUID restaurant_id PK
+        VARCHAR name
+        VARCHAR city
+        BOOLEAN is_open
+        DECIMAL avg_rating
+        VARCHAR status
+    }
+    menu_categories {
+        UUID category_id PK
+        UUID restaurant_id FK
+        VARCHAR name
+    }
+    menu_items {
+        UUID item_id PK
+        UUID restaurant_id FK
+        UUID category_id FK
+        VARCHAR name
+        INTEGER price_cents
+        BOOLEAN is_veg
+    }
+    orders {
+        UUID order_id PK
+        UUID customer_id FK
+        UUID restaurant_id FK
+        UUID delivery_partner_id FK
+        VARCHAR status
+        INTEGER total_cents
+        VARCHAR order_type
+    }
+    order_items {
+        UUID order_item_id PK
+        UUID order_id FK
+        UUID item_id FK
+        INTEGER quantity
+        INTEGER total_price_cents
+    }
+    delivery_partners {
+        UUID partner_id PK
+        VARCHAR name
+        VARCHAR vehicle_type
+        VARCHAR city
+        BOOLEAN is_available
+        DECIMAL avg_rating
+    }
+
+    restaurants ||--o{ menu_categories : "has"
+    menu_categories ||--o{ menu_items : "contains"
+    restaurants ||--o{ orders : "receives"
+    orders ||--o{ order_items : "contains"
+    menu_items ||--o{ order_items : "ordered as"
+    delivery_partners ||--o{ orders : "delivers"
+```
+
 ### Full Database Schemas
 
 ```sql
@@ -1028,3 +1086,135 @@ Peak dinner (7-9 PM):
 - ES queries: 50K/sec
 - DB writes: 10K/sec
 ```
+
+---
+
+## 12. Sequence Diagrams
+
+### 12.1 Restaurant Search + Ranking
+
+```mermaid
+sequenceDiagram
+    participant User
+    participant API Gateway
+    participant SearchService
+    participant Elasticsearch
+    participant RankingService
+    participant Redis
+    participant PersonalizationService
+
+    User->>API Gateway: GET /restaurants?lat=28.61&lng=77.23&cuisine=Italian
+    API Gateway->>SearchService: search(location, filters)
+
+    SearchService->>Elasticsearch: geo_query(radius=5km, cuisine=Italian, open=true)
+    Elasticsearch-->>SearchService: 45 matching restaurants
+
+    SearchService->>RankingService: rank(restaurants[], user_id)
+    RankingService->>Redis: GET user:{id}:preferences (order history, favorites)
+    RankingService->>PersonalizationService: getAffinities(user_id)
+    PersonalizationService-->>RankingService: {Italian: 0.9, Fast: 0.7, Healthy: 0.3}
+
+    Note over RankingService: Score = 0.25×relevance + 0.20×rating<br/>+ 0.20×delivery_time + 0.15×personalization<br/>+ 0.10×popularity + 0.10×promoted
+
+    RankingService-->>SearchService: ranked list (top 20)
+    SearchService-->>API Gateway: restaurants with ETAs, ratings, offers
+    API Gateway-->>User: Restaurant list (paginated)
+```
+
+### 12.2 Order Flow + Kitchen Confirmation
+
+```mermaid
+sequenceDiagram
+    participant Customer
+    participant OrderService
+    participant PaymentService
+    participant Kafka
+    participant RestaurantApp
+    participant KitchenDisplay
+    participant DeliveryService
+
+    Customer->>OrderService: POST /orders {restaurant, items, address, payment}
+    OrderService->>PaymentService: authorize(amount=₹450)
+    PaymentService-->>OrderService: authorized
+
+    OrderService->>Kafka: publish("order.placed")
+    OrderService-->>Customer: "Order placed! Waiting for restaurant..."
+
+    Kafka->>RestaurantApp: New order notification
+    RestaurantApp->>KitchenDisplay: Display order items
+
+    RestaurantApp->>OrderService: ACCEPT {prep_time: 25min}
+    OrderService->>Kafka: publish("order.confirmed", {ready_at})
+    OrderService-->>Customer: "Preparing! Ready in 25 min"
+
+    Note over DeliveryService: Trigger rider assignment<br/>10 min before ready_at
+    Kafka->>DeliveryService: schedule assignment
+
+    KitchenDisplay->>OrderService: markReady(order_id)
+    OrderService->>Kafka: publish("order.ready_for_pickup")
+    OrderService-->>Customer: "Food is ready! Rider on the way"
+```
+
+### 12.3 Delivery Partner Assignment
+
+```mermaid
+sequenceDiagram
+    participant Kafka
+    participant AssignmentEngine
+    participant LocationService
+    participant Redis
+    participant MLService
+    participant Rider
+    participant OrderService
+    participant Customer
+
+    Kafka->>AssignmentEngine: consume("order.ready_soon", ready_in=10min)
+    AssignmentEngine->>LocationService: getNearbyRiders(restaurant_loc, radius=3km)
+    LocationService->>Redis: GEOSEARCH riders:available ...
+    Redis-->>AssignmentEngine: [R-1(500m), R-3(1.2km), R-7(2.1km)]
+
+    AssignmentEngine->>MLService: predictETAs(riders → restaurant → customer)
+    MLService-->>AssignmentEngine: [R-1:8min, R-3:12min, R-7:18min]
+
+    Note over AssignmentEngine: Score: ETA(0.4) + rating(0.2)<br/>+ acceptance_rate(0.2) + batch_fit(0.2)
+
+    AssignmentEngine->>Rider: Push to R-1: "New delivery ₹65, 2.5km"
+    alt Rider accepts (30s timeout)
+        Rider-->>AssignmentEngine: ACCEPT
+        AssignmentEngine->>OrderService: assignRider(order, R-1)
+        OrderService-->>Customer: "Rider R-1 assigned! ETA 8 min to restaurant"
+    else Rider rejects/timeout
+        AssignmentEngine->>Rider: Push to R-3 (next best)
+    end
+```
+
+## 13. Infrastructure & Deployment
+
+### 13.1 Compute & Storage
+| Layer | Technology | Spec |
+|-------|-----------|------|
+| Application | Kubernetes (EKS) | Multi-AZ, 50+ pods per service |
+| Primary DB | PostgreSQL (Aurora) | Multi-AZ, r6g.4xlarge writer + 3 readers |
+| Search | Elasticsearch | 12-node cluster, 3TB index |
+| Cache | Redis Cluster | 12 shards, 256GB total |
+| Event Bus | Kafka (MSK) | 12 brokers, 30-day retention |
+| Location | Redis GEO | Dedicated cluster for rider/restaurant geo |
+| CDN | CloudFront | Menu images, static assets |
+| Object Storage | S3 | Restaurant images, invoices |
+
+### 13.2 Scale Numbers
+- **Peak QPS**: 50,000 orders/min during peak (lunch/dinner)
+- **Concurrent riders**: 300,000 active
+- **Location updates**: 500,000/second
+- **Search queries**: 100,000/second
+
+### 13.3 Multi-Region (India-specific)
+- **Primary**: Mumbai (ap-south-1)
+- **Secondary**: Hyderabad (ap-south-2) — hot standby
+- **Edge**: Delhi, Bangalore, Chennai — CloudFront POPs
+- **Data residency**: All PII stays within India (compliance)
+
+### 13.4 Observability
+- **APM**: Datadog with distributed tracing across 40+ services
+- **Metrics**: Prometheus + Grafana (order SLA, rider utilization, kitchen delay)
+- **Alerts**: PagerDuty with tiered escalation (P1: order drop > 5%)

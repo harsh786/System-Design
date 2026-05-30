@@ -112,6 +112,41 @@ Global:
 
 ## 4. Data Modeling
 
+### Entity-Relationship Diagram
+
+```mermaid
+erDiagram
+    CUSTOMERS {
+        uuid id PK
+        string name
+    }
+    CDN_DISTRIBUTIONS {
+        uuid id PK
+        uuid customer_id FK
+        string name
+        string status
+        jsonb origins
+    }
+    ORIGINS {
+        uuid id PK
+        uuid distribution_id FK
+        string domain
+        string protocol
+        int port
+    }
+    CDN_ACCESS_LOGS {
+        string request_id PK
+        uuid distribution_id FK
+        uuid customer_id FK
+        string cache_status
+        int status_code
+    }
+
+    CUSTOMERS ||--o{ CDN_DISTRIBUTIONS : owns
+    CDN_DISTRIBUTIONS ||--o{ ORIGINS : sources_from
+    CDN_DISTRIBUTIONS ||--o{ CDN_ACCESS_LOGS : generates
+```
+
 ### Database Choice
 | Data | Store | Why |
 |------|-------|-----|
@@ -1214,4 +1249,78 @@ Revenue model:
   - Per-request pricing
   - Feature tiers (optimization, edge compute, WAF)
   - Committed use discounts
+```
+
+---
+
+## Sequence Diagrams
+
+### 1. Cache Hit/Miss Flow
+
+```mermaid
+sequenceDiagram
+    participant User
+    participant Edge as CDN Edge (PoP)
+    participant Shield as Origin Shield
+    participant Origin as Origin Server
+    participant S3 as Object Store (S3)
+
+    User->>Edge: GET /static/bundle.js (Accept-Encoding: br)
+
+    alt Edge cache HIT
+        Edge->>Edge: Validate freshness (max-age not expired)
+        Edge-->>User: 200 OK (CF-Cache-Status: HIT, Age: 120)
+    else Edge cache MISS
+        Edge->>Shield: Forward request (collapse concurrent)
+        Note over Shield: Request coalescing:<br/>100 concurrent requests for same asset<br/>= 1 origin fetch
+
+        alt Shield cache HIT
+            Shield-->>Edge: 200 OK (body + headers)
+        else Shield cache MISS
+            Shield->>Origin: GET /static/bundle.js
+            Origin->>S3: Fetch object
+            S3-->>Origin: Object bytes
+            Origin->>Origin: Compress (Brotli for br, gzip fallback)
+            Origin-->>Shield: 200 OK (Cache-Control: public, max-age=31536000, immutable)
+            Shield->>Shield: Cache response
+        end
+
+        Edge->>Edge: Cache response (respect Vary: Accept-Encoding)
+        Edge-->>User: 200 OK (CF-Cache-Status: MISS)
+    end
+```
+
+### 2. Cache Invalidation Flow
+
+```mermaid
+sequenceDiagram
+    participant Dev as Developer/CI
+    participant API as CDN API
+    participant CP as Control Plane
+    participant Edge1 as Edge PoP (US)
+    participant Edge2 as Edge PoP (EU)
+    participant Edge3 as Edge PoP (APAC)
+
+    Dev->>API: POST /purge {paths: ["/static/app.*.js"], type: "wildcard"}
+    API->>API: Authenticate + authorize (purge permission)
+    API->>CP: Enqueue purge job
+
+    par Propagate to all PoPs
+        CP->>Edge1: Purge command (fanout via internal mesh)
+        CP->>Edge2: Purge command
+        CP->>Edge3: Purge command
+    end
+
+    Edge1->>Edge1: Invalidate matching keys (mark stale)
+    Edge2->>Edge2: Invalidate matching keys
+    Edge3->>Edge3: Invalidate matching keys
+
+    Edge1-->>CP: ACK (purged 3 objects)
+    Edge2-->>CP: ACK (purged 3 objects)
+    Edge3-->>CP: ACK (purged 3 objects)
+
+    CP-->>API: Purge complete (propagation: 2.1s)
+    API-->>Dev: 200 {purged: 9, propagation_time_ms: 2100}
+
+    Note over Edge1,Edge3: Next request for purged paths<br/>will trigger origin fetch (soft purge:<br/>serve stale while revalidating)
 ```

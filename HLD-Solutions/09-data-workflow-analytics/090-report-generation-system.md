@@ -47,6 +47,58 @@
 
 ## 3. Data Modeling
 
+### Entity-Relationship Diagram
+
+```mermaid
+erDiagram
+    REPORT_TEMPLATES {
+        uuid template_id PK
+        varchar name
+        uuid owner_id FK
+        uuid org_id
+        jsonb parameters_schema
+    }
+    REPORT_JOBS {
+        uuid job_id PK
+        uuid template_id FK
+        varchar status
+        varchar trigger_type
+        uuid requester_id
+        uuid artifact_id FK
+    }
+    REPORT_ARTIFACTS {
+        uuid artifact_id PK
+        uuid job_id FK
+        uuid template_id FK
+        varchar format
+        bigint size_bytes
+    }
+    REPORT_CACHE {
+        varchar cache_key PK
+        uuid artifact_id FK
+        uuid template_id FK
+        varchar parameter_hash
+    }
+    REPORT_SCHEDULES {
+        uuid schedule_id PK
+        uuid template_id FK
+        varchar cron_expression
+        boolean is_active
+    }
+    REPORT_PERMISSIONS {
+        uuid permission_id PK
+        uuid template_id FK
+        varchar principal_type
+        uuid principal_id
+    }
+
+    REPORT_TEMPLATES ||--o{ REPORT_JOBS : generates
+    REPORT_TEMPLATES ||--o{ REPORT_SCHEDULES : scheduled-by
+    REPORT_TEMPLATES ||--o{ REPORT_PERMISSIONS : secured-by
+    REPORT_JOBS ||--|| REPORT_ARTIFACTS : produces
+    REPORT_ARTIFACTS ||--o{ REPORT_CACHE : cached-in
+```
+
 ### Database Schemas
 
 ```sql
@@ -1137,3 +1189,103 @@ Total: 26.4s ✓ (< 30s SLA)
 - Collaborative report building (real-time template editor)
 - ML-powered auto-insights (anomaly detection in report data)
 - Natural language report requests ("Show me Q4 sales by region")
+
+---
+
+## 12. Sequence Diagrams
+
+### Diagram 1: Async Report Generation + Notification
+
+```mermaid
+sequenceDiagram
+    participant User
+    participant API as Report API
+    participant Queue as Job Queue (SQS)
+    participant Worker as Report Worker
+    participant DB as Source Database
+    participant S3 as S3 Storage
+    participant Cache as Redis Cache
+    participant Notify as Notification Service
+
+    User->>API: POST /reports (template_id, params, format=PDF)
+    API->>API: Validate params, check permissions (RBAC)
+    API->>API: Generate report_id (UUIDv7 for time-ordering)
+    API->>Queue: Enqueue job {report_id, template_id, params, priority=NORMAL}
+    API->>Cache: SET report:{report_id} → {status: QUEUED, progress: 0%}
+    API-->>User: 202 Accepted {report_id, status_url: /reports/{id}/status}
+
+    User->>API: GET /reports/{id}/status (polling or WebSocket)
+    API->>Cache: GET report:{report_id}
+    Cache-->>API: {status: QUEUED}
+    API-->>User: {status: "queued", progress: 0}
+
+    Worker->>Queue: Receive message (long-poll, visibility timeout=300s)
+    Queue-->>Worker: Job payload
+    Worker->>Cache: SET status=PROCESSING, progress=10%
+
+    Worker->>DB: Execute data queries (with row-level security filter)
+    DB-->>Worker: Result sets (paginated to limit memory)
+    Worker->>Cache: SET progress=50%
+
+    Worker->>Worker: Render template (Handlebars + data → HTML)
+    Worker->>Worker: Convert HTML → PDF (Puppeteer/WeasyPrint)
+    Worker->>Cache: SET progress=80%
+
+    Worker->>S3: Upload PDF (multipart, server-side encryption)
+    S3-->>Worker: {key: "reports/org-1/2024/report-abc.pdf"}
+    Worker->>Cache: SET status=COMPLETED, progress=100%, s3_key, expires_at
+
+    Worker->>Notify: Send notification (email + in-app)
+    Notify->>User: "Your report is ready" (with presigned download URL)
+
+    User->>API: GET /reports/{id}/download
+    API->>S3: Generate presigned URL (1h expiry)
+    API-->>User: 302 Redirect → presigned S3 URL
+```
+
+### Diagram 2: Cached Report Serve + Invalidation
+
+```mermaid
+sequenceDiagram
+    participant User
+    participant API as Report API
+    participant Cache as Redis Cache
+    participant S3 as S3 Storage
+    participant Scheduler as Cache Invalidator
+    participant Source as Source DB
+
+    User->>API: POST /reports (template=daily_sales, params={date: today})
+    API->>API: Compute cache_key = SHA256(template_id + sorted_params + version)
+    API->>Cache: GET report_cache:{cache_key}
+
+    alt Cache HIT (report generated <15min ago)
+        Cache-->>API: {s3_key, generated_at, ttl_remaining: 600s}
+        API->>S3: Generate presigned URL for cached report
+        API-->>User: 200 OK {download_url, cached: true, generated_at}
+    else Cache MISS
+        API->>API: Check if identical job already in-flight
+        alt Duplicate job exists
+            API-->>User: 202 Accepted {report_id: existing_job_id}
+        else New job needed
+            API->>API: Enqueue new generation job
+            API-->>User: 202 Accepted {report_id: new}
+        end
+    end
+
+    Note over Scheduler: Proactive invalidation
+
+    Scheduler->>Source: Check last_modified for key tables
+    Source-->>Scheduler: orders table modified at 14:05
+
+    Scheduler->>Cache: SCAN report_cache:* WHERE depends_on=orders AND generated_before=14:05
+    Scheduler->>Cache: DEL stale cache entries (3 reports invalidated)
+
+    Note over Scheduler: Proactive re-generation for popular reports
+
+    Scheduler->>Scheduler: Top-10 most requested reports (by hit count)
+    Scheduler->>API: Trigger background regeneration (priority=LOW)
+    
+    Note over Cache: TTL-based expiry (defense in depth)
+    Cache->>Cache: Key expires after max_ttl (1h) regardless of invalidation
+```
+

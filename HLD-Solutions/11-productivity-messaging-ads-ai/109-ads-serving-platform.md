@@ -59,6 +59,61 @@
 
 ## 4. Data Modeling
 
+### Entity-Relationship Diagram
+
+```mermaid
+erDiagram
+    ADVERTISERS {
+        uuid advertiser_id PK
+        varchar name
+        varchar billing_type
+        decimal daily_budget
+        varchar status
+    }
+    CAMPAIGNS {
+        uuid campaign_id PK
+        uuid advertiser_id FK
+        varchar name
+        varchar objective
+        varchar status
+        varchar bid_strategy
+        date start_date
+    }
+    AD_GROUPS {
+        uuid ad_group_id PK
+        uuid campaign_id FK
+        varchar name
+        varchar status
+        jsonb targeting
+    }
+    ADS {
+        uuid ad_id PK
+        uuid ad_group_id FK
+        varchar format
+        varchar status
+        varchar headline
+        varchar landing_url
+        float quality_score
+    }
+    CONVERSION_PIXELS {
+        uuid pixel_id PK
+        uuid advertiser_id FK
+        varchar event_type
+        varchar attribution_model
+    }
+    USER_PROFILES {
+        uuid user_id PK
+        jsonb demographics
+        jsonb behavior
+    }
+
+    ADVERTISERS ||--o{ CAMPAIGNS : runs
+    ADVERTISERS ||--o{ CONVERSION_PIXELS : tracks
+    CAMPAIGNS ||--o{ AD_GROUPS : contains
+    AD_GROUPS ||--o{ ADS : contains
+    USER_PROFILES }o--o{ ADS : "targeted by"
+```
+
 ### Primary Database: PostgreSQL (campaigns) + Cassandra (events) + Redis (real-time)
 
 ```sql
@@ -1059,3 +1114,260 @@ Implementation:
 | Feature store unavailable | Degraded CTR accuracy | Default feature values, model trained to handle missing |
 
 ---
+
+---
+
+## 12. Sequence Diagrams
+
+### 12.1 Ad Request → Real-Time Auction → Render
+
+```mermaid
+sequenceDiagram
+    participant U as User Browser
+    participant Pub as Publisher Ad Server
+    participant SSP as SSP (Supply-Side)
+    participant Exch as Ad Exchange
+    participant DSP1 as DSP #1
+    participant DSP2 as DSP #2
+    participant CTR as CTR Model Server
+    participant Budget as Budget Service
+    participant CDN as Creative CDN
+
+    U->>Pub: Page load → ad slot detected
+    Pub->>SSP: BidRequest {slot_id, user_signals, floor_price: $2.00}
+    SSP->>Exch: OpenRTB BidRequest (enriched with user segments)
+    
+    par Parallel bid solicitation (50ms timeout)
+        Exch->>DSP1: BidRequest {user, context, floor}
+        DSP1->>CTR: Predict CTR(user_features, ad_candidates)
+        CTR-->>DSP1: [{ad_A: 0.035}, {ad_B: 0.028}]
+        DSP1->>DSP1: eCPM = CTR × bid → rank
+        DSP1-->>Exch: BidResponse {ad_A, bid: $4.50}
+    and
+        Exch->>DSP2: BidRequest {user, context, floor}
+        DSP2->>Budget: Check remaining budget for campaign_xyz
+        Budget-->>DSP2: $1,240 remaining (pace OK)
+        DSP2-->>Exch: BidResponse {ad_C, bid: $3.80}
+    end
+    
+    Exch->>Exch: Second-price auction: winner=DSP1, price=$3.81
+    Exch-->>SSP: WinNotice {ad_A, clearing_price: $3.81}
+    SSP-->>Pub: Ad markup (creative URL + tracking pixels)
+    Pub-->>U: Render ad from CDN
+    U->>CDN: Fetch creative asset
+    CDN-->>U: Ad creative (< 150KB)
+    U->>Exch: Impression beacon fired
+    Exch->>Budget: Deduct $3.81 from campaign budget
+```
+
+### 12.2 Campaign Budget Pacing
+
+```mermaid
+sequenceDiagram
+    participant Sched as Pacing Scheduler (every 1min)
+    participant Budget as Budget Service
+    participant Redis as Redis (Token Bucket)
+    participant DSP as DSP Bidding Engine
+    participant Kafka as Event Stream
+    participant Analytics as Spend Analytics
+
+    Sched->>Budget: Calculate target spend rate
+    Budget->>Budget: daily_budget=$10,000 / remaining_hours=8 → $1,250/hr → $20.83/min
+    Budget->>Redis: SET token_bucket:{campaign_id} {tokens: 20.83, refill_rate: 0.347/s}
+    
+    Note over DSP: Every bid request...
+    DSP->>Redis: DECR token_bucket:{campaign_id}
+    Redis-->>DSP: tokens_remaining: 15.2 (OK to bid)
+    DSP->>DSP: Bid normally
+    
+    Note over DSP: Later, budget running low...
+    DSP->>Redis: DECR token_bucket:{campaign_id}
+    Redis-->>DSP: tokens_remaining: 0.3 (low)
+    DSP->>DSP: Reduce bid probability (probabilistic throttle)
+    
+    Kafka->>Analytics: Aggregate spend events (1-min windows)
+    Analytics->>Budget: Actual spend last minute: $22.50 (overpacing 8%)
+    Budget->>Redis: ADJUST refill_rate → 0.320/s (slow down)
+    Budget->>Budget: Log pacing adjustment for reporting
+```
+
+### 12.3 CTR Model Prediction Serving
+
+```mermaid
+sequenceDiagram
+    participant DSP as DSP Bidder
+    participant Router as Model Router
+    participant FeatStore as Feature Store (Redis)
+    participant Model as CTR Model (TensorRT)
+    participant Cache as Prediction Cache
+    participant Monitor as Model Monitor
+
+    DSP->>Router: PredictCTR(user_id, [ad_candidate_1..N], context)
+    Router->>Cache: GET prediction:{user_hash}:{context_hash}
+    Cache-->>Router: MISS (or stale >30s)
+    
+    par Feature assembly
+        Router->>FeatStore: GET user_features:{user_id}
+        FeatStore-->>Router: {age_bucket, interests, recency, history_ctr}
+    and
+        Router->>FeatStore: GET ad_features:{ad_ids}
+        FeatStore-->>Router: {category, creative_type, historical_ctr, campaign_age}
+    and
+        Router->>Router: Extract context features {page_category, time_of_day, device, geo}
+    end
+    
+    Router->>Router: Assemble feature vector (sparse + dense, ~200 dims)
+    Router->>Model: BatchPredict([feature_vectors]) (GPU, <5ms p99)
+    Model-->>Router: [0.035, 0.028, 0.019, 0.041, ...]
+    Router->>Cache: SET prediction:{hash} TTL=30s
+    Router->>Monitor: Log(predictions, latency, feature_coverage)
+    Router-->>DSP: [{ad_1: 0.035}, {ad_2: 0.028}, ...]
+    
+    Note over Monitor: Async: drift detection, data quality alerts
+```
+
+## 13. Algorithm Deep Dives
+
+### 13.1 Real-Time Bidding (RTB) Auction Mechanism
+
+#### Second-Price Auction (Vickrey Mechanism)
+
+In a second-price auction, the highest bidder wins but pays the second-highest bid + $0.01 (minimum increment). This is strategy-proof: bidders maximize utility by bidding their true valuation.
+
+```
+Auction Input:
+  Bids: [DSP_A: $4.50, DSP_B: $3.80, DSP_C: $2.10]
+  Floor price: $2.00
+
+Auction Execution:
+  1. Filter bids below floor: all pass
+  2. Rank by bid: DSP_A > DSP_B > DSP_C
+  3. Winner: DSP_A
+  4. Clearing price: max(second_bid + $0.01, floor) = max($3.81, $2.00) = $3.81
+  5. DSP_A pays $3.81 (saves $0.69 vs their bid)
+
+Properties:
+  - Truthful: Dominant strategy is to bid true value
+  - Efficient: Highest-value bidder wins
+  - Revenue-optimal (among truthful mechanisms for single item)
+```
+
+#### Budget Pacing with Token Bucket Algorithm
+
+The challenge: spend a $10,000 daily budget evenly across 24 hours while maximizing value (not just uniform distribution).
+
+```
+Algorithm: Adaptive Token Bucket Pacing
+
+Parameters:
+  - B: Total daily budget ($10,000)
+  - T: Remaining time (seconds until midnight)
+  - λ: Target spend rate = B / T
+  - α: Smoothing factor (0.1 for gradual adjustment)
+  - overspend_tolerance: 5%
+
+Token Bucket State:
+  - tokens: Current available spend units
+  - max_tokens: λ × 60 (1-minute buffer)
+  - refill_rate: λ per second
+
+Pacing Logic (per bid opportunity):
+  if tokens >= bid_amount:
+      tokens -= bid_amount
+      → ALLOW BID
+  else:
+      p = tokens / bid_amount  // Probabilistic throttling
+      if random() < p:
+          → ALLOW BID (reduced probability)
+      else:
+          → SKIP (don't participate in auction)
+
+Adaptive Adjustment (every 60s):
+  actual_spend = aggregate_last_minute()
+  expected_spend = λ × 60
+  error = (actual_spend - expected_spend) / expected_spend
+  
+  if |error| > overspend_tolerance:
+      λ_new = λ × (1 - α × error)  // PID-like correction
+      refill_rate = λ_new
+  
+  // Time-of-day adjustment (traffic follows diurnal pattern):
+  traffic_multiplier = predicted_traffic[current_hour] / avg_traffic
+  λ_adjusted = λ_new × traffic_multiplier
+```
+
+#### Value-Based Pacing (Advanced)
+
+Instead of uniform pacing, allocate more budget to high-value opportunities:
+
+```
+For each bid opportunity:
+  value_score = CTR_prediction × conversion_value
+  threshold = dynamic_threshold(remaining_budget, remaining_time)
+  
+  if value_score > threshold:
+      bid = min(value_score × bid_multiplier, max_bid_cap)
+  else:
+      skip  // Save budget for better opportunities
+      
+  // Threshold adapts: rises when overpacing, falls when underpacing
+```
+
+### 13.2 CTR Prediction: Feature Engineering & Model Serving at 100K QPS
+
+#### Feature Engineering Pipeline
+
+```
+Feature Categories (typical ~500 raw features → ~200 after embedding):
+
+1. User Features (from user profile store):
+   - Demographics: age_bucket, gender, geo_region (one-hot)
+   - Behavioral: click_history_7d, purchase_recency, session_depth
+   - Interest segments: [sports, tech, travel] (multi-hot, from DMP)
+   
+2. Ad/Creative Features:
+   - Category: advertiser_vertical (one-hot, 50 categories)
+   - Creative: image_embedding (64-dim from pre-trained CNN)
+   - Historical: ad_historical_ctr, campaign_age_days, spend_velocity
+   
+3. Context Features:
+   - Temporal: hour_of_day (cyclical encoding: sin/cos), day_of_week
+   - Page: page_category, content_keywords (TF-IDF top-20)
+   - Device: device_type, os, screen_size, connection_speed
+   
+4. Cross Features (interaction terms):
+   - user_interest × ad_category (learned embedding, 16-dim)
+   - hour_of_day × device_type
+   - user_recency × ad_frequency (fatigue signal)
+
+Feature Vector Assembly: ~5μs per request (pre-computed embeddings in feature store)
+```
+
+#### Model Architecture for Production
+
+```
+Model: Deep & Cross Network (DCN-v2)
+  - Cross network: explicit feature interactions (O(d) params per layer)
+  - Deep network: 3 hidden layers [512, 256, 128], ReLU
+  - Output: sigmoid → P(click)
+  
+Serving Stack:
+  - Model format: TensorRT (NVIDIA) for GPU, ONNX Runtime for CPU fallback
+  - Batch inference: Accumulate requests for 2ms → batch (up to 256)
+  - Hardware: NVIDIA T4 GPUs (cost-effective inference)
+  - Throughput: ~25K predictions/s per GPU → 4 GPUs = 100K QPS
+  
+Latency Budget (total <10ms p99):
+  - Feature fetch: 2ms (parallel Redis MGET)
+  - Feature assembly: 0.5ms
+  - Model inference: 3ms (batched GPU)
+  - Post-processing: 0.5ms
+  - Network overhead: 2ms
+  
+Model Update Cycle:
+  - Full retrain: daily (on yesterday's click data, ~100M examples)
+  - Online update: hourly (incremental, last hour's data)
+  - A/B testing: shadow mode for 4h, then 5% traffic, then full rollout
+  - Monitoring: AUC degradation >1% triggers alert, auto-rollback if >3%
+```
+

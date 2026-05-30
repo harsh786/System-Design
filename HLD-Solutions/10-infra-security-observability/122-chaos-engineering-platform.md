@@ -778,6 +778,62 @@ class ApprovalWorkflow:
 
 ## 5. Data Model
 
+### Entity-Relationship Diagram
+
+```mermaid
+erDiagram
+    CHAOS_EXPERIMENTS {
+        uuid id PK
+        string name
+        uuid team_id FK
+        uuid created_by FK
+        string target_service
+        string fault_type
+        string state
+        string risk_level
+    }
+    CHAOS_EXPERIMENT_RUNS {
+        uuid id PK
+        uuid experiment_id FK
+        timestamp started_at
+        string state
+        boolean hypothesis_passed
+    }
+    CHAOS_APPROVALS {
+        uuid id PK
+        uuid experiment_id FK
+        string risk_level
+        int approvals_needed
+        string status
+    }
+    CHAOS_APPROVAL_VOTES {
+        uuid id PK
+        uuid approval_id FK
+        uuid approver_id FK
+        string decision
+    }
+    CHAOS_AUDIT_LOG {
+        bigint id PK
+        uuid experiment_id FK
+        uuid run_id FK
+        string action
+        string actor_type
+    }
+    GAME_DAYS {
+        uuid id PK
+        string name
+        date scheduled_date
+        uuid coordinator_id FK
+        string state
+    }
+
+    CHAOS_EXPERIMENTS ||--o{ CHAOS_EXPERIMENT_RUNS : "executed as"
+    CHAOS_EXPERIMENTS ||--o{ CHAOS_APPROVALS : "requires"
+    CHAOS_APPROVALS ||--o{ CHAOS_APPROVAL_VOTES : "voted on"
+    CHAOS_EXPERIMENTS ||--o{ CHAOS_AUDIT_LOG : "audited"
+    CHAOS_EXPERIMENT_RUNS ||--o{ CHAOS_AUDIT_LOG : "logged"
+```
+
 ### Database Schema (PostgreSQL)
 
 ```sql
@@ -1166,3 +1222,155 @@ chaos_gate:
 - Queue backpressure experiments need careful monitoring
 - Cache invalidation chaos must track consistency violations
 - State machine corruption detection via checksums
+
+---
+
+## Sequence Diagrams
+
+### Experiment Injection + Blast Radius Control
+
+```mermaid
+sequenceDiagram
+    participant Eng as SRE / Engineer
+    participant API as Chaos API
+    participant Scheduler as Experiment Scheduler
+    participant Safety as Safety Controller
+    participant Agent as Chaos Agent (target host)
+    participant Target as Target Service
+    participant Monitor as Monitoring System
+    participant DB as Experiment Store
+
+    Eng->>API: POST /experiments {type: network-latency, target: payments-svc, latency: 500ms, blast_radius: 10%}
+    API->>API: Validate permissions, check service ownership
+    API->>Safety: Pre-flight safety check
+    Safety->>Monitor: Get current health metrics for payments-svc
+    Monitor-->>Safety: {error_rate: 0.1%, latency_p99: 200ms, healthy: true}
+    Safety->>Safety: Check: no active incidents, within business hours, blast_radius ≤ limit
+    Safety-->>API: APPROVED (safe to proceed)
+    API->>DB: Store experiment {id, status: approved}
+    API->>Scheduler: Schedule experiment
+
+    Scheduler->>Agent: Inject fault {type: latency, amount: 500ms, target: 10% of pods}
+    Agent->>Target: Apply tc netem (network latency injection)
+    Agent-->>Scheduler: Injection confirmed
+
+    Scheduler->>DB: Update status: running
+    Scheduler->>Monitor: Start experiment monitoring window
+    Note over Monitor: Continuous health check every 5s during experiment
+```
+
+### Steady-State Monitoring + Auto-Rollback
+
+```mermaid
+sequenceDiagram
+    participant Monitor as Monitoring System
+    participant Safety as Safety Controller
+    participant Agent as Chaos Agent
+    participant Target as Target Service
+    participant Scheduler as Experiment Scheduler
+    participant DB as Experiment Store
+    participant Notify as Notification Service
+
+    loop Every 5s during experiment
+        Monitor->>Monitor: Check steady-state hypothesis
+        Monitor->>Monitor: Evaluate: error_rate < 1%, p99 < 1000ms, no cascading failures
+    end
+
+    alt Steady state VIOLATED (abort conditions met)
+        Monitor->>Safety: ABORT: error_rate=5.2% exceeds threshold (1%)
+        Safety->>Agent: IMMEDIATE ROLLBACK (kill switch)
+        Agent->>Target: Remove fault injection (tc netem del)
+        Agent-->>Safety: Rollback confirmed
+        Safety->>Scheduler: Experiment aborted (safety trigger)
+        Scheduler->>DB: Update: status=aborted, reason="error_rate_exceeded"
+        Scheduler->>Notify: Alert team: experiment auto-aborted
+    else Experiment duration complete (steady state held)
+        Monitor-->>Scheduler: Duration complete, steady state maintained
+        Scheduler->>Agent: Remove fault injection (graceful)
+        Agent->>Target: Remove tc netem
+        Scheduler->>DB: Update: status=completed, result=passed
+        Scheduler->>Notify: Experiment passed ✓
+    end
+
+    Note over Safety: Kill switch can also be triggered manually (panic button)
+```
+
+## Caching Strategy
+
+| Layer | What's Cached | TTL | Purpose |
+|-------|--------------|-----|---------|
+| Service health baseline | Redis | 5 min | Pre-flight safety comparison |
+| Target service topology | In-memory | 2 min | Blast radius calculation |
+| Experiment templates | DB + cache | 1 hour | Fast experiment creation |
+| Safety rules | In-memory | 1 min | Low-latency abort decisions |
+
+## Infrastructure Components
+
+| Component | Technology | Sizing | HA Strategy |
+|-----------|-----------|--------|-------------|
+| Chaos API | Go service | 3 pods | Multi-AZ, stateless |
+| Experiment Scheduler | Go + Temporal | 3 pods | Temporal for durable execution |
+| Safety Controller | Go service | 3 pods (active-active) | Must be MORE reliable than targets |
+| Chaos Agents | DaemonSet (per node) | 1 per node | Host-level injection |
+| Experiment Store | PostgreSQL | db.r6g.large | Multi-AZ RDS |
+| Monitoring Integration | Prometheus/Datadog API | - | Read-only queries |
+| Kill Switch | Redis Pub/Sub + Agent | Global | Sub-second propagation |
+
+### Safety Design (Non-Negotiable)
+- **Kill switch**: Redis Pub/Sub broadcast → all agents halt within 1s
+- **Blast radius enforcement**: Maximum 25% of pods/hosts per experiment
+- **No production during incidents**: Experiments blocked if active P1/P2 incident
+- **Business hours gate**: Critical path experiments only during low-traffic windows
+- **Automatic abort**: If any monitored metric exceeds 2x baseline → immediate halt
+
+## Deep Dive: Experiment Design Patterns
+
+### Steady-State Hypothesis Validation
+```
+FUNCTION validate_steady_state(experiment):
+  baseline = get_baseline_metrics(experiment.target, window=5min)
+  
+  DEFINE steady_state_conditions:
+    error_rate < baseline.error_rate * 2 AND error_rate < 1%
+    latency_p99 < baseline.latency_p99 * 3 AND latency_p99 < 2000ms
+    throughput > baseline.throughput * 0.8
+    no cascading failures (downstream error rates stable)
+    no customer-facing impact (synthetic monitors green)
+  
+  RETURN ALL conditions satisfied
+```
+
+### Blast Radius Control Algorithm
+```
+FUNCTION compute_targets(service, blast_radius_pct):
+  all_instances = get_healthy_instances(service)
+  target_count = ceil(len(all_instances) * blast_radius_pct / 100)
+  
+  // Ensure we never exceed safety limits
+  target_count = min(target_count, MAX_ABSOLUTE_TARGETS)
+  
+  // Select targets with zone-awareness (never all in one AZ)
+  targets = select_spread_across_azs(all_instances, target_count)
+  
+  // Verify: remaining healthy > minimum threshold
+  remaining = len(all_instances) - target_count
+  IF remaining < service.min_healthy_instances:
+    REJECT("Would violate minimum healthy threshold")
+  
+  RETURN targets
+```
+
+### GameDay Orchestration
+```
+Multi-experiment scenario (progressive):
+  Phase 1: Single pod failure (blast_radius: 1 pod)
+    → Validate: auto-scaling, load redistribution
+  Phase 2: AZ failure simulation (blast_radius: 1 AZ)
+    → Validate: cross-AZ failover, no data loss
+  Phase 3: Dependency failure (inject 100% failure to cache)
+    → Validate: graceful degradation, circuit breakers
+  Phase 4: Combined failures (AZ + dependency)
+    → Validate: system resilience under compound failures
+
+Each phase: only proceeds if previous phase passed steady-state validation
+```

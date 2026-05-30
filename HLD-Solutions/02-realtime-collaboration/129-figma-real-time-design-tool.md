@@ -84,6 +84,61 @@
 
 ## 4. Data Model / Schema Design
 
+### Entity-Relationship Diagram
+
+```mermaid
+erDiagram
+    DOCUMENT {
+        string document_id PK
+        string name
+        int version
+    }
+    PAGE_NODE {
+        string node_id PK
+        string document_id FK
+        string name
+    }
+    BASE_NODE {
+        string node_id PK
+        string parent_id FK
+        string node_type
+        float x
+        float y
+        float width
+        float height
+    }
+    COMPONENT_NODE {
+        string node_id PK
+        string component_id
+        dict variant_properties
+    }
+    INSTANCE_NODE {
+        string node_id PK
+        string component_id FK
+        dict overrides
+    }
+    CRDT_OPERATION {
+        string op_id PK
+        string client_id FK
+        int timestamp
+        string op_type
+        string target_node_id FK
+    }
+    AWARENESS_STATE {
+        string client_id PK
+        string user_id FK
+        string active_page_id FK
+        list selection
+    }
+
+    DOCUMENT ||--o{ PAGE_NODE : "contains"
+    PAGE_NODE ||--o{ BASE_NODE : "contains"
+    BASE_NODE ||--o{ BASE_NODE : "parent-child"
+    COMPONENT_NODE ||--o{ INSTANCE_NODE : "instantiated as"
+    DOCUMENT ||--o{ CRDT_OPERATION : "versioned by"
+    DOCUMENT ||--o{ AWARENESS_STATE : "has editors"
+```
+
 ### Document Tree Model
 ```python
 @dataclass
@@ -939,3 +994,160 @@ Batch of 10 property changes: ~500 bytes
 - **Rendering**: frame time (p50/p99), draw calls, GPU memory
 - **Document health**: node count, tree depth, component instance count
 - **Client metrics**: WebSocket reconnection rate, offline duration, op queue depth
+
+---
+
+## Sequence Diagrams
+
+### 1. Component Edit + CRDT Sync
+
+```mermaid
+sequenceDiagram
+    participant A as Designer A
+    participant GW as WebSocket Gateway
+    participant CRDT as CRDT Engine
+    participant DB as Postgres (Document Store)
+    participant Cache as Redis
+    participant GW2 as Gateway Node 2
+    participant B as Designer B
+
+    A->>A: Move rectangle {id: "rect_1"} to position (200, 300)
+    A->>GW: operation {type: "update_property", node_id: "rect_1",<br/>props: {x: 200, y: 300}, vector_clock: [A:5]}
+    
+    GW->>CRDT: Apply operation
+    CRDT->>CRDT: Merge into document CRDT state<br/>Last-writer-wins register for position properties<br/>Resolve conflicts via vector clock comparison
+    CRDT->>Cache: Update live document state
+    CRDT->>DB: Append to operation log (async batch, every 500ms)
+    CRDT-->>GW: ACK {server_clock: [A:5, B:3]}
+
+    par Sync to collaborators
+        CRDT->>GW2: Broadcast operation to B's gateway
+        GW2-->>B: operation {node: "rect_1", props: {x:200, y:300}, from: A}
+        B->>B: Apply remote operation to local state
+        B->>B: Re-render canvas (requestAnimationFrame)
+    end
+
+    Note over CRDT: Conflict resolution:<br/>- Position/size: LWW (last writer wins by timestamp)<br/>- Text content: RGA (Replicated Growable Array)<br/>- Tree structure: Move semantics (no cycles)
+
+    alt Concurrent conflict (B also moved rect_1)
+        B->>GW2: operation {node: "rect_1", props: {x:150, y:250}, vector_clock: [B:4]}
+        GW2->>CRDT: Apply B's operation
+        CRDT->>CRDT: Vector clock comparison:<br/>A:5 > B:4 → A's position wins (LWW)
+        CRDT->>GW2: Resolved state {x:200, y:300}
+        GW2-->>B: Correction (snap to A's position)
+    end
+```
+
+### 2. Multiplayer Cursor (Awareness)
+
+```mermaid
+sequenceDiagram
+    participant A as Designer A
+    participant B as Designer B
+    participant C as Designer C
+    participant GW as WebSocket Gateway
+    participant AS as Awareness Service
+    participant Cache as Redis
+
+    Note over A,C: All designers have same file open
+
+    A->>A: Mouse moves on canvas (throttled to 60fps → 20 updates/sec)
+    A->>GW: cursor_update {x: 450, y: 320, viewport: {zoom: 1.5, scroll: {x:0, y:100}},<br/>selection: ["rect_1", "text_2"], tool: "move"}
+
+    GW->>AS: Process cursor update (debounce: 50ms)
+    AS->>Cache: HSET file:{id}:cursors A {x, y, viewport, selection, tool, color, name}
+    
+    AS->>GW: Broadcast to other editors
+    par
+        GW-->>B: cursor_positions [{user: A, x:450, y:320, color:"#FF5733", name:"Alice", tool:"move"}]
+        B->>B: Transform cursor to B's viewport coordinates<br/>Render colored cursor + name label + selection highlights
+    and
+        GW-->>C: cursor_positions [{user: A, ...}]
+        C->>C: Render A's cursor in C's viewport
+    end
+
+    Note over AS: Optimizations:<br/>- Batch cursor updates (send all cursors in one frame)<br/>- Skip updates for off-screen cursors (viewport culling)<br/>- Reduce frequency for idle cursors (no movement = 1 update/5s)
+
+    alt Designer disconnects
+        GW->>AS: User A disconnected
+        AS->>Cache: HDEL file:{id}:cursors A
+        AS->>GW: Broadcast cursor_removed {user: A}
+        GW-->>B: Remove A's cursor from canvas
+        GW-->>C: Remove A's cursor from canvas
+    end
+```
+
+### 3. Auto-Save + Version History
+
+```mermaid
+sequenceDiagram
+    participant C as Client
+    participant GW as WebSocket Gateway
+    participant CRDT as CRDT Engine
+    participant Q as Kafka
+    participant SS as Snapshot Service
+    participant DB as Postgres
+    participant S3 as S3 (Snapshots)
+    participant VS as Version Service
+
+    Note over C,CRDT: Continuous editing generates operations
+
+    loop Every 30 seconds (auto-save interval)
+        CRDT->>CRDT: Check if dirty (ops since last save)
+        CRDT->>Q: Flush operation batch to Kafka
+        Q->>SS: Consume operations batch
+        SS->>DB: Persist operations to op_log table
+        SS->>SS: Increment auto-save counter
+    end
+
+    alt Every 100 operations OR every 5 minutes (snapshot threshold)
+        SS->>CRDT: Request full document state
+        CRDT-->>SS: Serialized CRDT state (binary)
+        SS->>S3: Store snapshot {file_id, revision, blob}
+        SS->>DB: INSERT version {file_id, revision, snapshot_url, ts, auto: true}
+        SS->>GW: Notify clients: auto_saved {revision}
+        GW-->>C: "All changes saved" indicator
+    end
+
+    Note over C: User manually saves version
+    C->>GW: create_version {title: "Final layout v2"}
+    GW->>VS: Create named version
+    VS->>CRDT: Get current state
+    CRDT-->>VS: Full document state
+    VS->>S3: Store named snapshot
+    VS->>DB: INSERT version {title, revision, auto: false, thumbnail_url}
+    VS-->>GW: Version created {version_id, title}
+    GW-->>C: "Version saved: Final layout v2"
+
+    Note over VS: Version restore:
+    C->>GW: restore_version {version_id}
+    GW->>VS: Load version
+    VS->>S3: Fetch snapshot
+    VS->>CRDT: Replace document state (generate inverse ops)
+    CRDT->>GW: Broadcast full state reset to all editors
+    GW-->>C: Document restored (re-render canvas)
+```
+
+### Async Processing Architecture
+
+| Pipeline Stage | Technology | Input | Output | SLA |
+|---------------|-----------|-------|--------|-----|
+| Operation Persistence | Kafka → Postgres | CRDT operations (batched) | Durable op log | < 500ms (batch interval) |
+| Snapshot Generation | Go workers | Op log + previous snapshot | Full state snapshot (S3) | < 2s |
+| Thumbnail Generation | Headless renderer (Skia) | Document snapshot | PNG thumbnails (S3) | < 5s |
+| Export (PDF/SVG/PNG) | Rendering pipeline | Document state | Export file | < 10s |
+| Asset Processing | Image pipeline | Uploaded images | Optimized + thumbnails | < 3s |
+| Component Library Sync | Background workers | Published components | Library index update | < 1s |
+
+**Kafka Topics:**
+- `design.operations` — real-time CRDT ops (high throughput, 7-day retention)
+- `design.snapshots` — snapshot triggers (low throughput)
+- `design.exports` — export job queue
+- `design.assets` — uploaded image/asset processing
+- `design.events` — file open/close, comment, share events
+
+**Worker Scaling:**
+- Snapshot workers: Scale on op_log lag (target: < 1000 pending ops)
+- Export workers: Scale on queue depth (burst capacity for team exports)
+- Thumbnail workers: Fire-and-forget, best-effort delivery
+

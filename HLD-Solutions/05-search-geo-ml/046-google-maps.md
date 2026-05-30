@@ -43,6 +43,54 @@
 
 ## 3. Data Modeling
 
+### Entity-Relationship Diagram
+
+```mermaid
+erDiagram
+    ROAD_NODES {
+        bigint node_id PK
+        decimal lat
+        decimal lng
+        boolean is_intersection
+        int partition_id
+    }
+    ROAD_SEGMENTS {
+        bigint segment_id PK
+        bigint start_node_id FK
+        bigint end_node_id FK
+        varchar road_class
+        int length_meters
+        boolean is_oneway
+    }
+    TURN_RESTRICTIONS {
+        bigint restriction_id PK
+        bigint from_segment_id FK
+        bigint via_node_id FK
+        bigint to_segment_id FK
+        varchar restriction_type
+    }
+    POIS {
+        bigint poi_id PK
+        varchar name
+        varchar category
+        decimal lat
+        decimal lng
+        decimal rating
+    }
+    TRAFFIC_SEGMENTS {
+        bigint segment_id PK
+        smallint current_speed_kmh
+        varchar congestion_level
+        int travel_time_seconds
+    }
+    ROAD_NODES ||--o{ ROAD_SEGMENTS : "start of"
+    ROAD_NODES ||--o{ ROAD_SEGMENTS : "end of"
+    ROAD_SEGMENTS ||--o| TRAFFIC_SEGMENTS : "has traffic"
+    ROAD_SEGMENTS ||--o{ TURN_RESTRICTIONS : "from"
+    ROAD_SEGMENTS ||--o{ TURN_RESTRICTIONS : "to"
+    ROAD_NODES ||--o{ TURN_RESTRICTIONS : "via"
+```
+
 ### 3.1 Road Graph (Custom Binary Format + PostgreSQL/PostGIS)
 
 ```sql
@@ -1219,3 +1267,304 @@ alerts:
 - Road graph too large for single server (200GB+ in memory)
 - Solution: Geographic partitioning with border-node stitching for cross-region routes
 - Challenge: Cross-continental routes require multi-hop coordination
+
+---
+
+## 12. Sequence Diagrams
+
+### 12.1 Route Computation Request Flow
+
+```mermaid
+sequenceDiagram
+    participant Client
+    participant API as API Gateway
+    participant Router as Routing Service
+    participant CH as CH Index (In-Memory)
+    participant Traffic as Traffic Service
+    participant Tile as Tile Service
+    participant Cache as Route Cache
+
+    Client->>API: POST /directions {origin, destination, mode=driving}
+    API->>Cache: Check cache (origin_cell + dest_cell + time_bucket)
+    alt Cache Hit
+        Cache-->>API: Cached route (polyline + ETA)
+        API-->>Client: 200 OK (cached)
+    else Cache Miss
+        API->>Router: computeRoute(origin, destination, departure_time)
+        Router->>Router: Map-match origin & destination to nearest road nodes
+        Router->>CH: Bidirectional Dijkstra on contracted graph
+        CH-->>Router: Shortest path (node sequence)
+        Router->>Traffic: Get current speeds for path edges
+        Traffic-->>Router: Speed data per segment
+        Router->>Router: Recompute ETA with live traffic, find alternatives
+        Router-->>API: Route(polyline, ETA, steps, alternatives[])
+        API->>Cache: Store (TTL=5min for traffic-sensitive)
+        API->>Tile: Prefetch tiles along route
+    end
+    API-->>Client: 200 OK {routes: [...], eta, distance}
+```
+
+### 12.2 Map Tile Rendering Pipeline
+
+```mermaid
+sequenceDiagram
+    participant Client
+    participant CDN
+    participant TileSvc as Tile Service
+    participant VectorDB as Vector Tile DB
+    participant Renderer as Tile Renderer
+    participant Storage as Object Storage (S3)
+
+    Client->>CDN: GET /tiles/14/2621/6332.mvt
+    alt CDN Hit
+        CDN-->>Client: Vector tile (cached)
+    else CDN Miss
+        CDN->>TileSvc: Forward request
+        TileSvc->>Storage: Check pre-rendered tile
+        alt Pre-rendered exists
+            Storage-->>TileSvc: Tile bytes
+        else Need rendering
+            TileSvc->>VectorDB: Query features for tile bounds (z=14, x=2621, y=6332)
+            VectorDB-->>TileSvc: Roads, buildings, POIs in bbox
+            TileSvc->>Renderer: Encode features → MVT protobuf
+            Renderer-->>TileSvc: Rendered vector tile
+            TileSvc->>Storage: Store for future requests
+        end
+        TileSvc-->>CDN: Vector tile + cache headers
+        CDN-->>Client: Vector tile
+    end
+    Client->>Client: Decode MVT + apply style → render on GPU
+```
+
+### 12.3 Live Traffic Update Flow
+
+```mermaid
+sequenceDiagram
+    participant Phones as Android/iOS Devices (millions)
+    participant Ingest as Location Ingest Service
+    participant Kafka
+    participant MapMatch as Map Matching Service
+    participant SpeedCalc as Speed Aggregator
+    participant TrafficDB as Traffic Store (Redis)
+    participant Router as Routing Service
+
+    Phones->>Ingest: Location updates (lat, lng, speed, heading) @ 1Hz
+    Ingest->>Kafka: Batch publish (partitioned by geo region)
+    Kafka->>MapMatch: Consume location stream
+    MapMatch->>MapMatch: Hidden Markov Model → snap to road segments
+    MapMatch->>SpeedCalc: (segment_id, speed, timestamp)
+    SpeedCalc->>SpeedCalc: Sliding window average (5-min buckets)
+    SpeedCalc->>TrafficDB: SET speed:segment_id → {current_speed, confidence, sample_count}
+    Note over TrafficDB: TTL=10min, stale = use historical
+    Router->>TrafficDB: GET speeds for route segments
+    TrafficDB-->>Router: Live speeds (or fallback to historical)
+```
+
+---
+
+## 13. Deep Dive: Routing Algorithms
+
+### 13.1 Dijkstra's Algorithm (Step-by-Step)
+
+**The Foundation:**
+```python
+import heapq
+
+def dijkstra(graph, source, target):
+    # Priority queue: (distance, node)
+    pq = [(0, source)]
+    dist = {source: 0}
+    prev = {}
+
+    while pq:
+        d, u = heapq.heappop(pq)
+
+        if u == target:
+            return reconstruct_path(prev, target), d
+
+        if d > dist.get(u, float('inf')):
+            continue  # Stale entry
+
+        for v, weight in graph[u].neighbors():
+            new_dist = d + weight
+            if new_dist < dist.get(v, float('inf')):
+                dist[v] = new_dist
+                prev[v] = u
+                heapq.heappush(pq, (new_dist, v))
+
+    return None, float('inf')
+```
+
+**Why vanilla Dijkstra is too slow for maps:**
+- US road network: ~24 million nodes, ~58 million edges
+- Dijkstra explores outward in all directions (like a circle expanding)
+- For NYC → LA: explores ~12 million nodes before finding path
+- Time: O((V + E) log V) ≈ O(58M × log 24M) ≈ seconds per query
+- At 10K QPS, this is completely infeasible
+
+---
+
+### 13.2 Contraction Hierarchies (CH) - The Production Solution
+
+**Key insight:** Most shortest paths go through important nodes (highways, major intersections). Pre-compute shortcuts to skip unimportant nodes.
+
+**Step 1: Node Ordering (Preprocessing)**
+```
+Rank every node by "importance":
+- Importance ≈ (# shortcuts needed if removed) - (# edges removed) + (hierarchy depth)
+- Highway intersections → high importance
+- Residential dead-ends → low importance
+
+Example graph:
+    A ---2--- B ---3--- C ---1--- D
+    |                             |
+    5                             2
+    |                             |
+    E --------4------------ F ---1--- G
+
+Node importance ranking: D > C > B > F > G > A > E
+```
+
+**Step 2: Contraction (Remove nodes bottom-up)**
+```
+Remove node E (least important):
+- E connects A and F
+- Shortest path A→E→F = 5+4 = 9
+- Without E, is there a path A→F ≤ 9? Check: A→B→C→D→F = 2+3+1+2 = 8. YES!
+- No shortcut needed (existing path is shorter)
+
+Remove node A:
+- A connects B and E (E already removed)
+- Only remaining: A connects to B
+- A is dead-end → no shortcuts needed
+
+Remove node G:
+- G connects F only → no shortcuts needed
+
+Remove node F:
+- F connects D and (contracted nodes)
+- D→F = 2, already connected → no shortcut
+
+Remove node B:
+- B connects A(removed) and C
+- Shortcut: Need path A→C? A removed, so only C matters
+- No new shortcut needed
+
+Result: Overlay graph has original edges + shortcut edges
+```
+
+**Step 3: Bidirectional Search (Query Time)**
+```python
+def ch_query(source, target, up_graph, down_graph):
+    """
+    up_graph: edges going to higher-ranked nodes
+    down_graph: edges going to lower-ranked nodes
+    """
+    # Forward search: only go UP in hierarchy from source
+    forward_pq = [(0, source)]
+    forward_dist = {source: 0}
+
+    # Backward search: only go UP in hierarchy from target
+    backward_pq = [(0, target)]
+    backward_dist = {target: 0}
+
+    best = float('inf')
+    meeting_node = None
+
+    while forward_pq or backward_pq:
+        # Alternate forward and backward
+        if forward_pq:
+            d, u = heapq.heappop(forward_pq)
+            if d >= best: 
+                forward_pq = []  # Prune
+            else:
+                for v, w in up_graph[u]:  # Only upward edges!
+                    new_d = d + w
+                    if new_d < forward_dist.get(v, float('inf')):
+                        forward_dist[v] = new_d
+                        heapq.heappush(forward_pq, (new_d, v))
+                # Check if backward already reached u
+                if u in backward_dist:
+                    total = forward_dist[u] + backward_dist[u]
+                    if total < best:
+                        best = total
+                        meeting_node = u
+
+        # Similar for backward...
+
+    return best, meeting_node
+```
+
+**Why CH is 1000-10000x faster:**
+| Metric | Dijkstra | Contraction Hierarchies |
+|--------|----------|------------------------|
+| Nodes explored | 5-12 million | 500-2000 |
+| Query time | 2-5 seconds | 0.5-2 ms |
+| Preprocessing | None | 5-30 minutes |
+| Space overhead | None | 2-3x (shortcuts) |
+| Dynamic weights | Yes | No (need re-preprocess) |
+
+**The tradeoff:** CH preprocessing takes 10-30 minutes for a country-sized graph. Updates (road closures, new roads) require partial re-contraction.
+
+---
+
+### 13.3 A* with Landmarks (ALT Algorithm)
+
+**Why A* helps:**
+- A* = Dijkstra + heuristic function h(n) that estimates distance to target
+- Only explores nodes where `g(n) + h(n) < best_known`
+- Guides search toward target instead of expanding in all directions
+
+**Landmark-based heuristic (ALT):**
+```
+Preprocessing:
+1. Select ~16 landmarks (strategically placed: corners of country, central hubs)
+2. For each landmark L, precompute dist(L, every_node) using Dijkstra
+   This takes 16 × O(V log V) but only done once
+
+Query (source S → target T):
+- For each landmark L:
+  - By triangle inequality: dist(S,T) ≥ |dist(S,L) - dist(T,L)|
+  - Also: dist(S,T) ≥ |dist(L,S) - dist(L,T)|
+- h(n) = max over all landmarks of |dist(n,L) - dist(T,L)|
+- This gives a tight lower bound → fewer nodes explored
+```
+
+**When ALT beats CH:**
+- Dynamic edge weights (traffic changes every few minutes)
+- CH needs re-preprocessing; ALT works with current weights
+- Hybrid approach: Use CH for initial route, ALT for re-routing around traffic
+
+---
+
+### 13.4 Map Tile Rendering
+
+**Tile Pyramid (Slippy Map):**
+```
+Zoom 0: 1 tile (entire world)
+Zoom 1: 4 tiles (2×2)
+Zoom 2: 16 tiles (4×4)
+...
+Zoom 14: 268M tiles (16384×16384) - street level
+...
+Zoom 22: ~4 trillion tiles (building detail)
+
+Tile address: /{z}/{x}/{y}.mvt
+Example: /14/2621/6332.mvt = zoom 14, column 2621, row 6332
+```
+
+**Vector Tiles vs Raster Tiles:**
+| Aspect | Vector Tiles | Raster Tiles |
+|--------|-------------|--------------|
+| Format | Protobuf (MVT) | PNG/JPEG |
+| Size | 20-50 KB | 50-200 KB |
+| Styling | Client-side (dynamic) | Server-side (fixed) |
+| Rotation | Smooth (re-render) | Pixelated |
+| Labels | Client places (no overlap) | Pre-baked |
+| 3D | Possible (extrude buildings) | Not possible |
+| Best for | Mobile apps | Static embeds |
+
+**When to pre-render vs on-demand:**
+- **Pre-render (zoom 0-10):** Few tiles, high traffic → cache everything
+- **On-demand + cache (zoom 11-16):** Many tiles, moderate traffic → render on first request, cache in CDN
+- **On-demand only (zoom 17-22):** Billions of tiles, rare access → render per request, short TTL

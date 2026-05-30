@@ -74,6 +74,36 @@ At 1M comments/second with 50M viewers, true fanout = 50 trillion deliveries/sec
 
 ## 4. Data Modeling
 
+### Entity-Relationship Diagram
+
+```mermaid
+erDiagram
+    EVENT {
+        uuid event_id PK
+        varchar name
+        timestamp start_time
+    }
+    EVENT_COMMENTS {
+        uuid event_id PK
+        timestamp time_bucket PK
+        timeuuid comment_id PK
+        uuid user_id FK
+        text content
+        text moderation_status
+        float score
+    }
+    USER_COMMENTS {
+        uuid user_id PK
+        uuid event_id FK
+        timeuuid comment_id PK
+        text content
+        timestamp created_at
+    }
+
+    EVENT ||--o{ EVENT_COMMENTS : "receives"
+    EVENT_COMMENTS }o--|| USER_COMMENTS : "authored as"
+```
+
 ### 4.1 Database Selection
 
 | Workload | Database | Justification |
@@ -702,3 +732,132 @@ Delivery by language:
 - Spanish segment: 15% → Spanish comments + translated top
 - etc.
 ```
+
+---
+
+## Sequence Diagrams
+
+### 1. Comment Post + Moderation
+
+```mermaid
+sequenceDiagram
+    participant U as User
+    participant GW as WebSocket Gateway
+    participant API as API Gateway
+    participant MS as Moderation Service
+    participant ML as ML Toxicity Model
+    participant CS as Comment Service
+    participant DB as Cassandra
+    participant Q as Kafka
+    participant Cache as Redis
+    participant Stream as Stream Broadcaster
+
+    U->>GW: post_comment {event_id, text: "Great goal!", reply_to: null}
+    GW->>API: Route to comment pipeline
+    API->>API: Rate limit check (5 comments/min per user)
+
+    API->>MS: Moderate content
+    par ML-based moderation
+        MS->>ML: Score toxicity + spam probability
+        ML-->>MS: {toxicity: 0.02, spam: 0.01}
+    and Rule-based checks
+        MS->>MS: Banned words, URL filter, caps ratio
+    end
+
+    alt Content flagged (toxicity > 0.7 OR spam > 0.5)
+        MS-->>API: REJECTED {reason: toxic}
+        API-->>GW: Error: comment rejected
+        GW-->>U: "Comment could not be posted"
+    else Content approved
+        MS-->>API: APPROVED
+        API->>CS: Create comment
+        CS->>DB: INSERT comment {event_id, user_id, text, ts, status: approved}
+        CS->>Cache: ZADD event:{id}:comments (score=ts, value=comment_json)
+        CS->>Q: Publish comment.approved {event_id, comment}
+        CS-->>GW: Comment created {comment_id, ts}
+        GW-->>U: comment_ack {id, rendered}
+
+        Q->>Stream: Add to live stream broadcast
+    end
+
+    Note over MS: Shadow-ban mode: flagged users see their own<br/>comments but others don't (reduce repost attempts)
+```
+
+### 2. Real-Time Streaming to Viewers
+
+```mermaid
+sequenceDiagram
+    participant Q as Kafka (comments topic)
+    participant Agg as Aggregator Service
+    participant Cache as Redis
+    participant Sampler as Rate Sampler
+    participant GW1 as Gateway Cluster (Region 1)
+    participant GW2 as Gateway Cluster (Region 2)
+    participant V1 as Viewers (Region 1, 500K)
+    participant V2 as Viewers (Region 2, 300K)
+
+    loop Continuous ingestion (10K comments/sec during viral event)
+        Q->>Agg: Batch consume comments (100ms window)
+        Agg->>Agg: Deduplicate, sort by timestamp
+        
+        Agg->>Sampler: Apply sampling for high-volume events
+        Note over Sampler: If > 1000 comments/sec:<br/>Sample top comments (reactions, verified users)<br/>+ random sample for diversity
+        Sampler-->>Agg: Filtered batch (max 50 comments/sec to clients)
+    end
+
+    Agg->>Cache: Update event:{id}:live_feed (circular buffer, last 200)
+    
+    par Regional fanout
+        Agg->>GW1: Publish batch to Region 1 gateways
+        GW1->>GW1: Group by subscription rooms (event_id)
+        GW1-->>V1: WebSocket push: new_comments [{...}, {...}]
+    and
+        Agg->>GW2: Publish batch to Region 2 gateways
+        GW2-->>V2: WebSocket push: new_comments [{...}, {...}]
+    end
+
+    Note over V1,V2: Client-side rendering:<br/>- Smooth scroll animation<br/>- Viewport-based rendering (only visible comments)<br/>- Auto-pause scroll when user is reading
+
+    alt New viewer connects mid-event
+        V1->>GW1: Connect + subscribe {event_id}
+        GW1->>Cache: GET event:{id}:live_feed (last 50)
+        Cache-->>GW1: Recent comments
+        GW1-->>V1: Initial batch (backfill) + live stream begins
+    end
+```
+
+### Caching Strategy
+
+| Layer | Store | Content | TTL | Eviction |
+|-------|-------|---------|-----|----------|
+| Live Comment Feed | Redis (Sorted Set) | Last 200 comments per event (circular buffer) | Event duration + 1h | ZREMRANGEBYRANK (keep top 200) |
+| Comment Count | Redis Counter | Total comments per event | Event duration | Reset post-event |
+| User Rate Limit | Redis | Comment count per user per minute | 60s sliding window | Auto-expire |
+| Hot Comments | Redis | Top 20 by reactions (real-time leaderboard) | 30s refresh | Re-score on reaction event |
+| Viewer Count | Redis HyperLogLog | Approximate unique viewers | Event duration | Merge across gateways |
+| Blocked Users | Redis Set | Banned/shadow-banned user IDs | Event duration | Admin removes |
+
+**Cache Patterns:**
+- **Circular buffer**: Fixed-size sorted set prevents unbounded growth during viral events
+- **Sampling with cache**: Aggregator caches sampled output; reduces re-computation
+- **Regional cache replication**: Each region has local Redis replica for low-latency reads
+- **Warm-up on event start**: Pre-populate cache with event metadata, participant lists
+
+### Infrastructure Components
+
+| Component | Technology | Configuration | Purpose |
+|-----------|-----------|---------------|---------|
+| WebSocket Gateway | Envoy + Custom (Rust) | 500K connections/node, 20 nodes/region | Real-time comment delivery |
+| Load Balancer | L4 (NLB) | Connection-aware, regional | Distribute WebSocket connections |
+| API Gateway | Kong/Custom | 100K RPS, rate limiting per user | Comment submission endpoint |
+| CDN | CloudFront/Fastly | Edge SSE fallback for WebSocket-blocked clients | Static assets + fallback streaming |
+| Kafka Cluster | 12 brokers | Partitioned by event_id, retention 24h | Comment event bus |
+| Aggregator | Custom (Go) | Horizontally scaled per event | Batch, sample, dedupe comments |
+| ML Moderation | GPU cluster (K8s) | Auto-scale on queue depth | Real-time toxicity scoring |
+
+**Scaling for Viral Events (1M+ concurrent viewers):**
+- **Gateway tier**: Auto-scale to 50+ nodes per region; each handles 500K WebSocket connections
+- **Tiered fanout**: Gateway nodes subscribe to regional pub/sub; local broadcast to connected clients
+- **Backpressure**: If viewers > capacity, degrade to 2s batching (vs 100ms normal)
+- **SSE fallback**: For mobile web clients or restrictive networks
+

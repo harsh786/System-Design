@@ -60,6 +60,61 @@ WebSocket connections (floor maps): 100K concurrent
 
 ## 4. Data Modeling
 
+### Entity-Relationship Diagram
+
+```mermaid
+erDiagram
+    parking_facilities {
+        UUID facility_id PK
+        UUID operator_id FK
+        VARCHAR name
+        VARCHAR facility_type
+        INTEGER total_spots
+        INTEGER base_rate_cents_per_hour
+        VARCHAR status
+    }
+    facility_floors {
+        UUID floor_id PK
+        UUID facility_id FK
+        INTEGER floor_number
+        INTEGER total_spots
+        INTEGER available_spots
+    }
+    parking_spots {
+        UUID spot_id PK
+        UUID facility_id FK
+        UUID floor_id FK
+        VARCHAR spot_number
+        VARCHAR spot_type
+        VARCHAR current_status
+        VARCHAR sensor_id
+    }
+    reservations {
+        UUID reservation_id PK
+        UUID user_id FK
+        UUID facility_id FK
+        UUID spot_id FK
+        VARCHAR reservation_type
+        TIMESTAMP start_time
+        TIMESTAMP end_time
+        VARCHAR status
+        INTEGER actual_cost_cents
+    }
+    sensor_events {
+        BIGSERIAL event_id PK
+        VARCHAR sensor_id FK
+        UUID spot_id FK
+        VARCHAR event_type
+        TIMESTAMP recorded_at
+    }
+
+    parking_facilities ||--o{ facility_floors : "has floors"
+    facility_floors ||--o{ parking_spots : "contains"
+    parking_facilities ||--o{ reservations : "reserved at"
+    parking_spots ||--o{ reservations : "assigned"
+    parking_spots ||--o{ sensor_events : "monitored by"
+```
+
 ### Full Database Schemas
 
 ```sql
@@ -1066,3 +1121,108 @@ WebSocket connections (floor maps):
 - 50 WebSocket servers (2000 connections each)
 - Redis Pub/Sub for cross-server broadcast
 ```
+
+---
+
+## 12. Sequence Diagrams
+
+### 12.1 Find + Reserve Parking Spot
+
+```mermaid
+sequenceDiagram
+    participant Driver
+    participant MobileApp
+    participant API Gateway
+    participant SearchService
+    participant AvailabilityService
+    participant Redis
+    participant ReservationService
+    participant PaymentService
+    participant NotificationService
+
+    Driver->>MobileApp: "Find parking near Mall of India"
+    MobileApp->>API Gateway: GET /parking?lat=28.57&lng=77.32&radius=1km
+    API Gateway->>SearchService: search(location, radius, vehicle_type=sedan)
+
+    SearchService->>AvailabilityService: getRealTimeAvailability(lot_ids[])
+    AvailabilityService->>Redis: MGET availability:{lot_1}, availability:{lot_2}...
+    Redis-->>AvailabilityService: [{total:200, available:34}, {total:50, available:2}...]
+    AvailabilityService-->>SearchService: 5 lots with availability
+
+    SearchService-->>MobileApp: Lots sorted by distance + availability + price
+
+    Driver->>MobileApp: Select "City Center Parking" spot B-12
+    MobileApp->>API Gateway: POST /reservations {lot_id, spot: B-12, duration: 2h}
+    API Gateway->>ReservationService: reserve(lot, spot, driver, duration)
+
+    ReservationService->>Redis: SET spot:{lot}:B-12 RESERVED:{driver} NX EX 900
+    Redis-->>ReservationService: OK (15min hold to arrive)
+
+    ReservationService->>PaymentService: preAuth(driver, estimated=$8.00)
+    PaymentService-->>ReservationService: auth_hold placed
+
+    ReservationService-->>MobileApp: {reservation_id, spot: B-12, navigate_to: coords}
+    MobileApp-->>Driver: "Reserved! Spot B-12. Arrive within 15 min"
+    NotificationService-->>Driver: Push: Turn-by-turn navigation to spot
+```
+
+### 12.2 IoT Sensor Event → Availability Update
+
+```mermaid
+sequenceDiagram
+    participant IoTSensor
+    participant IoTGateway
+    participant Kafka
+    participant AvailabilityWorker
+    participant Redis
+    participant PostgreSQL
+    participant WebSocket
+    participant MobileApp
+
+    Note over IoTSensor: Ultrasonic/magnetic sensor detects car departure
+
+    IoTSensor->>IoTGateway: {sensor_id: S-450, event: CAR_LEFT, timestamp}
+    IoTGateway->>Kafka: publish("sensor.event", {lot_id, spot: B-12, status: EMPTY})
+
+    Kafka->>AvailabilityWorker: consume("sensor.event")
+    AvailabilityWorker->>Redis: INCR availability:{lot_id}:available
+    AvailabilityWorker->>Redis: HSET spots:{lot_id} B-12 available
+    AvailabilityWorker->>PostgreSQL: INSERT occupancy_log(lot, spot, event, ts)
+
+    AvailabilityWorker->>WebSocket: broadcast(lot_id, {spot: B-12, status: available})
+    WebSocket->>MobileApp: Real-time map update (spot turns green)
+
+    Note over AvailabilityWorker: Also triggers billing for departing car
+    AvailabilityWorker->>Kafka: publish("parking.session.ended", {spot, duration, driver})
+```
+
+## 13. Infrastructure & Deployment
+
+### 13.1 Compute & Storage
+| Layer | Technology | Spec |
+|-------|-----------|------|
+| Application | EKS | 3 AZs, auto-scaling 5-50 pods |
+| IoT Ingestion | AWS IoT Core | MQTT broker, 100K concurrent sensors |
+| Stream Processing | Kafka + Flink | Real-time sensor event processing |
+| Primary DB | PostgreSQL (RDS) | Reservation records, billing |
+| Real-time State | Redis Cluster | Spot availability, reservation locks |
+| Time-series | InfluxDB | Occupancy analytics, predictions |
+| Mobile Backend | AppSync (GraphQL) | Real-time subscriptions for app |
+
+### 13.2 IoT Architecture
+- **Protocol**: MQTT (QoS 1) for sensor → gateway
+- **Gateway**: Edge compute (AWS Greengrass) at each parking lot
+- **Deduplication**: Sensor events deduplicated at gateway (debounce 5s)
+- **Heartbeat**: Sensors ping every 60s; missing = alert
+- **Failover**: Camera-based detection as backup for sensor failure
+
+### 13.3 Scaling
+- **Sensors**: 100,000+ per city (one per spot)
+- **Events/sec**: 10,000 (peak: arrival/departure waves)
+- **Reservation QPS**: 5,000 concurrent reservations
+- **Map updates**: WebSocket to 50,000 concurrent app users
+
+### 13.4 Multi-City Deployment
+- Each city = independent stack (data locality)
+- Central control plane for lot onboarding, pricing rules
+- Edge caching for lot metadata (rarely changes)

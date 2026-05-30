@@ -55,6 +55,95 @@ Network:
 
 ## 4. Data Modeling — Full Schemas
 
+### Entity-Relationship Diagram
+
+```mermaid
+erDiagram
+    instruments ||--o{ orders : "traded on"
+    instruments ||--o{ trades : "executes"
+    instruments ||--o{ positions : "held in"
+    instruments ||--o{ candles : "aggregated"
+    instruments ||--o{ ticks : "streams"
+    trading_accounts ||--o{ orders : "places"
+    trading_accounts ||--o{ positions : "holds"
+    trading_accounts ||--o{ risk_limits : "constrained by"
+    orders ||--o{ trades : "fills"
+    trades ||--o{ settlement_instructions : "settles"
+
+    instruments {
+        BIGINT instrument_id PK
+        VARCHAR symbol
+        VARCHAR instrument_type
+        VARCHAR exchange
+        DECIMAL tick_size
+        VARCHAR status
+    }
+    orders {
+        BIGINT order_id PK
+        BIGINT account_id FK
+        BIGINT instrument_id FK
+        CHAR side
+        VARCHAR order_type
+        BIGINT price
+        BIGINT quantity
+        VARCHAR status
+    }
+    trades {
+        BIGINT trade_id PK
+        BIGINT instrument_id FK
+        BIGINT price
+        BIGINT quantity
+        BIGINT buy_order_id FK
+        BIGINT sell_order_id FK
+        CHAR aggressor_side
+    }
+    positions {
+        BIGSERIAL position_id PK
+        BIGINT account_id FK
+        BIGINT instrument_id FK
+        BIGINT quantity
+        BIGINT avg_cost_basis
+        BIGINT unrealized_pnl
+    }
+    trading_accounts {
+        BIGINT account_id PK
+        UUID user_id
+        VARCHAR account_type
+        BIGINT cash_balance
+        BIGINT buying_power
+        BIGINT margin_used
+    }
+    risk_limits {
+        BIGSERIAL limit_id PK
+        BIGINT account_id FK
+        VARCHAR limit_type
+        BIGINT limit_value
+        VARCHAR breach_action
+    }
+    settlement_instructions {
+        BIGSERIAL instruction_id PK
+        BIGINT trade_id FK
+        BIGINT account_id FK
+        DATE settlement_date
+        VARCHAR status
+    }
+    candles {
+        BIGINT instrument_id PK
+        VARCHAR interval PK
+        TIMESTAMPTZ timestamp PK
+        BIGINT open
+        BIGINT close
+        BIGINT volume
+    }
+    ticks {
+        BIGINT instrument_id
+        TIMESTAMPTZ timestamp
+        BIGINT last_price
+        BIGINT bid_price
+        BIGINT ask_price
+    }
+```
+
 ```sql
 -- Instruments/Securities
 CREATE TABLE instruments (
@@ -903,3 +992,332 @@ Total RTO: < 5 minutes (regulatory requirement < 30 min)
 - **Market data**: Multicast eliminates N×M fan-out problem
 - **Historical data**: TimescaleDB with automatic compression + retention
 - **Client connections**: WebSocket servers scale independently from matching
+
+---
+
+## 12. Sequence Diagrams
+
+### Diagram 1: Limit Order Placement + Matching
+
+```mermaid
+sequenceDiagram
+    participant Trader as Trader App
+    participant GW as API Gateway
+    participant OMS as Order Management System
+    participant Risk as Risk/Margin Engine
+    participant ME as Matching Engine
+    participant MD as Market Data Publisher
+    participant Kafka as Event Bus
+
+    Trader->>GW: POST /orders (symbol=AAPL, side=BUY, type=LIMIT, price=150.00, qty=100)
+    GW->>OMS: Create order (validate, assign order_id=ORD_001)
+    OMS->>Risk: Pre-trade risk check (margin sufficient? position limit OK?)
+    Risk-->>OMS: APPROVED (available_margin=50000, required=15000)
+    OMS->>OMS: Order status = NEW, persist to DB
+    OMS->>ME: Submit order (BUY AAPL 100@150.00)
+    
+    ME->>ME: Check order book ASK side for matches
+    Note over ME: ASK book: [149.50x50, 149.75x30, 150.00x200]
+    ME->>ME: Match: BUY@150 crosses ASK@149.50 (50 shares)
+    ME->>ME: Match: BUY@150 crosses ASK@149.75 (30 shares)
+    ME->>ME: Remaining 20 shares → insert into BID book at 150.00
+    
+    ME->>Kafka: Publish trades [{price:149.50,qty:50}, {price:149.75,qty:30}]
+    ME->>Kafka: Publish order update (ORD_001: partially_filled, filled_qty=80)
+    ME->>MD: Update BBO (best bid=150.00, best ask=150.00x170)
+    
+    Kafka-->>OMS: Consume trade events → update order state
+    OMS->>Risk: Post-trade: update positions, recalc margin
+    MD-->>Trader: WebSocket: trade confirmation + updated market data
+
+    Note over Trader,Kafka: Price-time priority: older orders at same price fill first.<br/>Partial fills create multiple trade events for one order.
+```
+
+### Diagram 2: Market Data Tick Distribution
+
+```mermaid
+sequenceDiagram
+    participant ME as Matching Engine
+    participant MDP as Market Data Publisher
+    participant Conflate as Conflation Engine
+    participant MC as Multicast Network
+    participant GW1 as WS Gateway 1 (100K clients)
+    participant GW2 as WS Gateway 2 (100K clients)
+    participant Trader as Trader App
+
+    ME->>MDP: Trade executed (AAPL, price=150.25, qty=100, ts=T1)
+    ME->>MDP: Trade executed (AAPL, price=150.30, qty=50, ts=T2, 2ms later)
+    
+    MDP->>MDP: Build market data message (L1: BBO + last trade)
+    MDP->>MC: Multicast L1 update (UDP, group=239.1.1.1)
+    
+    Note over MDP,MC: Multicast: 1 send → all subscribers receive (no N copies)
+    
+    MC-->>GW1: Receive L1 tick (AAPL: last=150.30, bid=150.25, ask=150.35)
+    MC-->>GW2: Receive L1 tick
+    
+    GW1->>Conflate: High-frequency ticks arriving (>100/sec for AAPL)
+    Conflate->>Conflate: Conflate: keep only LATEST tick per symbol per 100ms window
+    Conflate-->>GW1: Conflated tick (AAPL: latest state, not every micro-update)
+    
+    GW1->>Trader: WebSocket push (AAPL tick, conflated to client's subscription rate)
+    
+    Note over ME,Trader: Without conflation: 10K ticks/sec × 200K clients = 2B msg/sec (impossible)<br/>With conflation: 10 updates/sec × 200K = 2M msg/sec (feasible)
+```
+
+### Diagram 3: Position Reconciliation
+
+```mermaid
+sequenceDiagram
+    participant Cron as EOD Scheduler
+    participant Recon as Reconciliation Engine
+    participant OMS as Order Management System
+    participant Exch as Exchange/Clearinghouse
+    participant Pos as Position Store
+    participant Alert as Alert System
+
+    Cron->>Recon: Trigger T+1 reconciliation
+    Recon->>OMS: GET all fills for today (internal record)
+    OMS-->>Recon: 150,000 fills across 5,000 symbols
+    Recon->>Exch: GET trade confirmations (exchange record)
+    Exch-->>Recon: 150,000 confirmations
+    
+    Recon->>Recon: Match: internal fill ↔ exchange confirmation
+    Recon->>Recon: Match by: order_id, symbol, side, qty, price, timestamp
+    
+    alt All matched
+        Recon->>Pos: Confirm positions (mark as reconciled)
+        Recon->>Recon: Generate recon report (status=CLEAN)
+    else Breaks found
+        Recon->>Alert: BREAK: 3 fills unmatched (missing from exchange)
+        Recon->>Alert: BREAK: 1 phantom fill (on exchange, not in OMS)
+        Alert->>Alert: Route to operations team for manual resolution
+        Recon->>Pos: Flag affected positions as UNRECONCILED
+    end
+    
+    Recon->>Recon: Verify: SUM(positions) == SUM(fills) - SUM(settlements)
+    Recon->>Pos: Snapshot positions for audit trail
+
+    Note over Cron,Alert: Reconciliation catches: dropped messages, partial fills,<br/>exchange corrections, and system bugs before they compound.
+```
+
+## 13. Caching Strategy
+
+### Rate/Pricing & Order Book Caching
+
+```
+TRADING PLATFORM CACHING
+
+1. ORDER BOOK — IN-MEMORY (Not cached, it IS the primary store)
+   The matching engine's order book lives in RAM on dedicated cores.
+   NOT a cache — it IS the authoritative state.
+   Persisted: async snapshots every 1s + WAL of all order events
+   Recovery: replay WAL from last snapshot
+
+2. MARKET DATA CACHE (L1/L2 quotes)
+   Key: md:{symbol}:l1
+   Storage: Redis (for API queries) + local memory (for WebSocket gateways)
+   TTL: None (overwritten on every tick, ~10-100/sec per active symbol)
+   Staleness: Acceptable up to 1 second for retail; <1ms for co-located
+   
+3. REFERENCE DATA CACHE
+   Key: ref:{symbol}:info
+   Content: lot_size, tick_size, trading_hours, circuit_limits
+   TTL: Until market open (refreshed daily pre-market)
+   Source: Exchange reference data feed
+   
+4. POSITION CACHE (Write-through)
+   Key: pos:{account}:{symbol}
+   Updated: On every fill (within same Redis MULTI as position DB update)
+   Used for: Real-time P&L display, margin calculation
+   CRITICAL: Stale position → wrong margin → risk breach
+   
+5. MARGIN/RISK CACHE
+   Key: margin:{account}:available
+   TTL: None (updated on every trade + every price tick for marked-to-market)
+   Pattern: Write-through on trade, periodic refresh on tick
+
+WHY EVENTUAL CONSISTENCY IS DANGEROUS:
+- Stale margin → allow order that should be rejected → naked exposure
+- Stale position → wrong P&L → trader makes bad decisions
+- Stale order book → crossed book → arbitrage opportunity
+
+WHERE EVENTUAL CONSISTENCY IS ACCEPTABLE:
+- Historical trade queries (seconds of lag OK)
+- P&L reporting (end-of-day exact, intraday approximate is fine)
+- Client portfolio view (1-2 second delay acceptable for retail)
+```
+
+## 14. Algorithm Deep Dive: Order Book Matching Engine
+
+### Price-Time Priority Matching (Step-by-Step)
+
+```
+ORDER BOOK MATCHING ENGINE — CONTINUOUS DOUBLE AUCTION
+
+DATA STRUCTURE:
+  BID side (buy orders):  Max-heap by price, FIFO within same price
+  ASK side (sell orders): Min-heap by price, FIFO within same price
+
+┌─────────────────────────────────────────────────────────────┐
+│ INITIAL ORDER BOOK STATE (AAPL)                              │
+├─────────────────────────────────────────────────────────────┤
+│ BID (buyers)              │ ASK (sellers)                    │
+│ Price    Qty   Time       │ Price    Qty   Time              │
+│ ─────────────────────     │ ─────────────────────            │
+│ 150.00   200   09:30:01   │ 150.25   100   09:30:00         │
+│ 150.00   100   09:30:05   │ 150.25   50    09:30:03         │
+│ 149.95   300   09:29:50   │ 150.50   500   09:29:55         │
+│ 149.90   150   09:29:45   │ 151.00   200   09:29:40         │
+├─────────────────────────────────────────────────────────────┤
+│ Best Bid: 150.00 (300 total)  │  Best Ask: 150.25 (150 total)│
+│ Spread: $0.25                                                │
+└─────────────────────────────────────────────────────────────┘
+
+INCOMING ORDER: BUY 200 shares @ LIMIT 150.50
+
+MATCHING ALGORITHM:
+  Step 1: Compare order price (150.50) with best ask (150.25)
+          150.50 >= 150.25 → MATCH possible (buyer willing to pay ask price)
+  
+  Step 2: Fill against ASK@150.25, time priority:
+          - Fill 100 shares @ 150.25 from order at 09:30:00 (oldest first)
+          - Fill 50 shares @ 150.25 from order at 09:30:03
+          - Total filled at 150.25: 150 shares
+          - Remaining to fill: 200 - 150 = 50 shares
+  
+  Step 3: Move to next price level. Best ask now = 150.50
+          150.50 >= 150.50 → MATCH possible
+          - Fill 50 shares @ 150.50 (from the 500-share order)
+          - Remaining to fill: 0 shares → ORDER FULLY FILLED
+  
+  TRADE REPORT:
+    Trade 1: BUY 100 AAPL @ 150.25 (aggressive order gets price improvement!)
+    Trade 2: BUY 50 AAPL @ 150.25
+    Trade 3: BUY 50 AAPL @ 150.50
+    Average fill price: (100×150.25 + 50×150.25 + 50×150.50) / 200 = $150.3125
+
+  RESULTING ORDER BOOK:
+  │ BID (buyers)              │ ASK (sellers)                    │
+  │ 150.00   200   09:30:01   │ 150.50   450   09:29:55         │
+  │ 150.00   100   09:30:05   │ 151.00   200   09:29:40         │
+  │ 149.95   300   09:29:50   │                                  │
+  │ 149.90   150   09:29:45   │                                  │
+  
+  New spread: 150.00 / 150.50 = $0.50 (wider, liquidity consumed)
+
+IMPLEMENTATION (simplified):
+```
+
+```python
+from sortedcontainers import SortedList
+from collections import deque
+from dataclasses import dataclass
+import time
+
+@dataclass
+class Order:
+    id: str
+    side: str       # "BUY" or "SELL"
+    price: float
+    quantity: int
+    timestamp: float
+    remaining: int = None
+    
+    def __post_init__(self):
+        self.remaining = self.remaining or self.quantity
+
+class OrderBook:
+    def __init__(self, symbol: str):
+        self.symbol = symbol
+        # price -> deque of orders (FIFO within price level)
+        self.bids: dict[float, deque] = {}  # sorted desc by price
+        self.asks: dict[float, deque] = {}  # sorted asc by price
+        self.bid_prices = SortedList()      # sorted descending
+        self.ask_prices = SortedList()      # sorted ascending
+        self.trades = []
+    
+    def add_order(self, order: Order) -> list:
+        """Returns list of trades generated"""
+        trades = []
+        
+        if order.side == "BUY":
+            trades = self._match_buy(order)
+            if order.remaining > 0:
+                self._insert_bid(order)
+        else:
+            trades = self._match_sell(order)
+            if order.remaining > 0:
+                self._insert_ask(order)
+        
+        return trades
+    
+    def _match_buy(self, order: Order) -> list:
+        """Match incoming buy against ask side"""
+        trades = []
+        
+        while order.remaining > 0 and self.ask_prices:
+            best_ask_price = self.ask_prices[0]
+            
+            # Check if buy price >= best ask (willing to pay)
+            if order.price < best_ask_price:
+                break  # No more matches possible
+            
+            # Fill against orders at this price level (FIFO)
+            level = self.asks[best_ask_price]
+            while order.remaining > 0 and level:
+                resting_order = level[0]
+                fill_qty = min(order.remaining, resting_order.remaining)
+                
+                # Execute trade at RESTING order's price (price improvement for aggressor)
+                trade = {
+                    "symbol": self.symbol,
+                    "price": best_ask_price,
+                    "quantity": fill_qty,
+                    "buyer_order": order.id,
+                    "seller_order": resting_order.id,
+                    "timestamp": time.time()
+                }
+                trades.append(trade)
+                
+                order.remaining -= fill_qty
+                resting_order.remaining -= fill_qty
+                
+                if resting_order.remaining == 0:
+                    level.popleft()  # Remove fully filled order
+            
+            # Remove empty price level
+            if not level:
+                del self.asks[best_ask_price]
+                self.ask_prices.remove(best_ask_price)
+        
+        return trades
+    
+    def _insert_bid(self, order: Order):
+        """Insert unfilled remainder into bid book"""
+        if order.price not in self.bids:
+            self.bids[order.price] = deque()
+            self.bid_prices.add(-order.price)  # Negative for desc sort
+        self.bids[order.price].append(order)
+```
+
+```
+PERFORMANCE CHARACTERISTICS:
+- Match single order: O(1) best case, O(levels × orders_per_level) worst case
+- In practice: >99% of matches hit only 1-2 price levels
+- Insert (no match): O(log P) where P = number of distinct price levels
+- Cancel: O(1) with order_id → order lookup hash map
+
+LATENCY BUDGET:
+- Receive order from network: ~5μs
+- Deserialize: ~2μs
+- Match + generate trades: ~1-3μs
+- Publish trades to multicast: ~5μs
+- Total: <20μs per order (single-threaded, pinned to CPU core)
+
+WHY SINGLE-THREADED:
+- No locking overhead (lock-free by design)
+- CPU cache locality (entire book fits in L3)
+- Deterministic replay (important for audit + disaster recovery)
+- Each symbol's book runs on its own dedicated core
+```

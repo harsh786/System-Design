@@ -45,6 +45,59 @@
 
 ## 3. Data Modeling
 
+### Entity-Relationship Diagram
+
+```mermaid
+erDiagram
+    USERS {
+        uuid user_id PK
+        varchar username
+        jsonb demographics
+        varchar subscription_tier
+    }
+    ITEMS {
+        uuid item_id PK
+        varchar item_type
+        varchar title
+        varchar category
+        float popularity_score
+    }
+    MODELS {
+        uuid model_id PK
+        varchar model_name
+        varchar model_type
+        varchar status
+        int version
+    }
+    AB_EXPERIMENTS {
+        uuid experiment_id PK
+        varchar name
+        varchar status
+        varchar primary_metric
+    }
+    USER_INTERACTIONS {
+        uuid user_id FK
+        uuid item_id FK
+        varchar event_type
+        timestamp event_timestamp
+    }
+    USER_RECOMMENDATIONS {
+        uuid user_id FK
+        varchar rec_type
+        int model_version
+    }
+    ITEM_SIMILARITIES {
+        uuid item_id FK
+        list similar_items
+    }
+    USERS ||--o{ USER_INTERACTIONS : generates
+    ITEMS ||--o{ USER_INTERACTIONS : receives
+    USERS ||--o{ USER_RECOMMENDATIONS : "served to"
+    ITEMS ||--o{ ITEM_SIMILARITIES : "has similar"
+    MODELS ||--o{ AB_EXPERIMENTS : "tested in"
+    MODELS ||--o{ USER_RECOMMENDATIONS : produces
+```
+
 ### 3.1 PostgreSQL - Metadata & Configuration
 
 ```sql
@@ -1171,3 +1224,130 @@ alerts:
 - Federated learning: Train on-device, aggregate updates
 - Differential privacy: Add noise to user embeddings
 - Right to be forgotten: Ability to remove user from all models
+
+---
+
+## 13. Sequence Diagrams
+
+### 13.1 Real-time Recommendation Serving
+
+```mermaid
+sequenceDiagram
+    participant User
+    participant API as API Gateway
+    participant RecSvc as Recommendation Service
+    participant Candidate as Candidate Generator
+    participant UserStore as User Feature Store (Redis)
+    participant ItemStore as Item Feature Store
+    participant Ranker as ML Ranker (TF Serving)
+    participant Filter as Business Rules Filter
+    participant Cache as Rec Cache
+
+    User->>API: GET /recommendations?context=homepage
+    API->>Cache: Check (user_segment + context, TTL=5min)
+    alt Cache Miss
+        API->>RecSvc: getRecommendations(user_id, context=homepage)
+        RecSvc->>UserStore: Get user embedding + recent interactions
+        UserStore-->>RecSvc: {embedding: [0.1,...], last_50_items: [...], preferences: {...}}
+        
+        par Candidate Generation (multiple sources)
+            RecSvc->>Candidate: Collaborative filtering (ANN lookup on user embedding)
+            Candidate-->>RecSvc: 200 candidates (similar users liked)
+        and
+            RecSvc->>Candidate: Content-based (items similar to recent interactions)
+            Candidate-->>RecSvc: 200 candidates
+        and
+            RecSvc->>Candidate: Trending/Popular in user's segment
+            Candidate-->>RecSvc: 50 candidates
+        end
+        
+        RecSvc->>RecSvc: Merge + deduplicate → ~400 unique candidates
+        RecSvc->>ItemStore: Batch fetch item features for 400 candidates
+        ItemStore-->>RecSvc: Item features (embedding, popularity, freshness, ...)
+        RecSvc->>Ranker: Score 400 candidates (user features × item features)
+        Ranker-->>RecSvc: Scores: [{item_id, score}, ...]
+        RecSvc->>Filter: Apply rules (already seen, out of stock, diversity)
+        Filter-->>RecSvc: Filtered + diversified top-50
+        RecSvc-->>API: Top-50 recommendations with explanations
+        API->>Cache: Store result
+    end
+    API-->>User: {recommendations: [...], reason: "Because you watched X"}
+```
+
+### 13.2 Offline Model Training Pipeline
+
+```mermaid
+sequenceDiagram
+    participant Events as User Event Stream
+    participant Kafka
+    participant Lake as Data Lake (S3/Delta)
+    participant Feature as Feature Engineering (Spark)
+    participant Train as Training Pipeline (GPU Cluster)
+    participant Eval as Evaluation Service
+    participant Registry as Model Registry
+    participant Deploy as Model Deployer
+    participant Serving as TF Serving
+
+    Events->>Kafka: User interactions (click, purchase, dwell_time, skip)
+    Kafka->>Lake: Raw events (append-only, partitioned by date)
+    
+    Note over Feature: Daily batch job
+    Feature->>Lake: Read last 90 days of interactions
+    Feature->>Feature: Compute features: user-item pairs, co-occurrence, temporal patterns
+    Feature->>Feature: Generate training examples (positive: click/buy, negative: impression no-click)
+    Feature->>Lake: Write training dataset (10B examples)
+    
+    Train->>Lake: Load training data
+    Train->>Train: Train two-tower model (user encoder + item encoder)
+    Train->>Train: Epochs: 5, batch_size: 8192, lr: 0.001
+    Train->>Eval: Evaluate on held-out test set
+    Eval->>Eval: Metrics: Recall@50=0.35, NDCG@10=0.28, HR@10=0.42
+    
+    alt Metrics improved over current production
+        Eval->>Registry: Register new model version (v47)
+        Registry->>Deploy: Trigger canary deployment (5% traffic)
+        Deploy->>Serving: Load model v47 on canary replicas
+        Note over Serving: Monitor online metrics for 24h
+        Deploy->>Serving: Promote to 100% if online metrics stable
+    else Metrics regressed
+        Eval->>Eval: Log failure, notify ML team
+    end
+```
+
+---
+
+## 14. Infrastructure Components
+
+### 14.1 Feature Store Architecture
+
+```
+┌────────────────────────────────────────────────────────────┐
+│                     Feature Store                            │
+├────────────────────────────────────────────────────────────┤
+│                                                            │
+│  Online Store (Redis Cluster):                             │
+│  - User features: embedding, last_N_items, segment        │
+│  - Item features: embedding, popularity, category         │
+│  - Latency: < 5ms p99 for batch lookup of 500 items      │
+│  - Size: 200M users × 1KB + 50M items × 512B = ~225 GB  │
+│                                                            │
+│  Offline Store (Delta Lake / Parquet):                     │
+│  - Full feature history for training                      │
+│  - Point-in-time correctness (avoid future data leakage)  │
+│  - Size: ~50 TB (90-day window)                           │
+│                                                            │
+│  Feature Pipeline (Spark Streaming + Batch):               │
+│  - Real-time: user embedding update on new interaction    │
+│  - Batch: recompute all features daily                    │
+│  - Sync: batch results backfill online store              │
+│                                                            │
+└────────────────────────────────────────────────────────────┘
+```
+
+### 14.2 Serving Infrastructure
+
+- **Model serving:** TensorFlow Serving / Triton, GPU instances for ranking model
+- **ANN index:** Faiss (IVF-PQ) for candidate generation, ~50M item embeddings
+- **Scaling:** Horizontal pod autoscaler on QPS + latency, 3 replicas minimum
+- **Fallback:** If ML ranker times out (>100ms), fall back to popularity-based ranking
+- **A/B testing:** Traffic splitting at API gateway level, metrics tracked per variant

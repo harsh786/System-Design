@@ -57,6 +57,65 @@
 
 ## 4. Data Modeling
 
+### Entity-Relationship Diagram
+
+```mermaid
+erDiagram
+    CHANNELS {
+        bigint channel_id PK
+        bigint user_id FK
+        varchar channel_name
+        bigint subscriber_count
+    }
+    VIDEOS {
+        bigint video_id PK
+        bigint channel_id FK
+        varchar title
+        enum upload_status
+        enum visibility
+        bigint view_count
+    }
+    VIDEO_ENCODINGS {
+        bigint encoding_id PK
+        bigint video_id FK
+        enum resolution
+        enum codec
+        enum status
+    }
+    SUBSCRIPTIONS {
+        bigint user_id PK
+        bigint channel_id PK
+        enum notification
+    }
+    COMMENTS {
+        bigint comment_id PK
+        bigint video_id FK
+        bigint user_id FK
+        bigint parent_id FK
+        text content
+    }
+    WATCH_HISTORY {
+        bigint user_id PK
+        bigint video_id PK
+        int watch_time_ms
+        float percentage
+    }
+    PLAYLISTS {
+        bigint playlist_id PK
+        bigint user_id FK
+        varchar title
+        enum visibility
+    }
+
+    CHANNELS ||--o{ VIDEOS : publishes
+    VIDEOS ||--o{ VIDEO_ENCODINGS : "encoded as"
+    CHANNELS ||--o{ SUBSCRIPTIONS : "subscribed to"
+    VIDEOS ||--o{ COMMENTS : has
+    COMMENTS ||--o{ COMMENTS : "replies to"
+    VIDEOS ||--o{ WATCH_HISTORY : "watched in"
+    CHANNELS }o--o{ PLAYLISTS : "created by user"
+```
+
 ### Videos Table (PostgreSQL / Vitess sharded by video_id)
 ```sql
 CREATE TABLE videos (
@@ -1095,3 +1154,144 @@ Upload Request Trace:
 3. **Recommendation service down**: Fall back to trending/popular videos (pre-computed)
 4. **Database shard failure**: Read replicas auto-promote; cross-region failover in <30s
 5. **Kafka broker loss**: ISR ensures no data loss; consumers rebalance automatically
+
+---
+
+## Sequence Diagrams
+
+### 1. Video Upload + Transcoding Pipeline
+
+```mermaid
+sequenceDiagram
+    participant C as Client
+    participant API as Upload API
+    participant S3 as Object Store
+    participant Q as Kafka Queue
+    participant TS as Transcoding Service
+    participant W as Worker Pool
+    participant DB as Metadata DB
+    participant CDN as CDN Origin
+
+    C->>API: POST /upload (chunked, resumable)
+    API->>S3: Store raw chunks
+    API->>DB: Create video record (status: uploading)
+    C->>API: Complete upload signal
+    API->>S3: Assemble chunks into raw file
+    API->>Q: Publish TranscodeJob event
+    API-->>C: 202 Accepted (video_id)
+
+    Q->>TS: Consume TranscodeJob
+    TS->>S3: Download raw file
+    TS->>TS: Probe (resolution, codec, duration)
+
+    loop For each target rendition (1080p, 720p, 480p, 360p)
+        TS->>W: Dispatch chunk transcode tasks
+        W->>W: FFmpeg encode chunk
+        alt Chunk succeeds
+            W->>S3: Upload encoded chunk
+            W->>TS: Report chunk complete
+        else Chunk fails
+            W->>TS: Report failure
+            TS->>W: Retry chunk (max 3x)
+            alt Retry exhausted
+                TS->>Q: Publish to dead-letter queue
+                TS->>DB: Update status: failed
+            end
+        end
+    end
+
+    TS->>S3: Concatenate chunks per rendition
+    TS->>TS: Generate manifest (DASH/HLS)
+    TS->>S3: Upload manifests
+    TS->>DB: Update status: ready, store rendition metadata
+    TS->>CDN: Warm cache for popular prediction
+    Note over DB,CDN: Video now playable
+```
+
+### 2. Video Playback with Adaptive Bitrate + CDN
+
+```mermaid
+sequenceDiagram
+    participant P as Player (Client)
+    participant API as Playback API
+    participant Auth as Auth Service
+    participant DB as Metadata DB
+    participant CDN as CDN Edge
+    participant Origin as CDN Origin
+    participant S3 as Object Store
+
+    P->>API: GET /watch/{video_id}
+    API->>Auth: Validate session + geo-restrictions
+    Auth-->>API: OK (user tier, region)
+    API->>DB: Fetch video metadata + rendition list
+    DB-->>API: Manifest URL, available qualities
+    API-->>P: Signed manifest URL + playback token
+
+    P->>CDN: GET manifest.m3u8 (signed URL)
+    alt Cache hit
+        CDN-->>P: Return manifest
+    else Cache miss
+        CDN->>Origin: Fetch manifest
+        Origin->>S3: Retrieve manifest
+        S3-->>Origin: manifest.m3u8
+        Origin-->>CDN: Cache + return
+        CDN-->>P: Return manifest
+    end
+
+    loop ABR streaming loop
+        P->>P: Measure bandwidth + buffer level
+        P->>CDN: GET segment_N at selected quality
+        alt CDN cache hit
+            CDN-->>P: Segment data
+        else CDN miss
+            CDN->>Origin: Fetch segment
+            Origin-->>CDN: Segment
+            CDN-->>P: Segment data
+        end
+        Note over P: Adjust quality up/down based on throughput
+    end
+
+    P->>API: POST /analytics (watch time, rebuffer events, quality switches)
+```
+
+### 3. Comment Post with Spam Filter
+
+```mermaid
+sequenceDiagram
+    participant U as User
+    participant API as Comment API
+    participant Auth as Auth Service
+    participant Spam as Spam/Toxicity ML
+    participant DB as Comment DB
+    participant Q as Event Queue
+    participant Notify as Notification Service
+    participant Owner as Video Owner
+
+    U->>API: POST /videos/{id}/comments {text}
+    API->>Auth: Validate user session + rate limit check
+    alt Rate limited
+        Auth-->>API: 429 Too Many Requests
+        API-->>U: Rate limited
+    else OK
+        Auth-->>API: User verified
+    end
+
+    API->>Spam: Classify comment (toxicity, spam, links)
+    alt Score > hard_threshold
+        Spam-->>API: REJECT (spam/toxic)
+        API->>DB: Store comment (status: rejected, reason)
+        API-->>U: Comment posted (shadow ban - user sees it, others don't)
+    else Score > soft_threshold
+        Spam-->>API: HOLD_FOR_REVIEW
+        API->>DB: Store comment (status: pending_review)
+        API-->>U: Comment posted (visible only to author until reviewed)
+        API->>Q: Publish HumanReviewNeeded event
+    else Score < soft_threshold
+        Spam-->>API: APPROVE
+        API->>DB: Store comment (status: published)
+        API-->>U: Comment posted successfully
+        API->>Q: Publish CommentPosted event
+        Q->>Notify: Trigger notifications
+        Notify->>Owner: Push notification (new comment)
+    end
+```

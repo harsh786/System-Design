@@ -60,6 +60,63 @@
 
 ## 4. Data Modeling
 
+### Entity-Relationship Diagram
+
+```mermaid
+erDiagram
+    PROBLEMS {
+        serial problem_id PK
+        varchar title
+        varchar difficulty
+        text description
+        float acceptance_rate
+        boolean is_premium
+    }
+    TEST_CASES {
+        serial test_case_id PK
+        integer problem_id FK
+        text input
+        text expected_output
+        boolean is_sample
+    }
+    SUBMISSIONS {
+        uuid submission_id PK
+        uuid user_id FK
+        integer problem_id FK
+        uuid contest_id FK
+        varchar language
+        varchar status
+        integer runtime_ms
+    }
+    CONTESTS {
+        uuid contest_id PK
+        varchar title
+        varchar type
+        timestamptz start_time
+        timestamptz end_time
+        varchar scoring_type
+    }
+    CONTEST_PARTICIPANTS {
+        uuid contest_id PK
+        uuid user_id PK
+        integer total_score
+        integer problems_solved
+        integer rank
+    }
+    USER_PROGRESS {
+        uuid user_id PK
+        integer problems_solved
+        integer streak_days
+        integer rating
+    }
+
+    PROBLEMS ||--o{ TEST_CASES : has
+    PROBLEMS ||--o{ SUBMISSIONS : receives
+    CONTESTS ||--o{ SUBMISSIONS : during
+    CONTESTS ||--o{ CONTEST_PARTICIPANTS : "has participants"
+    USER_PROGRESS ||--o{ SUBMISSIONS : tracks
+```
+
 ```sql
 -- Problems
 CREATE TABLE problems (
@@ -1098,3 +1155,262 @@ Judging: Interactor validates all user responses and reports verdict
 | Test case corruption | Wrong verdicts | Checksum validation, immutable test case versions |
 
 ---
+
+---
+
+## 12. Sequence Diagrams
+
+### 12.1 Code Submission → Sandbox Execution → Judging
+
+```mermaid
+sequenceDiagram
+    participant U as User Browser
+    participant API as API Gateway
+    participant Sub as Submission Service
+    participant Queue as Kafka (Submission Queue)
+    participant Worker as Judge Worker
+    participant Sandbox as Sandbox (gVisor + cgroups)
+    participant TC as Test Case Store (S3)
+    participant Result as Result Service
+    participant WS as WebSocket Gateway
+
+    U->>API: POST /submit {problem_id, language: "cpp", code}
+    API->>Sub: Validate(code_size < 64KB, language supported)
+    Sub->>Sub: Assign submission_id, status = "queued"
+    Sub->>Queue: Produce(submission_id, problem_id, code, language)
+    Sub-->>API: 202 Accepted {submission_id}
+    API-->>U: 202 {submission_id, status: "queued"}
+    U->>WS: Subscribe(submission_id) [WebSocket]
+    
+    Queue->>Worker: Consume submission
+    Worker->>Worker: Compile code (timeout: 30s, memory: 512MB)
+    Worker-->>WS: Status update: "compiling"
+    
+    alt Compilation Error
+        Worker-->>WS: {status: "CE", error: compiler_output}
+    else Compilation Success
+        Worker->>TC: Fetch test cases for problem_id
+        TC-->>Worker: [{input_1, expected_1}, ..., {input_N, expected_N}]
+        
+        loop For each test case (sequential)
+            Worker->>Sandbox: Execute(binary, input_i, time_limit=2s, mem_limit=256MB)
+            Sandbox->>Sandbox: Fork into isolated namespace
+            Sandbox->>Sandbox: Apply seccomp filter, set rlimits
+            Sandbox->>Sandbox: Run binary with input_i on stdin
+            Sandbox-->>Worker: {output, time_used, memory_used, exit_code}
+            Worker->>Worker: Compare output vs expected (trim, precision check)
+            Worker-->>WS: Test case i: {verdict, time, memory}
+        end
+        
+        Worker->>Result: Store final verdict {AC/WA/TLE/MLE/RE}
+        Worker-->>WS: Final: {verdict: "Accepted", time: "45ms", memory: "12MB"}
+    end
+```
+
+### 12.2 Contest Leaderboard Real-Time Update
+
+```mermaid
+sequenceDiagram
+    participant U as Contestant
+    participant Sub as Submission Service
+    participant Judge as Judge Worker
+    participant Kafka as Kafka (Verdict Topic)
+    participant LB as Leaderboard Service
+    participant Redis as Redis Sorted Set
+    participant SSE as SSE/WebSocket Gateway
+    participant Clients as All Contest Participants
+
+    U->>Sub: Submit solution for problem C
+    Sub->>Judge: Queue for judging
+    Judge->>Judge: Execute & judge (AC, penalty_time=45min)
+    Judge->>Kafka: Emit {contest_id, user_id, problem: C, verdict: AC, time: 45min}
+    
+    Kafka->>LB: Consume verdict event
+    LB->>LB: Calculate ICPC score: solved_count++ , penalty += 45 + 20*(wrong_attempts)
+    LB->>Redis: ZADD contest:{id}:board {score} user_id
+    Note over Redis: Score encoding: (solved_count * 10^6) - penalty_minutes
+    LB->>Redis: HSET contest:{id}:detail:{user_id} {problems_solved, penalty, last_ac_time}
+    LB->>Redis: ZREVRANK contest:{id}:board user_id
+    Redis-->>LB: rank = 3
+    LB->>SSE: Broadcast leaderboard delta {user_id, rank: 3, solved: 4, penalty: 187}
+    SSE-->>Clients: Server-Sent Event (leaderboard update)
+    
+    Note over LB: Scoreboard freeze: last 1hr of contest, verdicts still judged but board frozen for others
+```
+
+### 12.3 Custom Test Case Execution
+
+```mermaid
+sequenceDiagram
+    participant U as User Browser
+    participant API as API Gateway
+    participant Run as Run Service
+    participant Pool as Warm Sandbox Pool
+    participant Sandbox as Sandbox Container
+    participant U2 as User Browser
+
+    U->>API: POST /run {code, language: "python", stdin: "5\n1 2 3 4 5"}
+    API->>Run: Validate(code_size, input_size < 1KB)
+    Run->>Pool: Acquire pre-warmed container (language=python)
+    Pool-->>Run: container_id (ready in <100ms)
+    Run->>Sandbox: Execute(code, stdin, time_limit=5s, mem_limit=256MB)
+    Sandbox->>Sandbox: No compilation needed (interpreted)
+    Sandbox->>Sandbox: Run with provided stdin
+    Sandbox-->>Run: {stdout: "15", stderr: "", time: 12ms, memory: 8MB, exit_code: 0}
+    Run->>Pool: Return container to pool (reset state)
+    Run-->>API: {output: "15", time: "12ms", memory: "8MB", status: "success"}
+    API-->>U: 200 {output, execution_stats}
+
+    Note over Pool: Pool maintains 50 warm containers per language<br/>Containers recycled after 100 executions (security)
+```
+
+## 13. Algorithm Deep Dives
+
+### 13.1 Sandboxed Code Execution: Security Architecture
+
+#### Isolation Layers (Defense in Depth)
+
+```
+Layer 1: Container Namespace Isolation
+├── PID namespace: Process cannot see/signal host processes
+├── Network namespace: No network access (isolated or none)
+├── Mount namespace: Read-only rootfs, tmpfs for /tmp only
+├── User namespace: Maps to unprivileged user (uid 65534)
+└── IPC namespace: No shared memory with host
+
+Layer 2: seccomp-bpf (System Call Filtering)
+├── Allowed syscalls (~50 of ~300+):
+│   read, write, open (O_RDONLY), close, mmap, mprotect,
+│   brk, exit_group, clock_gettime, fstat, lseek
+├── Blocked (dangerous):
+│   execve (after initial exec), fork/clone (optional per problem),
+│   socket, connect, bind, ptrace, mount, chroot,
+│   reboot, kexec_load, init_module
+└── Action on violation: SECCOMP_RET_KILL (immediate SIGSYS)
+
+Layer 3: cgroups v2 (Resource Limits)
+├── memory.max: 256MB (hard limit, OOM kill on exceed)
+├── cpu.max: "200000 100000" (2 CPU cores max)
+├── pids.max: 64 (prevent fork bombs)
+├── io.max: "8:0 wbps=10485760" (10MB/s write cap)
+└── cpu.max period: Enforced by CFS scheduler
+
+Layer 4: gVisor (Kernel-Level Sandbox) [Optional, for extra security]
+├── Intercepts all syscalls at application kernel boundary
+├── Implements Linux syscall interface in userspace (Sentry)
+├── File operations through Gofer (separate process)
+└── Overhead: ~5-15% CPU, acceptable for judge workloads
+
+Layer 5: Physical Isolation
+├── Judge workers run on dedicated hosts (no user data)
+├── Ephemeral VMs: destroyed after each contest (Firecracker μVMs)
+├── No persistent storage accessible
+└── Network: completely disconnected (iptables DROP all)
+```
+
+#### Resource Limit Enforcement
+
+```
+Implementation (Linux cgroups v2 + rlimit):
+
+Before execution:
+  // Create cgroup for this submission
+  mkdir /sys/fs/cgroup/judge/{submission_id}
+  echo "268435456" > memory.max          // 256 MB
+  echo "268435456" > memory.swap.max     // No swap
+  echo "200000 100000" > cpu.max         // 2 cores
+  echo "64" > pids.max                   // 64 processes
+  echo $PID > cgroup.procs              // Move process into cgroup
+
+  // rlimit (per-process, backup to cgroups):
+  setrlimit(RLIMIT_CPU, {soft=2, hard=3})       // 2s CPU time
+  setrlimit(RLIMIT_FSIZE, {soft=10MB, hard=10MB})  // Output file size
+  setrlimit(RLIMIT_NOFILE, {soft=16, hard=16})  // Open file descriptors
+  setrlimit(RLIMIT_STACK, {soft=8MB, hard=8MB}) // Stack size
+
+Time measurement:
+  - Wall-clock: monitored by external watchdog (kill after TL + 0.5s)
+  - CPU time: read from cgroup cpu.stat (user + system)
+  - Used for verdict: CPU time (fairer, unaffected by system load)
+  
+Memory measurement:
+  - Peak RSS: read from cgroup memory.peak
+  - If memory.peak > limit: verdict = MLE (Memory Limit Exceeded)
+  - OOM killer invoked: verdict = MLE (process receives SIGKILL)
+```
+
+### 13.2 Judging at Scale: Distributed Test Execution
+
+#### Scaling Challenge
+
+```
+Contest scenario: 5,000 users × 10 problems × avg 5 submissions = 250,000 submissions in 5 hours
+Peak burst: 10,000 submissions in first 5 minutes after problem unlock
+Each submission: 20 test cases × 2s time limit = up to 40s of compute
+
+Required throughput at peak: 10,000 / 300s = 33 submissions/s
+With 40s avg execution: 33 × 40 = 1,320 concurrent sandboxes needed
+```
+
+#### Architecture for Scale
+
+```
+Strategy: Hierarchical queue with test-case-level parallelism
+
+Tier 1: Submission Queue (Kafka, partitioned by problem_id)
+  - Ensures test cases from same problem cached on same workers
+  - Partition count = number of problems × 3 (for parallelism)
+
+Tier 2: Worker Pool (auto-scaled)
+  - Each worker: 8 CPU cores, 32GB RAM → runs 4 sandboxes concurrently
+  - Fleet size: 330 workers at peak (1,320 / 4)
+  - Scale-up trigger: queue depth > 100 for > 30s
+  - Scale-down: 10 min idle → terminate
+
+Test Case Parallel Execution:
+  Option A (Standard): Sequential execution, stop on first failure
+    - Pros: Minimal resource use, early termination
+    - Cons: Slow for AC submissions (must run all N tests)
+    
+  Option B (Contest mode): Parallel execution across workers
+    - Split test cases: [TC1-5] → Worker A, [TC6-10] → Worker B, ...
+    - Merge results: All must pass for AC
+    - Pros: 4x faster for AC, better user experience
+    - Cons: More resource usage, but acceptable during contests
+
+Partial Scoring (IOI-style):
+  - Each test case has a point value
+  - Score = sum(points for passed test cases) / total_points × 100
+  - Subtasks: groups of test cases (all must pass in group for points)
+  
+  subtask_scoring(test_results, subtask_config):
+    total_score = 0
+    for subtask in subtask_config:
+      if all(test_results[tc] == AC for tc in subtask.test_cases):
+        total_score += subtask.points
+    return total_score
+```
+
+#### Test Case Caching Strategy
+
+```
+Problem: Test cases stored in S3, fetching 20 test cases per submission = high latency
+
+Solution: Tiered caching on judge workers
+  L1: In-memory LRU cache (per worker, top 50 problems)
+      - Hot problems: ~200MB RAM per worker
+      - Hit rate during contest: >95%
+  
+  L2: Local NVMe SSD (all problems for current contest)
+      - Pre-loaded before contest starts
+      - 10GB budget per worker
+  
+  L3: S3 (source of truth)
+      - Only hit on cache miss or new problem publish
+      
+Cache invalidation:
+  - Problem test cases are immutable after contest starts
+  - Version hash on test case sets → compare on startup
+  - Between contests: full cache flush + pre-warm
+```
+

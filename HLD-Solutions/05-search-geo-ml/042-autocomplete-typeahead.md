@@ -80,6 +80,34 @@ Edge cache nodes:          ~500 (CDN edge locations)
 
 ## 5. Data Modeling
 
+### Entity-Relationship Diagram
+
+```mermaid
+erDiagram
+    SUGGESTIONS {
+        bigint suggestion_id PK
+        varchar text
+        varchar normalized_text
+        bigint frequency
+        varchar category
+        varchar entity_id
+    }
+    USER_SEARCH_HISTORY {
+        bigint user_id PK
+        varchar query_text PK
+        int search_count
+        timestamp last_searched
+    }
+    TRENDING_QUERIES {
+        varchar query_text PK
+        char language
+        varchar region
+        float trend_score
+    }
+    USER_SEARCH_HISTORY }o--o{ SUGGESTIONS : "contributes to"
+    TRENDING_QUERIES }o--o{ SUGGESTIONS : "boosts"
+```
+
 ### Suggestion Entry
 ```sql
 CREATE TABLE suggestions (
@@ -1136,6 +1164,174 @@ Decision: Accept regional differences.
 - Each region builds trie from local query logs
 - Global trending synced every minute
 - Acceptable that US and UK see slightly different suggestions
+```
+
+---
+
+## 16. Sequence Diagrams
+
+### 16.1 Typeahead Request Flow
+
+```mermaid
+sequenceDiagram
+    participant Client
+    participant CDN as CDN (Edge Cache)
+    participant API as API Gateway
+    participant Trie as Trie Service (In-Memory)
+    participant Personal as Personalization Service
+    participant Redis as Redis (Hot/Trending)
+    participant Filter as Safety Filter
+
+    Client->>Client: User types "how to le" (debounce 100ms)
+    Client->>CDN: GET /suggest?q=how+to+le&limit=10
+    alt CDN Hit (popular prefix)
+        CDN-->>Client: ["how to learn python", "how to learn guitar", ...]
+    else CDN Miss
+        CDN->>API: Forward request
+        API->>Trie: lookup("how to le", top_k=20)
+        Trie->>Trie: Walk trie to "how to le" node, return precomputed top-20
+        Trie-->>API: [("how to learn python", 95), ("how to learn guitar", 72), ...]
+        API->>Redis: Get trending overlay for prefix "how to le"
+        Redis-->>API: [("how to leave a google review", TRENDING)]
+        API->>Personal: Boost by user history (user searched "python" yesterday)
+        Personal-->>API: boost("how to learn python", +20)
+        API->>API: Merge + re-rank (trie + trending + personal)
+        API->>Filter: Check suggestions against blocklist
+        Filter-->>API: Remove blocked items
+        API-->>CDN: Top-10 suggestions (Cache-Control: max-age=60)
+        CDN-->>Client: ["how to learn python", "how to leave a review", ...]
+    end
+```
+
+### 16.2 Trie Update from Trending Data
+
+```mermaid
+sequenceDiagram
+    participant Search as Search Logs
+    participant Kafka
+    participant Flink as Flink (Trending Detection)
+    participant Redis as Redis (Hot Store)
+    participant Builder as Trie Builder
+    participant TrieSvc as Trie Service Nodes
+    participant Health as Health Checker
+
+    Search->>Kafka: Query events (query, timestamp, user_id, region)
+    Kafka->>Flink: Consume stream
+    Flink->>Flink: Sliding window (5 min): count per query, detect spikes
+    
+    alt Trending Spike Detected
+        Flink->>Redis: SET trending:prefix → suggestion (TTL=30min)
+        Note over Redis: Immediately available for hot overlay
+    end
+
+    Note over Builder: Every 4 hours (batch rebuild)
+    Builder->>Builder: Aggregate query counts from last 30 days
+    Builder->>Builder: Apply decay: weight = count × 0.95^(days_ago)
+    Builder->>Builder: Build new trie with precomputed top-K per node
+    Builder->>Builder: Serialize to binary format (mmap-friendly)
+    Builder->>TrieSvc: Atomic swap: load new trie file
+    TrieSvc->>Health: Health check on new trie
+    Health-->>TrieSvc: OK (latency within bounds)
+    TrieSvc->>TrieSvc: Serve from new trie, deallocate old
+```
+
+---
+
+## 17. Deep Dive: Trie Algorithm
+
+### 17.1 Compressed Trie (Patricia Trie) Structure
+
+```
+Standard Trie (wasteful):       Compressed Trie (production):
+      root                             root
+     / | \                           /    \
+    h   w   p                    "how"   "python"
+    |   |   |                    / | \       |
+    o   h   y                 " to" "?" " learn"  → top-K
+    |   |   |                  |           
+    w   a   t                "le"         
+    |   |   |               / | \
+    ?   t   h             "arn" "ave" "t"
+        |   |
+        ?   o
+            |
+            n
+
+Space savings: ~60-70% fewer nodes by collapsing single-child chains
+```
+
+### 17.2 Precomputed Top-K Per Node
+
+```python
+class TrieNode:
+    def __init__(self):
+        self.children = {}  # char → TrieNode (or compressed: string → TrieNode)
+        self.top_k = []     # Precomputed: [(suggestion, score), ...] limit 10-15
+        self.is_terminal = False
+
+# At build time, propagate top-K from leaves upward:
+def build_top_k(node, k=10):
+    """Post-order traversal: compute top-K for each node"""
+    candidates = []
+    
+    if node.is_terminal:
+        candidates.append((node.full_string, node.score))
+    
+    for child in node.children.values():
+        build_top_k(child, k)
+        candidates.extend(child.top_k)
+    
+    # Keep only top-K by score
+    candidates.sort(key=lambda x: -x[1])
+    node.top_k = candidates[:k]
+```
+
+**Query time complexity:** O(L) where L = length of prefix typed
+- Walk trie following prefix characters: O(L)
+- Return precomputed top_k: O(1) — no DFS needed at query time!
+
+### 17.3 Memory Optimization
+
+```
+For 100M unique queries with precomputed top-10 per node:
+
+Naive: 100M nodes × (pointer + string + top-10 pointers) ≈ 80GB
+Optimized:
+1. Compressed trie: reduces to ~30M nodes
+2. String pool: deduplicate shared prefixes (save 40%)
+3. Score quantization: float32 → uint16 (2 bytes, normalized 0-65535)
+4. Array-of-struct → struct-of-arrays (cache-friendly)
+5. Memory-mapped file: OS manages paging, instant startup
+
+Final: ~8-12 GB per shard (fits in RAM)
+Sharding: by prefix range (a-f, g-m, n-s, t-z) → 4 shards × 3 replicas
+```
+
+### 17.4 Handling Deletions and Score Updates
+
+```python
+# Problem: rebuilding 12GB trie takes 30 minutes. Can't do on every query.
+
+# Solution: Layered approach
+# Layer 1: Base trie (rebuilt every 4 hours)
+# Layer 2: Delta overlay (small trie with recent changes, in Redis)
+# Layer 3: Trending overlay (hot queries from last 5 min)
+
+def get_suggestions(prefix, user_id):
+    # 1. Base trie lookup
+    base_results = base_trie.lookup(prefix)  # O(L)
+    
+    # 2. Delta overlay (recently added/removed)
+    delta_results = redis.zrevrange(f"delta:{prefix}*", 0, 10)
+    
+    # 3. Trending overlay
+    trending = redis.smembers(f"trending:{prefix[:4]}")
+    
+    # 4. Merge with priority: trending > delta > base
+    merged = merge_and_dedup(base_results, delta_results, trending)
+    
+    # 5. Personalization boost
+    return personalize(merged, user_id)
 ```
 
 ---

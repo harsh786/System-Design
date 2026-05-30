@@ -88,6 +88,58 @@ Schema Registry:
 
 ## 4. Data Modeling
 
+### Entity-Relationship Diagram
+
+```mermaid
+erDiagram
+    EVENT_STREAM {
+        string stream_id PK
+        string stream_type
+    }
+    STORED_EVENT {
+        string event_id PK
+        string stream_id FK
+        bigint stream_position
+        bigint global_position
+        string event_type
+    }
+    SNAPSHOT {
+        string stream_id FK
+        bigint stream_position
+        bytes state
+    }
+    PROJECTION_CHECKPOINTS {
+        string projection_name PK
+        bigint last_global_position
+        string status
+    }
+    PROJECTION_DEAD_LETTERS {
+        bigint id PK
+        string projection_name FK
+        uuid event_id FK
+        string error_message
+    }
+    SAGA_INSTANCES {
+        uuid saga_id PK
+        string saga_type
+        string current_state
+        string status
+        bigint version
+    }
+    EVENT_SCHEMAS {
+        string event_type PK
+        int schema_version PK
+        jsonb schema_definition
+        string compatibility_mode
+    }
+
+    EVENT_STREAM ||--o{ STORED_EVENT : contains
+    EVENT_STREAM ||--o| SNAPSHOT : snapshot_of
+    STORED_EVENT }o--|| EVENT_SCHEMAS : conforms_to
+    PROJECTION_CHECKPOINTS ||--o{ PROJECTION_DEAD_LETTERS : has
+    SAGA_INSTANCES ||--o{ STORED_EVENT : triggered_by
+```
+
 ### Event Schema
 ```protobuf
 message StoredEvent {
@@ -1279,3 +1331,115 @@ async def health_check():
 - Low-value data (logs, metrics)
 - When eventual consistency is unacceptable everywhere
 - Small team without ES/CQRS experience (steep learning curve)
+
+---
+
+## Sequence Diagrams
+
+### 1. Command → Event → Projection Flow
+
+```mermaid
+sequenceDiagram
+    participant Client
+    participant CMD as Command Handler
+    participant Agg as Aggregate (Domain)
+    participant ES as Event Store (Postgres/EventStoreDB)
+    participant Bus as Event Bus (Kafka)
+    participant Proj as Projection Builder
+    participant Read as Read Model (Elasticsearch)
+
+    Client->>CMD: PlaceOrder {customer_id, items, total}
+    CMD->>ES: Load aggregate (order stream, version N)
+    ES-->>CMD: Events [Created, ItemAdded, ...]
+    CMD->>Agg: Rehydrate from events
+
+    Agg->>Agg: Validate business rules:<br/>- Customer credit OK?<br/>- Items in stock?<br/>- No duplicate order?
+
+    alt Validation passes
+        Agg->>Agg: Produce event: OrderPlaced {order_id, items, total, ts}
+        CMD->>ES: Append event (optimistic lock: expected_version=N)
+
+        alt Concurrency conflict (version mismatch)
+            ES-->>CMD: ConflictException
+            CMD->>CMD: Retry: reload aggregate, re-validate
+        else Success
+            ES-->>CMD: Stored (version N+1)
+            CMD-->>Client: 202 Accepted {order_id, version: N+1}
+        end
+
+        ES--)Bus: Publish OrderPlaced event
+        Bus->>Proj: Consume event
+        Proj->>Read: Upsert read model (denormalized order view)
+        Note over Read: Eventual consistency<br/>Typical lag: 50-200ms
+    else Validation fails
+        Agg-->>CMD: InsufficientCredit error
+        CMD-->>Client: 400 {error: "insufficient_credit"}
+    end
+```
+
+### 2. Saga Orchestration Flow
+
+```mermaid
+sequenceDiagram
+    participant Saga as Order Saga Orchestrator
+    participant ES as Event Store
+    participant Payment as Payment Service
+    participant Inventory as Inventory Service
+    participant Shipping as Shipping Service
+    participant Comp as Compensation Handler
+
+    Note over Saga: Saga started by OrderPlaced event
+
+    Saga->>ES: Append SagaStarted {order_id, steps: [payment, inventory, shipping]}
+
+    Saga->>Payment: ReservePayment {order_id, amount: $99}
+    Payment-->>Saga: PaymentReserved {transaction_id: TXN1}
+    Saga->>ES: Append PaymentReserved
+
+    Saga->>Inventory: ReserveItems {order_id, items: [{sku, qty}]}
+    Inventory-->>Saga: ItemsReserved {reservation_id: RES1}
+    Saga->>ES: Append ItemsReserved
+
+    Saga->>Shipping: ScheduleShipment {order_id, address, items}
+
+    alt Shipping fails
+        Shipping-->>Saga: ShipmentFailed {reason: "address_invalid"}
+        Saga->>ES: Append ShipmentFailed
+
+        Note over Saga: Compensating actions (reverse order)
+        Saga->>Comp: Compensate inventory
+        Comp->>Inventory: ReleaseReservation {reservation_id: RES1}
+        Inventory-->>Comp: Released
+
+        Saga->>Comp: Compensate payment
+        Comp->>Payment: ReleasePayment {transaction_id: TXN1}
+        Payment-->>Comp: Released
+
+        Saga->>ES: Append SagaCompensated {order_id, reason}
+    else Shipping succeeds
+        Shipping-->>Saga: ShipmentScheduled {tracking_id}
+        Saga->>ES: Append SagaCompleted {order_id}
+    end
+```
+
+### Caching Strategy
+
+#### Multi-Tier Caching for Event Sourcing
+- **L1 (Aggregate cache)**: In-memory LRU cache of rehydrated aggregates; keyed by stream_id + version; 10K entries
+- **L2 (Snapshot store)**: Periodic snapshots every 100 events; stored in event store; avoids replaying full history
+- **L3 (Read model cache)**: Redis cache of query results from read models; TTL 30s for hot data
+
+#### Cache Eviction Policies
+- **Aggregate cache**: LRU with 5-minute TTL; evict on memory pressure; always validate version on use
+- **Snapshot cache**: Never evicted (append-only); new snapshot replaces old for same aggregate
+- **Read model cache**: TTL-based (30s); invalidated on projection update event
+
+#### Cache Invalidation Patterns
+- **Event-driven**: New event appended → invalidate aggregate cache for that stream
+- **Projection update**: Projection builder publishes "view-updated" event → invalidate corresponding read cache entries
+- **Write-through for snapshots**: Snapshot created inline during command handling (every N events)
+
+#### Thundering Herd Prevention
+- **Snapshot on read**: If aggregate has >100 events and no snapshot, first reader creates snapshot (with lock)
+- **Single-flight projection**: Only one projector instance processes events for a given stream (Kafka partition key = stream_id)
+- **Read model warming**: On deploy, pre-warm cache for top-1000 aggregates by access frequency

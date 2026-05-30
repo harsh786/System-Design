@@ -95,6 +95,39 @@ Monitoring: 3 Prometheus + Grafana nodes
 
 ## 4. Data Modeling
 
+### Entity-Relationship Diagram
+
+```mermaid
+erDiagram
+    CLUSTER {
+        string cluster_id PK
+        int total_slots
+    }
+    CLUSTER_NODE {
+        string node_id PK
+        string ip
+        int port
+        string flags
+        int num_slots
+    }
+    HASH_SLOT {
+        int slot_number PK
+        string owner_node_id FK
+    }
+    CACHE_ENTRY {
+        string key PK
+        string type
+        int encoding
+        int lru_clock
+        int ttl
+    }
+
+    CLUSTER ||--o{ CLUSTER_NODE : contains
+    CLUSTER_NODE ||--o{ HASH_SLOT : owns
+    HASH_SLOT ||--o{ CACHE_ENTRY : stores
+    CLUSTER_NODE }o--o{ CLUSTER_NODE : replicates
+```
+
 ### Internal Data Structures
 
 #### Core Hash Table (Main Key Space)
@@ -1086,3 +1119,92 @@ Dashboard 4: Persistence
 7. Key naming: namespace by tenant to prevent cross-access
 8. Audit: log all admin commands and AUTH failures
 ```
+
+---
+
+## Sequence Diagrams
+
+### 1. Read with Cache Stampede Prevention
+
+```mermaid
+sequenceDiagram
+    participant C1 as Client-1
+    participant C2 as Client-2
+    participant C3 as Client-3
+    participant Proxy as Cache Proxy
+    participant Redis
+    participant DB as PostgreSQL
+
+    Note over C1,C3: Popular key expires → 3 concurrent requests
+
+    C1->>Proxy: GET user:1001:profile
+    C2->>Proxy: GET user:1001:profile
+    C3->>Proxy: GET user:1001:profile
+
+    Proxy->>Redis: GET user:1001:profile
+    Redis-->>Proxy: nil (cache miss)
+
+    Proxy->>Redis: SET user:1001:profile:lock NX EX 5
+    Redis-->>Proxy: OK (C1 wins the lock)
+
+    Note over Proxy: C2 and C3 wait (single-flight pattern)
+
+    Proxy->>DB: SELECT * FROM users WHERE id = 1001
+    DB-->>Proxy: {name, email, avatar_url, ...}
+
+    Proxy->>Redis: SET user:1001:profile {data} EX 3600
+    Proxy->>Redis: DEL user:1001:profile:lock
+
+    Proxy-->>C1: {profile data}
+    Proxy-->>C2: {profile data} (waited ~50ms)
+    Proxy-->>C3: {profile data} (waited ~50ms)
+
+    Note over Proxy: Probabilistic early expiration:<br/>TTL remaining < 10%? 5% chance of<br/>background refresh before actual expiry
+```
+
+### 2. Cache Eviction and Async Rebuild
+
+```mermaid
+sequenceDiagram
+    participant Writer as Write Service
+    participant Redis
+    participant Kafka
+    participant Rebuilder as Cache Rebuilder
+    participant DB as PostgreSQL
+
+    Writer->>DB: UPDATE products SET price=99.99 WHERE id=P1
+    DB-->>Writer: OK
+
+    Writer->>Redis: DEL product:P1:details
+    Note over Redis: Invalidate immediately (write-around)
+
+    Writer--)Kafka: Emit {topic: cache.invalidations, key: product:P1}
+
+    Kafka->>Rebuilder: Consume invalidation event
+    Rebuilder->>Rebuilder: Wait 100ms (coalesce rapid updates)
+    Rebuilder->>DB: SELECT * FROM products WHERE id=P1 (read replica)
+    DB-->>Rebuilder: {updated product data}
+    Rebuilder->>Redis: SET product:P1:details {data} EX 7200
+
+    Note over Redis: Memory pressure triggers eviction
+    Redis->>Redis: LFU eviction (allkeys-lfu policy)<br/>Evict least-frequently-used keys<br/>when maxmemory (80GB) reached
+
+    Note over Rebuilder: Monitor eviction rate<br/>Alert if > 1000 evictions/sec<br/>Scale cluster or increase maxmemory
+```
+
+### Infrastructure Components
+
+#### Load Balancer
+- **L4 (TCP)**: HAProxy/NLB in front of Redis Cluster; distributes connections across nodes
+- **Client-side**: Smart clients (Lettuce, ioredis) with cluster-aware routing — direct slot→node mapping
+- **Health checks**: TCP connect + `PING` command every 5s; remove node from pool after 3 consecutive failures
+
+#### API Gateway
+- Not directly applicable (Redis is an internal service, not exposed publicly)
+- **Access control**: Network-level ACLs (security groups) + Redis AUTH + ACL per-user permissions
+- **Request routing**: Cluster-aware proxy (e.g., Envoy with Redis protocol filter) for legacy clients
+
+#### Service Discovery
+- Redis Cluster uses gossip protocol for node discovery internally
+- External clients discover cluster topology via `CLUSTER SLOTS` / `CLUSTER NODES` commands
+- Sentinel (for non-cluster mode): provides automatic failover + service discovery endpoint

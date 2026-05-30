@@ -75,6 +75,38 @@ Ingress (uploads): 900TB + 15PB = ~16PB/day = 1.5 Tbps avg
 
 ## 4. Data Modeling
 
+### Entity-Relationship Diagram
+
+```mermaid
+erDiagram
+    USERS {
+        bigint user_id PK
+        varchar username
+        varchar email
+        smallint privacy_level
+    }
+    FRIENDSHIPS {
+        bigint user_id_1 PK
+        bigint user_id_2 PK
+        smallint status
+        float affinity_score
+    }
+    PRIVACY_SETTINGS {
+        bigint user_id PK
+        smallint default_post_audience
+    }
+    POSTS {
+        bigint post_id PK
+        bigint user_id FK
+        tinyint post_type
+        tinyint audience
+        timestamp created_at
+    }
+    USERS ||--|| PRIVACY_SETTINGS : "has"
+    USERS ||--o{ FRIENDSHIPS : "participates"
+    USERS ||--o{ POSTS : "creates"
+```
+
 ### PostgreSQL - Users & Auth (Sharded by user_id)
 ```sql
 CREATE TABLE users (
@@ -1073,6 +1105,123 @@ class PrivacyEnforcement:
 - Device-based session management with anomaly detection
 - Two-factor authentication (TOTP, SMS, security keys)
 - Scoped permissions for third-party app access (Graph API)
+
+---
+
+## Sequence Diagrams
+
+### 1. Post Creation + Feed Aggregation
+
+```mermaid
+sequenceDiagram
+    participant U as User
+    participant API as API Gateway
+    participant PS as Post Service
+    participant K as Kafka
+    participant AG as Aggregation Service
+    participant GS as Graph Service (TAO)
+    participant RK as Ranking Service
+    participant RC as Redis Feed Cache
+    participant CS as Cassandra
+
+    U->>API: POST /feed {text, media, audience}
+    API->>PS: createPost(user_id, content, privacy)
+    PS->>CS: persist post
+    PS->>K: publish PostCreated {post_id, author_id, audience}
+
+    K->>AG: consume PostCreated
+    AG->>GS: getFriends(author_id) filtered by audience
+    GS-->>AG: eligible_friend_ids[]
+
+    loop Batch of 500 friends
+        AG->>RK: scorePost(post, friend_features)
+        RK-->>AG: relevance_scores[]
+        AG->>RC: ZADD feed:{friend_id} score post_id
+        AG->>RC: ZREMRANGEBYRANK feed:{friend_id} 0 -501
+    end
+
+    AG->>K: publish FanoutComplete
+```
+
+### 2. Like/Comment Real-Time Update
+
+```mermaid
+sequenceDiagram
+    participant U as User B
+    participant API as API Gateway
+    participant ES as Engagement Service
+    participant K as Kafka
+    participant RT as Real-time Service
+    participant WS as WebSocket Gateway
+    participant U2 as User A (post author)
+    participant RC as Redis Counters
+
+    U->>API: POST /post/{id}/like
+    API->>ES: addLike(user_id, post_id)
+    ES->>RC: INCR likes:{post_id}
+    ES->>K: publish EngagementEvent {type:like, post_id, actor}
+
+    par Notify post author
+        K->>RT: consume EngagementEvent
+        RT->>WS: push to author channel
+        WS->>U2: real-time notification "User B liked your post"
+    and Update feed scores
+        K->>RT: recalculate post score
+        RT->>RC: ZADD feed:{viewer_id} new_score post_id
+    end
+
+    Note over ES: Batch counter sync to Cassandra every 30s
+```
+
+### 3. Feed Ranking Pipeline
+
+```mermaid
+sequenceDiagram
+    participant U as User
+    participant API as API Gateway
+    participant FS as Feed Service
+    participant RC as Redis Cache
+    participant CG as Candidate Generator
+    participant L1 as L1 Ranker (Lightweight)
+    participant L2 as L2 Ranker (Deep ML)
+    participant BL as Blender
+    participant CS as Cassandra
+
+    U->>API: GET /feed?cursor=xxx
+    API->>FS: getFeed(user_id)
+    FS->>RC: GET feed:{user_id}
+
+    alt Cache miss or stale
+        FS->>CG: generateCandidates(user_id, limit=2000)
+        CG->>CS: fetch friend posts (last 48h)
+        CG->>CS: fetch group posts, page posts
+        CG-->>FS: 2000 candidates
+
+        FS->>L1: quickScore(candidates, user_features)
+        L1-->>FS: top 500 scored candidates
+
+        FS->>L2: deepRank(top_500, user_history, context)
+        L2-->>FS: top 50 with final scores
+
+        FS->>BL: blend(ranked, ads, stories, diversity_rules)
+        BL-->>FS: final_feed[]
+        FS->>RC: cache final_feed TTL=300s
+    end
+
+    FS-->>API: feed_page + cursor
+    API-->>U: 200 OK
+```
+
+### Infrastructure Components
+
+| Component | Technology | Purpose |
+|-----------|-----------|---------|
+| CDN | Akamai + PoPs | Static assets, media delivery, 95%+ cache hit |
+| Load Balancer | L4 (IPVS) + L7 (Proxygen) | Connection routing, TLS termination, health checks |
+| API Gateway | Custom (Proxygen-based) | Auth, rate limiting, request routing, schema validation |
+| Service Mesh | Envoy sidecar | mTLS, circuit breaking, observability |
+| Edge Compute | Regional PoPs | Feed pre-fetch, push notification relay |
+| DNS | Route53 + GeoDNS | Latency-based routing to nearest region |
 
 ---
 

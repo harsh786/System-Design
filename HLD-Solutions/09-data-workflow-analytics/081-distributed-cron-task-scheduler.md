@@ -55,6 +55,54 @@
 
 ## 4. Data Modeling
 
+### Entity-Relationship Diagram
+
+```mermaid
+erDiagram
+    TASK_DAGS {
+        uuid dag_id PK
+        varchar dag_name
+        uuid tenant_id
+        boolean is_active
+    }
+    TASKS {
+        uuid task_id PK
+        uuid tenant_id
+        varchar task_type
+        varchar status
+        uuid dag_id FK
+        timestamp next_fire_time
+    }
+    TASK_EXECUTIONS {
+        uuid execution_id PK
+        uuid task_id FK
+        uuid dag_run_id
+        varchar status
+        bigint fence_token
+    }
+    DEAD_LETTER_QUEUE {
+        uuid dlq_id PK
+        uuid task_id FK
+        uuid execution_id FK
+        text failure_reason
+    }
+    SCHEDULER_NODES {
+        varchar node_id PK
+        boolean is_leader
+        varchar status
+    }
+    EXECUTION_LOCKS {
+        varchar lock_key PK
+        varchar owner_id
+        bigint fence_token
+    }
+
+    TASK_DAGS ||--o{ TASKS : contains
+    TASKS ||--o{ TASK_EXECUTIONS : produces
+    TASKS ||--o{ DEAD_LETTER_QUEUE : fails-to
+    TASK_EXECUTIONS ||--o| DEAD_LETTER_QUEUE : escalates-to
+```
+
 ### PostgreSQL Schemas
 
 ```sql
@@ -1306,3 +1354,223 @@ groups:
 ---
 
 *Total lines: 500+ | Covers all 11 standard sections with full depth*
+
+---
+
+## 12. Sequence Diagrams
+
+### Diagram 1: Task Scheduling + Leader Coordination
+
+```mermaid
+sequenceDiagram
+    participant Client
+    participant API as API Gateway
+    participant Leader as Scheduler Leader
+    participant Follower as Scheduler Follower
+    participant DB as PostgreSQL
+    participant Queue as Task Queue (Kafka)
+    participant Worker
+
+    Client->>API: POST /tasks (cron expression)
+    API->>Leader: Forward request
+    Leader->>DB: INSERT task (next_fire_time computed)
+    DB-->>Leader: ACK
+    Leader-->>Client: 201 Created (task_id)
+
+    Note over Leader: Timer wheel tick fires
+
+    Leader->>DB: SELECT tasks WHERE next_fire_time <= now() FOR UPDATE SKIP LOCKED
+    DB-->>Leader: [task_1, task_2, task_3]
+    Leader->>Queue: Produce task executions (partitioned by shard_key)
+    Queue-->>Leader: ACK (offset committed)
+    Leader->>DB: UPDATE tasks SET status='DISPATCHED', next_fire_time=next_occurrence
+
+    Worker->>Queue: Poll partition
+    Queue-->>Worker: task_1
+    Worker->>Worker: Execute task payload (HTTP callback)
+    Worker->>DB: UPDATE execution SET status='SUCCESS', completed_at=now()
+
+    Note over Follower: Leader heartbeat missed (>3s)
+    Follower->>Follower: Initiate Raft election
+    Follower->>DB: Acquire leader lease (fencing token incremented)
+    Follower-->>Follower: Becomes new Leader
+```
+
+### Diagram 2: Missed Execution Recovery
+
+```mermaid
+sequenceDiagram
+    participant Reconciler as Missed Execution Reconciler
+    participant DB as PostgreSQL
+    participant Queue as Task Queue
+    participant Worker
+    participant Alert as Alerting System
+
+    Note over Reconciler: Runs every 60s
+
+    Reconciler->>DB: SELECT tasks WHERE next_fire_time < now() - grace_period AND status != 'DISPATCHED'
+    DB-->>Reconciler: [task_7 missed by 5min, task_12 missed by 2min]
+
+    alt Misfire Policy = FIRE_ONCE
+        Reconciler->>Queue: Produce single catch-up execution
+        Reconciler->>DB: UPDATE next_fire_time to next future occurrence
+    else Misfire Policy = FIRE_ALL
+        Reconciler->>Queue: Produce execution for each missed interval
+        Reconciler->>DB: UPDATE next_fire_time to next future occurrence
+    else Misfire Policy = SKIP
+        Reconciler->>DB: UPDATE next_fire_time to next future occurrence (no execution)
+    end
+
+    Queue-->>Worker: Deliver missed task_7
+    Worker->>Worker: Execute (marks as RECOVERED)
+    Worker->>DB: INSERT execution (type='RECOVERY')
+
+    Reconciler->>Alert: Emit metric missed_executions_total{task_id, delay_seconds}
+```
+
+## 13. Algorithm Deep Dives
+
+### Deep Dive: Leader Election for Scheduler (Raft-Based with Fencing Tokens)
+
+#### Problem
+Multiple scheduler nodes must coordinate so exactly one dispatches tasks at any time. Split-brain causes duplicate executions.
+
+#### Algorithm: Raft + Fencing Tokens
+
+**Step 1: Cluster Bootstrap**
+- 3 or 5 scheduler nodes form a Raft group
+- Each node starts in FOLLOWER state with randomized election timeout (150-300ms)
+
+**Step 2: Election**
+```
+Node A timeout fires → becomes CANDIDATE
+Node A increments term to T=2, votes for self
+Node A sends RequestVote(term=2, lastLogIndex=5) to B, C
+Node B grants vote (hasn't voted in term 2)
+Node C grants vote
+Node A receives majority → becomes LEADER for term 2
+```
+
+**Step 3: Fencing Token Acquisition**
+```
+Leader A acquires distributed lock with fencing_token = monotonically_increasing_id
+  INSERT INTO scheduler_leader (node_id, fencing_token, lease_expires)
+  VALUES ('A', 47, now() + 10s)
+  ON CONFLICT DO UPDATE SET ... WHERE fencing_token < 47
+```
+
+**Step 4: Task Dispatch with Fencing**
+```
+Every task dispatch includes the fencing token:
+  Produce(topic='tasks', key=shard_id, headers={fencing_token: 47})
+  
+Workers reject messages with fencing_token < last_seen_token
+This prevents stale leaders from causing duplicates during network partitions
+```
+
+**Step 5: Leader Failure Recovery**
+```
+Followers detect missing heartbeat (>election_timeout)
+New election begins → Node C wins with term=3
+Node C acquires fencing_token=48
+Any in-flight dispatches from old leader (token=47) are rejected by workers
+```
+
+#### Correctness Guarantees
+- **Safety**: At most one leader per term (Raft guarantee)
+- **Liveness**: Election completes within 2 * election_timeout (probabilistic)
+- **No duplicate dispatch**: Fencing tokens prevent stale leader's messages from being processed
+
+---
+
+### Deep Dive: Timer Wheel Implementation
+
+#### Problem
+Scheduling millions of tasks with varying intervals efficiently. Naive priority queue is O(log n) per operation.
+
+#### Hierarchical Timer Wheel (4 levels)
+
+```
+Level 0: 1-second slots  × 60 slots  = 1 minute range
+Level 1: 1-minute slots  × 60 slots  = 1 hour range
+Level 2: 1-hour slots    × 24 slots  = 1 day range
+Level 3: 1-day slots     × 30 slots  = 30 day range
+```
+
+#### Data Structure
+```python
+class TimerWheel:
+    def __init__(self):
+        self.levels = [
+            [[] for _ in range(60)],   # seconds
+            [[] for _ in range(60)],   # minutes
+            [[] for _ in range(24)],   # hours
+            [[] for _ in range(30)],   # days
+        ]
+        self.current_tick = 0  # absolute seconds since epoch
+
+    def insert(self, task, fire_at_seconds):
+        delta = fire_at_seconds - self.current_tick
+        if delta < 60:
+            slot = fire_at_seconds % 60
+            self.levels[0][slot].append(task)
+        elif delta < 3600:
+            slot = (fire_at_seconds // 60) % 60
+            self.levels[1][slot].append(task)
+        elif delta < 86400:
+            slot = (fire_at_seconds // 3600) % 24
+            self.levels[2][slot].append(task)
+        else:
+            slot = (fire_at_seconds // 86400) % 30
+            self.levels[3][slot].append(task)
+
+    def tick(self):
+        """Called every second"""
+        self.current_tick += 1
+        slot = self.current_tick % 60
+        
+        # Fire all tasks in current second slot
+        tasks = self.levels[0][slot]
+        self.levels[0][slot] = []
+        
+        # Cascade: when second hand wraps, demote from minute level
+        if slot == 0:
+            min_slot = (self.current_tick // 60) % 60
+            for task in self.levels[1][min_slot]:
+                self.insert(task, task.fire_at)  # re-insert at lower level
+            self.levels[1][min_slot] = []
+            
+            # Similarly cascade hours and days...
+        
+        return tasks  # Tasks to dispatch
+```
+
+#### Performance
+| Operation | Complexity | Notes |
+|-----------|-----------|-------|
+| Insert | O(1) | Direct slot calculation |
+| Tick (no cascade) | O(k) | k = tasks firing this second |
+| Tick (with cascade) | O(m) | m = tasks in cascading slot (amortized O(1)) |
+| Cancel | O(1) | Mark task as cancelled, skip on fire |
+| Memory | O(n) | n = total scheduled tasks |
+
+#### Step-by-Step Example
+```
+Current time: T=100s (1min 40s)
+
+Insert task A: fire at T=105 → Level 0, slot 45 (105 % 60)
+Insert task B: fire at T=250 → Level 1, slot 4 (250/60 % 60 = 4)
+Insert task C: fire at T=7300 → Level 2, slot 2 (7300/3600 % 24 = 2)
+
+Tick to T=105: Fire task A from Level 0[45]
+Tick to T=120: Second hand wraps (120%60=0), cascade Level 1[2] (120/60%60=2)
+  → Task B (fire at 250) re-inserted to Level 0, slot 10 (250%60)
+Tick to T=250: Fire task B from Level 0[10]
+```
+
+#### Distributed Timer Wheel
+- Each scheduler node owns a shard of the timer wheel (partitioned by task_id hash)
+- Cascade operations are local (no cross-node communication)
+- Leader coordinates which node owns which shards
+- On node failure, shards reassigned; new owner rebuilds wheel from DB
+

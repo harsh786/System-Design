@@ -79,6 +79,50 @@
 
 ## 4. Data Modeling
 
+### Entity-Relationship Diagram
+
+```mermaid
+erDiagram
+    orders {
+        UUID order_id PK
+        VARCHAR order_number UK
+        UUID user_id FK
+        VARCHAR status
+        DECIMAL grand_total
+        VARCHAR payment_status
+        UUID parent_order_id FK
+    }
+    order_items {
+        UUID item_id PK
+        UUID order_id FK
+        UUID product_id FK
+        UUID seller_id FK
+        INTEGER quantity
+        DECIMAL line_total
+        VARCHAR status
+    }
+    order_events {
+        UUID event_id PK
+        UUID order_id FK
+        VARCHAR event_type
+        BIGINT sequence_number
+        UUID correlation_id
+    }
+    payment_transactions {
+        UUID transaction_id PK
+        UUID order_id FK
+        VARCHAR type
+        VARCHAR status
+        DECIMAL amount
+        VARCHAR psp_name
+    }
+
+    orders ||--o{ order_items : "contains"
+    orders ||--o{ order_events : "emits"
+    orders ||--o{ payment_transactions : "processes"
+    orders ||--o| orders : "split from"
+```
+
 ### Order Schema (PostgreSQL - Partitioned by created_at month)
 ```sql
 CREATE TABLE orders (
@@ -1212,3 +1256,99 @@ alerts:
 | Payment Gateway | Multi-PSP (Stripe/Adyen) | Redundancy, routing optimization |
 | Notifications | SQS + Lambda | Async, scalable notification delivery |
 | Monitoring | Datadog | APM + distributed tracing for sagas |
+
+---
+
+## 12. Sequence Diagrams
+
+### 12.1 Place Order Saga
+
+```mermaid
+sequenceDiagram
+    participant User
+    participant OrderService
+    participant SagaOrchestrator
+    participant InventoryService
+    participant PaymentService
+    participant FulfillmentService
+    participant Kafka
+
+    User->>OrderService: POST /orders {items, address, payment}
+    OrderService->>SagaOrchestrator: startSaga(ORDER_PLACEMENT, order_id)
+
+    SagaOrchestrator->>InventoryService: reserveItems(items[])
+    InventoryService-->>SagaOrchestrator: reserved (reservation_id)
+
+    SagaOrchestrator->>PaymentService: authorizePayment(amount, method)
+    PaymentService-->>SagaOrchestrator: authorized (auth_id)
+
+    SagaOrchestrator->>FulfillmentService: createShipment(order_id, address)
+    FulfillmentService-->>SagaOrchestrator: shipment_created (tracking_id)
+
+    SagaOrchestrator->>OrderService: markConfirmed(order_id)
+    OrderService->>Kafka: publish("order.confirmed")
+    OrderService-->>User: 201 {order_id, status: CONFIRMED}
+
+    Note over SagaOrchestrator: If any step fails → compensate in reverse:<br/>1. Cancel shipment<br/>2. Void payment auth<br/>3. Release inventory
+```
+
+### 12.2 Order Fulfillment State Machine
+
+```mermaid
+sequenceDiagram
+    participant Warehouse
+    participant FulfillmentService
+    participant OrderService
+    participant ShippingPartner
+    participant Kafka
+    participant User
+
+    Note over OrderService: State: CONFIRMED → PROCESSING
+    Warehouse->>FulfillmentService: pickComplete(order_id, items[])
+    FulfillmentService->>OrderService: updateState(PICKED)
+
+    Warehouse->>FulfillmentService: packComplete(order_id, package_dims)
+    FulfillmentService->>OrderService: updateState(PACKED)
+
+    FulfillmentService->>ShippingPartner: createLabel(package, address)
+    ShippingPartner-->>FulfillmentService: {label_url, tracking_number}
+    FulfillmentService->>OrderService: updateState(SHIPPED, tracking_number)
+    OrderService->>Kafka: publish("order.shipped")
+    Kafka->>User: Push notification: "Your order shipped!"
+
+    ShippingPartner->>FulfillmentService: webhook(delivered, proof_of_delivery)
+    FulfillmentService->>OrderService: updateState(DELIVERED)
+    OrderService->>Kafka: publish("order.delivered")
+    Kafka->>User: "Your order has been delivered!"
+```
+
+### 12.3 Return & Refund Flow
+
+```mermaid
+sequenceDiagram
+    participant User
+    participant ReturnService
+    participant OrderService
+    participant InventoryService
+    participant PaymentService
+    participant RefundService
+
+    User->>ReturnService: POST /returns {order_id, items, reason}
+    ReturnService->>OrderService: validateReturnEligibility(order_id)
+    OrderService-->>ReturnService: eligible (within 30-day window)
+
+    ReturnService-->>User: {return_id, shipping_label_url}
+
+    Note over User,ReturnService: User ships item back
+
+    ReturnService->>ReturnService: receiveItem(return_id, condition=GOOD)
+    ReturnService->>InventoryService: restockItem(sku, qty, warehouse)
+    InventoryService-->>ReturnService: restocked
+
+    ReturnService->>RefundService: initiateRefund(order_id, amount)
+    RefundService->>PaymentService: refund(original_charge_id, amount)
+    PaymentService-->>RefundService: refund_id (3-5 business days)
+
+    RefundService->>OrderService: updateState(REFUNDED)
+    RefundService-->>User: Email: "Refund of $49.99 initiated"
+```

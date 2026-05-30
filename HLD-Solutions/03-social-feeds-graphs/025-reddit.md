@@ -87,6 +87,56 @@ With CDN offloading 90% media: effective origin egress ≈ 460 Gbps
 
 ## 4. Data Modeling
 
+### Entity-Relationship Diagram
+
+```mermaid
+erDiagram
+    USERS {
+        bigint user_id PK
+        varchar username
+        bigint post_karma
+        bigint comment_karma
+    }
+    SUBREDDITS {
+        bigint subreddit_id PK
+        varchar name
+        bigint subscriber_count
+        bigint created_by FK
+    }
+    SUBSCRIPTIONS {
+        bigint user_id PK
+        bigint subreddit_id PK
+        timestamp subscribed_at
+    }
+    MODERATORS {
+        bigint user_id PK
+        bigint subreddit_id PK
+        jsonb permissions
+    }
+    POSTS {
+        timeuuid post_id PK
+        bigint subreddit_id FK
+        bigint author_id FK
+        text title
+        int score
+    }
+    COMMENTS {
+        timeuuid comment_id PK
+        bigint post_id FK
+        bigint author_id FK
+        bigint parent_id FK
+        int score
+    }
+    USERS ||--o{ SUBSCRIPTIONS : "subscribes"
+    SUBREDDITS ||--o{ SUBSCRIPTIONS : "has subscribers"
+    USERS ||--o{ MODERATORS : "moderates"
+    SUBREDDITS ||--o{ MODERATORS : "moderated by"
+    SUBREDDITS ||--o{ POSTS : "contains"
+    USERS ||--o{ POSTS : "authors"
+    POSTS ||--o{ COMMENTS : "has"
+    USERS ||--o{ COMMENTS : "writes"
+```
+
 ### PostgreSQL — Users, Subreddits, Subscriptions (Strong Consistency)
 
 ```sql
@@ -1063,6 +1113,166 @@ Implementation: Token bucket in Redis
 - r/all computation: dedicated cluster with 1-minute staleness acceptable
 - AMA events: pre-provision capacity for known celebrity AMAs
 - Subreddit creation spam: require minimum karma + account age
+
+---
+
+## Sequence Diagrams
+
+### 1. Post Submission + Hot Ranking Update
+
+```mermaid
+sequenceDiagram
+    participant U as User
+    participant API as API Gateway
+    participant PS as Post Service
+    participant DB as PostgreSQL (Citus)
+    participant K as Kafka
+    participant FL as Flink (Score Engine)
+    participant RC as Redis Sorted Sets
+    participant MS as Moderation Service
+
+    U->>API: POST /r/{subreddit}/submit {title, body, type}
+    API->>PS: createPost(user_id, subreddit_id, content)
+    PS->>DB: INSERT post (pending state)
+    PS->>K: publish PostCreated {post_id, subreddit, timestamp}
+
+    par Moderation check
+        K->>MS: consume PostCreated
+        MS->>MS: spam filter + automod rules
+        alt Passes moderation
+            MS->>DB: UPDATE post SET state=live
+        else Flagged
+            MS->>DB: UPDATE post SET state=removed
+            MS-->>U: notification: post removed
+        end
+    and Initial ranking
+        K->>FL: consume PostCreated
+        FL->>FL: calculate hot_score = log10(1) + (created_at - epoch) / 45000
+        FL->>RC: ZADD hot:{subreddit} score post_id
+        FL->>RC: ZADD new:{subreddit} timestamp post_id
+    end
+
+    PS-->>API: 201 Created {post_id, url}
+    API-->>U: redirect to post
+```
+
+### 2. Comment Tree Loading
+
+```mermaid
+sequenceDiagram
+    participant U as User
+    participant API as API Gateway
+    participant CS as Comment Service
+    participant RC as Redis Cache
+    participant DB as Cassandra
+    participant RS as Ranking Service
+
+    U->>API: GET /comments/{post_id}?sort=best&depth=5
+    API->>CS: getCommentTree(post_id, sort, depth)
+    CS->>RC: GET comment_tree:{post_id}:{sort}
+
+    alt Cache hit (hot posts)
+        RC-->>CS: serialized_tree
+    else Cache miss
+        CS->>DB: SELECT * FROM comments WHERE post_id=? 
+        DB-->>CS: flat_comments[]
+        CS->>CS: buildTree(flat_comments, parent_id linkage)
+        CS->>RS: rankComments(tree, sort_algorithm)
+        Note over RS: best = Wilson score interval; hot = score/age; controversial = balanced up/down
+        RS-->>CS: ranked_tree (truncated at depth=5)
+        CS->>RC: SET comment_tree:{post_id}:{sort} TTL=60
+    end
+
+    CS-->>API: comment_tree + "load more" cursors
+    API-->>U: 200 OK
+```
+
+### 3. Subreddit Subscription + Feed Generation
+
+```mermaid
+sequenceDiagram
+    participant U as User
+    participant API as API Gateway
+    participant SS as Subscription Service
+    participant GS as Graph Store
+    participant FS as Feed Service
+    participant RC as Redis
+    participant K as Kafka
+    participant AG as Aggregator
+
+    U->>API: POST /r/{subreddit}/subscribe
+    API->>SS: subscribe(user_id, subreddit_id)
+    SS->>GS: addEdge(user, SUBSCRIBES_TO, subreddit)
+    SS->>K: publish SubscriptionChanged {user_id, subreddit_id, action:join}
+    SS-->>API: 200 OK
+
+    Note over U: Later, user requests home feed
+    U->>API: GET /home?sort=best
+    API->>FS: getHomeFeed(user_id, sort)
+    FS->>RC: GET home_feed:{user_id}:{sort}
+
+    alt Cache miss or stale
+        FS->>GS: getSubscriptions(user_id)
+        GS-->>FS: subreddit_ids[]
+        FS->>AG: aggregate(subreddit_ids, sort, limit=100)
+        loop Each subscribed subreddit
+            AG->>RC: ZREVRANGE hot:{subreddit} 0 20
+        end
+        AG->>AG: merge + re-rank across subreddits (weight by affinity)
+        AG-->>FS: merged_feed[]
+        FS->>RC: SET home_feed:{user_id}:{sort} TTL=120
+    end
+
+    FS-->>API: feed_posts[]
+    API-->>U: 200 OK
+```
+
+---
+
+## Caching Strategy
+
+### Multi-Tier Cache Architecture
+
+| Tier | Technology | TTL | Use Case |
+|------|-----------|-----|----------|
+| L1 - CDN | CloudFront | 30-60s | Anonymous feed pages, media |
+| L2 - Application | Redis Cluster (32 shards) | 60s-5min | Hot/new sorted sets per subreddit, comment trees |
+| L3 - Local | In-process LRU (Caffeine) | 10s | Subreddit metadata, user session |
+| L4 - Read replica | PostgreSQL replicas | Real-time | User profiles, subreddit configs |
+
+### Eviction & Invalidation
+
+- **Sorted sets (hot/new/top)**: Rebuilt continuously by Flink; TTL not needed (overwritten)
+- **Comment trees**: Invalidate on new comment via Kafka event; rebuild for hot posts
+- **User home feed**: TTL 120s; force-invalidate on new subscription
+- **Post data**: Cache-aside, 5min TTL; event-driven invalidate on edit/delete
+
+---
+
+## Async Processing - Kafka Topic Design
+
+| Topic | Partitions | Key | Consumers |
+|-------|-----------|-----|-----------|
+| `post.created` | 64 | subreddit_id | Moderation, Ranking, Search indexing |
+| `vote.cast` | 128 | post_id | Score recalculation, Anti-fraud, Analytics |
+| `comment.created` | 64 | post_id | Tree invalidation, Notification, Moderation |
+| `subscription.changed` | 32 | user_id | Feed rebuild, Recommendation update |
+| `moderation.action` | 16 | subreddit_id | Audit log, User notification |
+
+**Vote processing**: Exactly-once semantics via Flink checkpointing. Vote deduplication via Redis HyperLogLog per post/user pair.
+
+---
+
+## Infrastructure Components
+
+| Component | Technology | Purpose |
+|-----------|-----------|---------|
+| CDN | CloudFront + Fastly | Static pages, media, 95% hit for anonymous |
+| Load Balancer | AWS ALB + NLB | HTTP routing, WebSocket support |
+| API Gateway | Kong | Rate limiting (per-user + per-subreddit), auth, routing |
+| Cache Layer | Redis Cluster (ElastiCache) | Feed sorted sets, sessions, rate limit counters |
+| Search | Elasticsearch (24 nodes) | Full-text post/comment search |
+| Media Pipeline | S3 + MediaConvert + CloudFront | Image/video hosting and transcoding |
 
 ---
 

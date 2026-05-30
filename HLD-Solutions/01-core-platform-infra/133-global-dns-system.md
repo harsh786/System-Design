@@ -57,6 +57,53 @@ Storage:
 
 ## 4. Data Modeling
 
+### Entity-Relationship Diagram
+
+```mermaid
+erDiagram
+    ZONES {
+        uuid zone_id PK
+        string zone_name
+        uuid account_id
+        boolean dnssec_enabled
+        bigint serial_number
+    }
+    RESOURCE_RECORDS {
+        uuid record_id PK
+        uuid zone_id FK
+        string name
+        string record_type
+        int ttl
+        string routing_policy
+        uuid health_check_id FK
+    }
+    HEALTH_CHECKS {
+        uuid health_check_id PK
+        uuid account_id
+        string protocol
+        string endpoint
+        string current_status
+    }
+    DNSSEC_KEYS {
+        uuid key_id PK
+        uuid zone_id FK
+        string key_type
+        string algorithm
+        string status
+    }
+    ROUTING_POLICIES {
+        uuid policy_id PK
+        uuid zone_id FK
+        string policy_type
+        jsonb config
+    }
+
+    ZONES ||--o{ RESOURCE_RECORDS : contains
+    ZONES ||--o{ DNSSEC_KEYS : secured_by
+    ZONES ||--o{ ROUTING_POLICIES : uses
+    HEALTH_CHECKS ||--o{ RESOURCE_RECORDS : monitors
+```
+
 ### 4.1 Zones and Records
 
 ```sql
@@ -869,3 +916,113 @@ query_log:
 - RFC 1035 (DNS), RFC 4034/4035 (DNSSEC), RFC 8484 (DoH), RFC 7858 (DoT)
 - RFC 8767 (Serving Stale Data), RFC 8806 (Running a Root Server Local)
 - Cloudflare architecture blog, AWS Route 53 documentation
+
+---
+
+## Sequence Diagrams
+
+### 1. DNS Resolution Flow
+
+```mermaid
+sequenceDiagram
+    participant Client
+    participant Stub as Stub Resolver (OS)
+    participant Recursive as Recursive Resolver (ISP/8.8.8.8)
+    participant Root as Root Server (.)
+    participant TLD as TLD Server (.com)
+    participant Auth as Authoritative NS (example.com)
+    participant LB as Geo-LB (optional)
+
+    Client->>Stub: getaddrinfo("api.example.com")
+    Stub->>Stub: Check /etc/hosts → miss
+    Stub->>Stub: Check local DNS cache → miss
+
+    Stub->>Recursive: Query A api.example.com (RD=1)
+
+    Recursive->>Recursive: Check cache → miss
+
+    Recursive->>Root: Query api.example.com (iterative)
+    Root-->>Recursive: Referral → .com TLD servers (NS records)
+
+    Recursive->>TLD: Query api.example.com
+    TLD-->>Recursive: Referral → ns1.example.com, ns2.example.com
+
+    Recursive->>Auth: Query A api.example.com
+    Auth->>Auth: Evaluate routing policy:<br/>- Geo: client from US-East<br/>- Health: all endpoints healthy<br/>- Weight: 70% primary, 30% canary
+
+    alt Simple A record
+        Auth-->>Recursive: A 203.0.113.10 (TTL 60s)
+    else Geo-routed
+        Auth->>LB: Which endpoint for US-East?
+        LB-->>Auth: 203.0.113.10 (us-east-1 ALB)
+        Auth-->>Recursive: A 203.0.113.10 (TTL 30s, low for failover agility)
+    end
+
+    Recursive->>Recursive: Cache response (TTL 30s)
+    Recursive-->>Stub: A 203.0.113.10
+    Stub->>Stub: Cache (respect TTL)
+    Stub-->>Client: 203.0.113.10
+```
+
+### 2. Zone Propagation Flow
+
+```mermaid
+sequenceDiagram
+    participant Admin as DNS Admin
+    participant Primary as Primary NS (Hidden)
+    participant API as DNS API
+    participant Queue as Change Queue
+    participant NS1 as Public NS-1
+    participant NS2 as Public NS-2
+    participant NS3 as Public NS-3
+
+    Admin->>API: Update record: api.example.com A → 198.51.100.20
+    API->>API: Validate record (syntax, no conflicts, DNSSEC)
+    API->>Primary: Write zone change (increment SOA serial)
+
+    Primary->>Primary: Update zone file, re-sign DNSSEC (RRSIG)
+    Primary->>Queue: Enqueue NOTIFY for all secondaries
+
+    par NOTIFY + AXFR/IXFR to all public NS
+        Primary->>NS1: NOTIFY (SOA serial increased)
+        NS1->>Primary: IXFR request (from serial X to X+1)
+        Primary-->>NS1: IXFR response (incremental zone transfer)
+        NS1->>NS1: Apply changes, verify DNSSEC chain
+
+        Primary->>NS2: NOTIFY
+        NS2->>Primary: IXFR request
+        Primary-->>NS2: IXFR response
+
+        Primary->>NS3: NOTIFY
+        NS3->>Primary: IXFR request
+        Primary-->>NS3: IXFR response
+    end
+
+    NS1-->>Primary: Transfer complete
+    NS2-->>Primary: Transfer complete
+    NS3-->>Primary: Transfer complete
+
+    Note over NS1,NS3: Propagation time: < 5s (NOTIFY-based)<br/>vs up to SOA refresh interval if NOTIFY lost
+
+    API-->>Admin: Change propagated to all NS (verified)
+
+    Note over Admin: Old cached records at resolvers<br/>will expire based on previous TTL<br/>Effective global propagation: TTL (30-300s)
+```
+
+### Infrastructure Components
+
+#### Load Balancer
+- **Anycast**: All authoritative NS share same IP via BGP anycast; nearest PoP answers
+- **Internal LB**: HAProxy/NLB in front of DNS server instances within each PoP (L4 UDP/TCP)
+- **Health checks**: DNS query probes (send known query, verify correct answer) every 5s per instance
+
+#### API Gateway
+- **Management API**: RESTful API for zone/record CRUD; behind L7 gateway with OAuth2 + RBAC
+- **Rate limiting**: Strict limits on zone changes (100 changes/min per zone) to prevent amplification
+- **Audit trail**: Every change logged with actor, timestamp, diff, and approval chain
+
+#### Anycast Network Infrastructure
+- **Global PoPs**: 30+ points of presence, BGP anycast routing for automatic geo-proximity
+- **DDoS protection**: Anycast inherently distributes attack traffic; per-PoP rate limiting + response rate limiting (RRL)
+- **Capacity**: Each PoP handles 100K+ QPS; total system capacity 10M+ QPS
+- **Failover**: BGP withdrawal removes unhealthy PoP from anycast pool within seconds

@@ -50,6 +50,87 @@ Snapshot store: Daily snapshots × 1B accounts × 50B = 50GB/snapshot
 
 ## 4. Data Modeling — Full Schemas
 
+### Entity-Relationship Diagram
+
+```mermaid
+erDiagram
+    chart_of_accounts ||--o{ ledger_accounts : "categorizes"
+    ledger_accounts ||--o{ ledger_entries : "contains"
+    ledger_accounts ||--o{ account_holds : "may have"
+    ledger_accounts ||--o{ interest_accruals : "accrues"
+    ledger_accounts ||--o{ balance_snapshots : "snapshots"
+    journals ||--o{ ledger_entries : "contains"
+    journals }o--o| journals : "reversal_of"
+    reconciliations ||--o{ reconciliation_items : "contains"
+
+    chart_of_accounts {
+        VARCHAR account_code PK
+        VARCHAR parent_code FK
+        VARCHAR account_name
+        VARCHAR account_type
+        CHAR normal_balance
+    }
+    ledger_accounts {
+        UUID account_id PK
+        VARCHAR account_code FK
+        VARCHAR owner_type
+        CHAR currency
+        BIGINT current_balance
+        VARCHAR status
+    }
+    journals {
+        UUID journal_id PK
+        BIGSERIAL journal_number
+        DATE entry_date
+        VARCHAR source_system
+        VARCHAR status
+        VARCHAR hash
+        VARCHAR prev_hash
+    }
+    ledger_entries {
+        BIGSERIAL entry_id PK
+        UUID journal_id FK
+        UUID account_id FK
+        CHAR entry_type
+        BIGINT amount
+        BIGINT running_balance
+    }
+    account_holds {
+        UUID hold_id PK
+        UUID account_id FK
+        VARCHAR hold_type
+        BIGINT amount
+        VARCHAR status
+    }
+    interest_accruals {
+        BIGSERIAL accrual_id PK
+        UUID account_id FK
+        DATE accrual_date
+        INTEGER rate_bps
+        BIGINT accrued_amount
+        BOOLEAN posted
+    }
+    balance_snapshots {
+        BIGSERIAL snapshot_id PK
+        UUID account_id FK
+        DATE snapshot_date
+        BIGINT closing_balance
+    }
+    reconciliations {
+        UUID recon_id PK
+        VARCHAR recon_type
+        VARCHAR status
+        INTEGER exception_items
+    }
+    reconciliation_items {
+        BIGSERIAL item_id PK
+        UUID recon_id FK
+        VARCHAR source_system
+        BIGINT source_amount
+        VARCHAR status
+    }
+```
+
 ```sql
 -- Chart of Accounts (hierarchical)
 CREATE TABLE chart_of_accounts (
@@ -1025,4 +1106,298 @@ Backup strategy:
 - Daily full backup (pg_basebackup)
 - Cross-region async replica (DR site)
 - Hash chain enables verification of restored data integrity
+```
+
+---
+
+## 12. Sequence Diagrams
+
+### Diagram 1: Double-Entry Transaction Posting
+
+```mermaid
+sequenceDiagram
+    participant Client as Banking App
+    participant API as Ledger API
+    participant Valid as Validation Engine
+    participant DB as PostgreSQL (Serializable)
+    participant Hash as Hash Chain Service
+    participant Kafka as Event Bus
+
+    Client->>API: POST /transactions (from=ACC_A, to=ACC_B, amount=10000, idem_key=TXN_001)
+    API->>API: Check idempotency key TXN_001
+    API->>Valid: Validate transaction
+    Valid->>Valid: Check: sufficient balance, account active, limits, AML threshold
+    Valid-->>API: VALID
+    API->>DB: BEGIN SERIALIZABLE
+    API->>DB: SELECT balance, version FROM accounts WHERE id='ACC_A' FOR UPDATE
+    DB-->>API: balance=50000, version=42
+    API->>DB: SELECT balance, version FROM accounts WHERE id='ACC_B' FOR UPDATE
+    DB-->>API: balance=20000, version=15
+    API->>DB: INSERT ledger_entry (DR: ACC_A, amount=10000, running_bal=40000)
+    API->>DB: INSERT ledger_entry (CR: ACC_B, amount=10000, running_bal=30000)
+    API->>DB: UPDATE accounts SET balance=40000, version=43 WHERE id='ACC_A'
+    API->>DB: UPDATE accounts SET balance=30000, version=16 WHERE id='ACC_B'
+    API->>Hash: Compute hash = SHA256(prev_hash || entry_data)
+    Hash-->>API: hash=0xABCDEF...
+    API->>DB: UPDATE ledger_entry SET hash_chain=0xABCDEF...
+    API->>DB: COMMIT
+    DB-->>API: SUCCESS
+    API->>Kafka: Publish transaction.posted (TXN_001)
+    API-->>Client: 201 Transaction (id=TXN_001, status=posted)
+
+    Note over Client,Kafka: Serializable isolation ensures no phantom reads.<br/>Hash chain makes tampering detectable.
+```
+
+### Diagram 2: End-of-Day Settlement
+
+```mermaid
+sequenceDiagram
+    participant Cron as EOD Scheduler
+    participant Settle as Settlement Engine
+    participant DB as Ledger DB
+    participant Nostro as Nostro/Vostro Accounts
+    participant RTGS as Central Bank (RTGS)
+    participant Recon as Reconciliation
+    participant Report as Regulatory Reporting
+
+    Cron->>Settle: Trigger EOD batch (date=2024-01-15)
+    Settle->>DB: SELECT net_positions GROUP BY counterparty, currency
+    DB-->>Settle: [{bank_X: +5M}, {bank_Y: -3M}, {bank_Z: +1M}]
+    Settle->>Settle: Netting: reduce 500 individual txns → 3 net transfers
+    
+    loop For each net position
+        Settle->>Nostro: Update nostro account (expected balance)
+        Settle->>RTGS: Submit settlement instruction (net_amount, counterparty)
+        RTGS-->>Settle: Settlement confirmation (ref=RTGS_789)
+        Settle->>DB: UPDATE settlements SET status=settled, rtgs_ref=RTGS_789
+    end
+    
+    Settle->>Recon: Trigger reconciliation
+    Recon->>DB: Compare: SUM(ledger_entries) vs nostro_statement
+    Recon->>Recon: Match entries, flag discrepancies
+    Recon-->>Settle: Recon complete (matched=499, breaks=1)
+    Settle->>Report: Generate regulatory report (Basel III, LCR)
+    Settle->>DB: INSERT eod_snapshot (date, trial_balance, hash)
+
+    Note over Cron,Report: Netting reduces RTGS transfers (saves fees).<br/>Breaks trigger investigation workflow.
+```
+
+### Diagram 3: Audit Trail Verification
+
+```mermaid
+sequenceDiagram
+    participant Auditor as Audit System
+    participant DB as Ledger DB
+    participant Hash as Hash Verifier
+    participant Merkle as Merkle Tree Builder
+    participant Alert as Alert System
+
+    Auditor->>DB: SELECT entries WHERE date=today ORDER BY sequence_num
+    DB-->>Auditor: 50,000 entries with hash_chain values
+    
+    loop For each entry (sequential)
+        Auditor->>Hash: Verify: SHA256(prev_hash || entry_data) == stored_hash
+        Hash-->>Auditor: MATCH ✓
+    end
+    
+    Auditor->>Auditor: All 50,000 hashes verified ✓
+    Auditor->>Merkle: Build Merkle tree from day's entries
+    Merkle-->>Auditor: Root hash = 0x1234ABCD...
+    Auditor->>DB: Compare root hash with stored daily_root_hash
+    
+    alt Hashes match
+        Auditor->>DB: INSERT audit_log (date, status=VERIFIED, root_hash)
+        Auditor-->>Auditor: Ledger integrity confirmed
+    else Hash mismatch detected
+        Auditor->>Alert: CRITICAL: Ledger tampering detected at entry #35,721
+        Alert->>Alert: Page on-call, freeze affected accounts
+        Auditor->>DB: INSERT audit_log (date, status=TAMPERED, break_point=35721)
+    end
+
+    Note over Auditor,Alert: Hash chain = sequential integrity (no insertion/deletion).<br/>Merkle tree = O(log n) proof for any single entry.
+```
+
+## 13. Caching Strategy
+
+### Balance & Account Caching
+
+```
+BANKING LEDGER CACHING — EXTREME CAUTION REQUIRED
+
+1. ACCOUNT BALANCE CACHE (Write-Through, NEVER cache-aside)
+   Key: account:{id}:balance
+   Pattern: Write-through ONLY (update cache IN SAME transaction as DB)
+   TTL: None (explicit invalidation only)
+   CRITICAL: Stale balance = incorrect available funds = overdraft risk
+   
+   On every transaction:
+     BEGIN TRANSACTION
+       UPDATE balance in DB
+       UPDATE balance in Redis (MULTI/EXEC for atomicity)
+     COMMIT
+   
+   On cache miss: Read from PRIMARY (never replica!)
+
+2. ACCOUNT METADATA CACHE (Read-through, safe to cache)
+   Key: account:{id}:meta
+   TTL: 5 minutes
+   Content: account_type, status, owner, limits
+   Safe because: metadata changes are rare, not financially sensitive
+
+3. INTEREST RATE / FEE SCHEDULE CACHE
+   Key: rates:{product_type}:{effective_date}
+   TTL: 1 hour (rates change infrequently, always have effective_date)
+   Source: Rates table with effective_date (never delete, only supersede)
+   
+4. RUNNING BALANCE vs COMPUTED BALANCE
+   Cache stores RUNNING balance (updated on each txn)
+   Nightly batch RECOMPUTES from all entries (SUM) to verify
+   Discrepancy = immediate investigation
+
+WHY EVENTUAL CONSISTENCY IS UNACCEPTABLE:
+- Balance query returns stale (higher) value → user initiates transfer → overdraft
+- Two concurrent transfers both see "sufficient balance" → double-spend
+- Interest calculation on stale balance → regulatory violation
+
+WHERE EVENTUAL CONSISTENCY IS ACCEPTABLE:
+- Statement generation (can be seconds behind)
+- Analytics/reporting dashboards
+- Notification delivery
+```
+
+### Infrastructure Components
+
+```
+┌─────────────────────────────────────────────────────────────┐
+│ BANKING LEDGER INFRASTRUCTURE                                │
+├─────────────────────────────────────────────────────────────┤
+│                                                              │
+│ COMPUTE:                                                     │
+│ ├── Kubernetes (EKS) — 3 AZs, dedicated node groups         │
+│ ├── Ledger API: 12 pods (4 CPU, 8GB each) — write-heavy     │
+│ ├── Query API: 8 pods (2 CPU, 4GB) — read from replicas     │
+│ └── Batch processors: Spot instances for EOD jobs            │
+│                                                              │
+│ DATABASE:                                                     │
+│ ├── PostgreSQL 15 (RDS Multi-AZ) — Primary for writes        │
+│ ├── 3 Read Replicas (sync within AZ, async cross-region)     │
+│ ├── Partitioning: Range by posting_date (monthly)            │
+│ ├── Connection pool: PgBouncer (transaction mode, 500 conns) │
+│ └── WAL archiving to S3 (point-in-time recovery)             │
+│                                                              │
+│ CACHING:                                                     │
+│ ├── Redis Cluster (6 nodes, 3 primary + 3 replica)           │
+│ ├── Dedicated cluster for balance cache (no eviction!)       │
+│ └── Separate cluster for session/rate data (LRU eviction OK) │
+│                                                              │
+│ MESSAGING:                                                    │
+│ ├── Kafka (6 brokers, replication=3, min.isr=2)              │
+│ ├── Topics: transactions, settlements, audit-events          │
+│ └── Retention: 30 days (compliance requirement)              │
+│                                                              │
+│ SECURITY:                                                     │
+│ ├── HSM (CloudHSM) — signing keys for hash chains            │
+│ ├── Vault — DB credentials, API keys rotation                │
+│ ├── mTLS between all services                                │
+│ └── Encryption at rest (AES-256) + in transit (TLS 1.3)      │
+│                                                              │
+│ OBSERVABILITY:                                                │
+│ ├── Prometheus + Grafana (metrics)                            │
+│ ├── Jaeger (distributed tracing)                             │
+│ ├── ELK stack (structured logs, 90-day retention)            │
+│ └── PagerDuty (balance discrepancy = P1 alert)               │
+│                                                              │
+└─────────────────────────────────────────────────────────────┘
+```
+
+## 14. Algorithm Deep Dives
+
+### Deep Dive: Immutable Ledger with Cryptographic Chaining
+
+```
+HASH CHAIN — Sequential Integrity Guarantee
+
+Each ledger entry stores: hash = SHA256(previous_entry_hash || entry_data)
+
+Entry #1: hash_1 = SHA256("GENESIS" || "DR:ACC_A,CR:ACC_B,amt:1000,ts:T1")
+Entry #2: hash_2 = SHA256(hash_1 || "DR:ACC_C,CR:ACC_D,amt:500,ts:T2")
+Entry #3: hash_3 = SHA256(hash_2 || "DR:ACC_A,CR:ACC_E,amt:2000,ts:T3")
+
+TAMPER DETECTION:
+If someone modifies Entry #2:
+  - Recomputing hash_2' gives different value
+  - hash_3 = SHA256(hash_2 || ...) ≠ SHA256(hash_2' || ...)
+  - Chain broken from Entry #2 onwards → tamper detected at O(n) verification
+
+MERKLE TREE — Efficient Proof for Any Entry
+
+For a day's entries [E1, E2, E3, E4, E5, E6, E7, E8]:
+
+              ROOT
+            /      \
+        H(1-4)     H(5-8)
+        /   \       /   \
+    H(1-2) H(3-4) H(5-6) H(7-8)
+    /  \   /  \   /  \   /  \
+   E1  E2 E3  E4 E5  E6 E7  E8
+
+To PROVE E3 is unmodified, provide:
+  - E3 itself
+  - H(E4)     (sibling)
+  - H(1-2)    (uncle)
+  - H(5-8)    (uncle)
+  
+Verifier computes: H(E3) → H(3-4) → H(1-4) → ROOT
+Compare with stored ROOT → verified in O(log n) steps
+
+USE CASES:
+1. Regulatory audit: "Prove this specific transaction existed and is unmodified"
+2. Cross-system reconciliation: Compare root hashes (one hash = entire day's integrity)
+3. Disaster recovery: Verify restored backup integrity without scanning all entries
+```
+
+### Deep Dive: Balance Computation Strategies
+
+```
+STRATEGY 1: RUNNING BALANCE (Maintained per entry)
+┌────────┬────────┬────────┬─────────────────┐
+│ Entry# │ Type   │ Amount │ Running Balance │
+├────────┼────────┼────────┼─────────────────┤
+│ 1      │ CR     │ +5000  │ 5000            │
+│ 2      │ DR     │ -1000  │ 4000            │
+│ 3      │ CR     │ +2000  │ 6000            │
+│ 4      │ DR     │ -500   │ 5500            │
+└────────┴────────┴────────┴─────────────────┘
+
+Pros: O(1) balance lookup (just read latest entry's running_balance)
+Cons: Concurrent transactions must serialize (each needs previous balance)
+      Insert in middle (backdated entry) requires recomputing all subsequent
+
+STRATEGY 2: COMPUTED BALANCE (SUM on read)
+  SELECT SUM(CASE WHEN type='CR' THEN amount ELSE -amount END) 
+  FROM entries WHERE account_id = 'ACC_A';
+
+Pros: No serialization needed on write, backdated entries trivial
+Cons: O(n) read, scales poorly with history (1M+ entries per account)
+
+STRATEGY 3: HYBRID (Running + Periodic Snapshots) ← RECOMMENDED
+  - Maintain running balance in accounts table (fast reads)
+  - Update atomically with each entry (serialized per account)
+  - Nightly: recompute from scratch, compare with running balance
+  - Monthly: take balance snapshots (optimization for historical queries)
+  
+  Historical balance query:
+    SELECT snapshot_balance + SUM(entries after snapshot)
+    FROM snapshots, entries
+    WHERE snapshot_date <= target_date
+
+  This bounds the SUM to at most ~30 days of entries instead of full history.
+
+CONCURRENCY CONTROL:
+  - Optimistic: version column, retry on conflict (good for low contention)
+  - Pessimistic: SELECT FOR UPDATE (good for hot accounts)
+  - Advisory locks: pg_advisory_xact_lock(account_id) — per-account serialization
+  
+  For banking: Pessimistic locks on hot accounts, optimistic for normal accounts
+  Threshold: > 100 txns/minute → pessimistic; else → optimistic with 3 retries
 ```

@@ -109,6 +109,48 @@ CDN offloads static assets (80%) → Origin: ~9 Gbps
 
 ## 5. Data Modeling
 
+### Entity-Relationship Diagram
+
+```mermaid
+erDiagram
+    QUESTIONS {
+        bigint question_id PK
+        bigint user_id FK
+        varchar title
+        enum status
+        int score
+        bigint accepted_answer_id FK
+    }
+    QUESTION_TAGS {
+        bigint question_id PK
+        int tag_id PK
+    }
+    QUESTION_REVISIONS {
+        bigint revision_id PK
+        bigint question_id FK
+        bigint user_id FK
+        int revision_num
+    }
+    ANSWERS {
+        bigint answer_id PK
+        bigint question_id FK
+        bigint user_id FK
+        int score
+        boolean is_accepted
+    }
+    ANSWER_REVISIONS {
+        bigint revision_id PK
+        bigint answer_id FK
+        bigint user_id FK
+        int revision_num
+    }
+    QUESTIONS ||--o{ ANSWERS : "has"
+    QUESTIONS ||--o{ QUESTION_TAGS : "tagged with"
+    QUESTIONS ||--o{ QUESTION_REVISIONS : "edited"
+    ANSWERS ||--o{ ANSWER_REVISIONS : "edited"
+    QUESTIONS ||--o| ANSWERS : "accepts"
+```
+
 ### 5.1 Question Schema (PostgreSQL, partitioned)
 
 ```sql
@@ -1152,4 +1194,143 @@ traces:
 | Analytics | ClickHouse | Historical metrics |
 | ML Serving | TorchServe | Duplicate detection, quality scoring |
 | CDN | CloudFront | 95% cache hit for anonymous |
+
+---
+
+## Sequence Diagrams
+
+### 1. Question Ask + Routing to Experts
+
+```mermaid
+sequenceDiagram
+    participant U as Asker
+    participant API as API Gateway
+    participant QS as Question Service
+    participant DB as PostgreSQL
+    participant K as Kafka
+    participant ML as Topic Classifier (ML)
+    participant RS as Routing Service
+    participant ES as Elasticsearch
+    participant NS as Notification Service
+
+    U->>API: POST /questions {title, body, topics}
+    API->>QS: createQuestion(user_id, content, topics)
+    QS->>DB: INSERT question (state=pending)
+    QS->>K: publish QuestionCreated {q_id, title, body, topics}
+
+    par Topic classification & enrichment
+        K->>ML: classify(title + body)
+        ML-->>QS: auto_topics[], difficulty_level
+        QS->>DB: UPDATE question SET topics, difficulty
+    and Expert routing
+        K->>RS: findExperts(topics, difficulty)
+        RS->>ES: query users by expertise + availability + answer_rate
+        ES-->>RS: candidate_experts[] (top 20)
+        RS->>RS: rank by: topic authority, response rate, last active
+        RS->>NS: notifyExperts(top_10, question_summary)
+        NS-->>NS: push/email notifications
+    and Duplicate check
+        K->>ML: semanticSearch(title + body)
+        ML->>ES: vector similarity search
+        alt Similar question found (>0.85 cosine)
+            ML-->>QS: suggest_duplicate {existing_q_id}
+            QS-->>U: "Similar question exists" suggestion
+        end
+    end
+
+    QS-->>API: 201 Created {question_id, url}
+```
+
+### 2. Answer Submission + Ranking
+
+```mermaid
+sequenceDiagram
+    participant U as Answerer
+    participant API as API Gateway
+    participant AS as Answer Service
+    participant DB as PostgreSQL
+    participant K as Kafka
+    participant QS as Quality Scorer (ML)
+    participant RK as Ranking Service
+    participant RC as Redis Cache
+    participant NS as Notification Service
+
+    U->>API: POST /questions/{q_id}/answers {body}
+    API->>AS: submitAnswer(user_id, question_id, body)
+    AS->>DB: INSERT answer (state=live)
+    AS->>K: publish AnswerCreated {answer_id, question_id, author}
+
+    par Quality scoring
+        K->>QS: scoreAnswer(body, author_credentials)
+        Note over QS: Signals: length, formatting, references, author expertise, grammar
+        QS-->>AS: quality_score (0-100)
+        AS->>DB: UPDATE answer SET quality_score
+    and Ranking update
+        K->>RK: rerank(question_id)
+        RK->>DB: fetch all answers for question
+        RK->>RK: score = f(votes, quality, author_cred, recency)
+        RK->>RC: SET answer_order:{q_id} ranked_ids[]
+    and Notifications
+        K->>NS: notify asker + question followers
+    end
+
+    AS->>RC: invalidate question_page:{q_id}
+    AS-->>API: 201 Created {answer_id}
+```
+
+### 3. Duplicate Question Detection
+
+```mermaid
+sequenceDiagram
+    participant U as User
+    participant API as API Gateway
+    participant DD as Duplicate Detector
+    participant EM as Embedding Service
+    participant VDB as Vector Store
+    participant ES as Elasticsearch
+    participant MOD as Moderator Queue
+
+    U->>API: POST /questions (during typing - real-time)
+    API->>DD: checkDuplicate(title_draft)
+
+    DD->>EM: encode(title_draft)
+    EM-->>DD: query_embedding
+
+    par Semantic search
+        DD->>VDB: ANN(query_embedding, top_k=10, threshold=0.80)
+        VDB-->>DD: semantic_matches[]
+    and Lexical search
+        DD->>ES: moreLikeThis(title_draft, min_score=5)
+        ES-->>DD: lexical_matches[]
+    end
+
+    DD->>DD: merge + deduplicate + score
+
+    alt High confidence duplicate (>0.92)
+        DD-->>API: {is_duplicate: true, original_id, confidence}
+        API-->>U: "This question may already have an answer" + link
+    else Moderate confidence (0.80-0.92)
+        DD-->>API: {suggestions: similar_questions[]}
+        API-->>U: "Similar questions" sidebar
+    else No match
+        DD-->>API: {is_duplicate: false}
+        Note over U: Proceed with posting
+    end
+
+    Note over MOD: Post-submission: community can flag duplicates for mod review
+```
+
+---
+
+## Infrastructure Components
+
+| Component | Technology | Purpose |
+|-----------|-----------|---------|
+| CDN | CloudFront + Varnish | Anonymous Q&A pages (95% hit), static assets |
+| Load Balancer | AWS ALB | HTTP routing, SSL termination, sticky sessions |
+| API Gateway | Kong | Rate limiting, OAuth, request transformation |
+| Full-Text Search | Elasticsearch (12 nodes) | Question/answer search, autocomplete |
+| Vector Search | Pinecone / pgvector | Semantic duplicate detection, expert matching |
+| ML Serving | TorchServe (GPU) | Quality scoring, topic classification, embeddings |
+| WebSocket | Socket.io + Redis Pub/Sub | Real-time answer notifications, live vote counts |
 

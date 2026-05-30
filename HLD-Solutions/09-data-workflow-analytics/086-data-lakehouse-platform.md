@@ -54,6 +54,51 @@ Compute:
 
 ## 4. Data Modeling
 
+### Entity-Relationship Diagram
+
+```mermaid
+erDiagram
+    LAKEHOUSE_TABLE_METADATA {
+        uuid table_id PK
+        varchar catalog_name
+        varchar table_name
+        varchar format
+        varchar medallion_layer
+    }
+    DELTA_LOG {
+        uuid table_id PK_FK
+        bigint version PK
+        varchar operation
+        timestamp timestamp
+    }
+    DELTA_ADD_FILE {
+        uuid table_id PK_FK
+        bigint version PK
+        varchar path PK
+        bigint size_bytes
+        jsonb stats_json
+    }
+    CATALOG_PERMISSIONS {
+        uuid permission_id PK
+        varchar securable_type
+        uuid securable_id FK
+        varchar principal_id
+        varchar privilege
+    }
+    DATA_LINEAGE {
+        uuid lineage_id PK
+        uuid source_table_id FK
+        uuid target_table_id FK
+        varchar transformation_type
+    }
+
+    LAKEHOUSE_TABLE_METADATA ||--o{ DELTA_LOG : tracks
+    LAKEHOUSE_TABLE_METADATA ||--o{ DELTA_ADD_FILE : contains
+    LAKEHOUSE_TABLE_METADATA ||--o{ CATALOG_PERMISSIONS : secured-by
+    LAKEHOUSE_TABLE_METADATA ||--o{ DATA_LINEAGE : source-of
+    LAKEHOUSE_TABLE_METADATA ||--o{ DATA_LINEAGE : target-of
+```
+
 ### Delta Log Entry Schema
 ```sql
 CREATE TABLE delta_log (
@@ -1147,3 +1192,139 @@ monitoring:
 - **Large transaction log**: Periodic compaction into checkpoint Parquet
 - **Concurrent reader storm**: Cache file metadata in Redis, serve from catalog cache
 - **Cross-region replication**: Delta Sharing protocol for zero-copy sharing
+
+---
+
+## 12. Sequence Diagrams
+
+### Diagram 1: Medallion Pipeline (Bronze → Silver → Gold)
+
+```mermaid
+sequenceDiagram
+    participant Source as Source Systems
+    participant Ingest as Ingestion (Kafka/CDC)
+    participant Bronze as Bronze Layer (Raw)
+    participant Silver as Silver Layer (Cleaned)
+    participant Gold as Gold Layer (Business)
+    participant Catalog as Unity Catalog
+    participant S3 as Object Storage
+
+    Source->>Ingest: CDC events / API extracts / file drops
+    Ingest->>S3: Write raw Parquet files (append-only, no schema enforcement)
+    Ingest->>Bronze: Delta WRITE transaction (add files to log)
+    Bronze->>Catalog: Register new version (schema=inferred)
+
+    Note over Bronze,Silver: Silver job triggers (streaming or scheduled)
+
+    Silver->>Bronze: Read new files since last checkpoint (change data feed)
+    Silver->>Silver: Deduplicate (by event_id + timestamp)
+    Silver->>Silver: Schema enforcement + type casting
+    Silver->>Silver: Data quality checks (expectations framework)
+    
+    alt Quality checks PASS
+        Silver->>S3: Write cleaned Parquet (Z-ORDER by common query columns)
+        Silver->>Catalog: Commit transaction (ACID, update stats)
+    else Quality checks FAIL
+        Silver->>S3: Write to quarantine path
+        Silver->>Catalog: Log quality violation (metric + sample rows)
+    end
+
+    Note over Silver,Gold: Gold aggregation job
+
+    Gold->>Silver: Read dimension + fact tables (time-travel: specific version)
+    Gold->>Gold: Business transformations (joins, aggregations, SCD Type 2)
+    Gold->>S3: Write business-level tables (partitioned by date)
+    Gold->>Catalog: Publish gold tables (tagged: certified, owner, SLA)
+    Gold->>Catalog: Update lineage graph (silver_orders → gold_revenue)
+```
+
+### Diagram 2: ACID Transaction Commit Protocol (Delta Lake)
+
+```mermaid
+sequenceDiagram
+    participant Writer1 as Writer (Job A)
+    participant Writer2 as Writer (Job B)
+    participant Log as Delta Log (S3/_delta_log/)
+    participant S3 as Object Storage
+    participant Lock as Optimistic Lock
+
+    Writer1->>Log: Read current version (000042.json)
+    Writer2->>Log: Read current version (000042.json)
+
+    Writer1->>S3: Write data files (part-001.parquet, part-002.parquet)
+    Writer2->>S3: Write data files (part-003.parquet)
+
+    Writer1->>Writer1: Prepare commit: {add: [part-001, part-002], remove: []}
+    Writer1->>Lock: Attempt PUT 000043.json (If-None-Match / DynamoDB conditional)
+    Lock-->>Writer1: SUCCESS (first writer wins)
+    Writer1->>Log: 000043.json committed
+
+    Writer2->>Writer2: Prepare commit: {add: [part-003], remove: [old-file]}
+    Writer2->>Lock: Attempt PUT 000043.json
+    Lock-->>Writer2: CONFLICT (file exists)
+
+    Note over Writer2: Optimistic concurrency retry
+
+    Writer2->>Log: Read 000043.json (check for conflicts)
+    Writer2->>Writer2: Conflict resolution: do my changes conflict with 000043?
+    
+    alt No conflict (disjoint partitions)
+        Writer2->>Writer2: Rebase commit on version 43
+        Writer2->>Lock: Attempt PUT 000044.json
+        Lock-->>Writer2: SUCCESS
+    else Conflict detected (same partition modified)
+        Writer2-->>Writer2: Abort transaction, raise ConcurrentModificationException
+    end
+
+    Note over Log: Checkpoint every 10 versions
+    Log->>S3: Write 000040.checkpoint.parquet (snapshot of all active files)
+```
+
+### Caching Strategy
+
+| Cache Layer | What's Cached | TTL | Invalidation |
+|-------------|--------------|-----|--------------|
+| Catalog metadata cache (Redis) | Table schemas, partition stats, file lists | 5min | On Delta commit (version change) |
+| Query result cache | Materialized query results for dashboards | 15min | Time-based + explicit invalidate on write |
+| File metadata cache | Parquet footer/statistics per file | 1h | Immutable (files never modified) |
+| Data file cache (SSD) | Hot Parquet files on compute nodes | LRU eviction | Capacity-based eviction |
+
+**Cache warming strategy:**
+- On cluster start, pre-fetch catalog metadata for top-50 tables (by query frequency)
+- Pin gold-layer file footers in SSD cache (small, frequently accessed)
+- Predictive prefetch: if query scans partition P1, prefetch P2 (sequential access pattern)
+
+### Async Processing Architecture
+
+- **Streaming ingestion**: Kafka consumers write to Bronze asynchronously; producers don't wait for full pipeline
+- **VACUUM (async)**: Background process removes orphaned files older than retention period (default 7 days)
+- **OPTIMIZE (async)**: Background compaction merges small files into larger ones (target 1GB per file)
+- **Statistics collection**: Async job computes column min/max/null_count after commits (for data skipping)
+- **Lineage propagation**: Async event published on each commit; lineage service updates graph without blocking writers
+
+### Infrastructure Components
+
+```
+┌─────────────────────────────────────────────────────────────┐
+│ Compute Layer                                                │
+│  ├── Spark clusters (auto-scaling 2-100 nodes)              │
+│  ├── SQL Warehouses (serverless, per-query scaling)         │
+│  └── Streaming clusters (always-on, Structured Streaming)   │
+├─────────────────────────────────────────────────────────────┤
+│ Metadata Layer                                               │
+│  ├── Unity Catalog (Hive Metastore compatible)              │
+│  ├── Delta Log (per-table, stored alongside data)           │
+│  └── Redis cluster (metadata + query result cache)          │
+├─────────────────────────────────────────────────────────────┤
+│ Storage Layer                                                │
+│  ├── S3/ADLS/GCS (primary object storage)                   │
+│  ├── SSD cache on compute nodes (hot data)                  │
+│  └── Glacier/Archive (tables with >90 day retention policy) │
+├─────────────────────────────────────────────────────────────┤
+│ Orchestration                                                │
+│  ├── Airflow/Databricks Workflows (DAG scheduling)          │
+│  ├── Kafka/Kinesis (streaming ingestion)                    │
+│  └── Terraform (infrastructure as code)                     │
+└─────────────────────────────────────────────────────────────┘
+```
+

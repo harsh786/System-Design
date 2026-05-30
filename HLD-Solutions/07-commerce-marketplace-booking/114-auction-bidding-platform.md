@@ -61,6 +61,68 @@ Real-time notifications: 100K/sec
 
 ## 4. Data Modeling
 
+### Entity-Relationship Diagram
+
+```mermaid
+erDiagram
+    users {
+        UUID user_id PK
+        VARCHAR username UK
+        VARCHAR email UK
+        BOOLEAN seller_verified
+        DECIMAL buyer_rating
+        DECIMAL seller_rating
+    }
+    categories {
+        UUID category_id PK
+        UUID parent_category_id FK
+        VARCHAR name
+        VARCHAR slug UK
+    }
+    auctions {
+        UUID auction_id PK
+        UUID seller_id FK
+        UUID category_id FK
+        VARCHAR auction_type
+        INTEGER starting_price_cents
+        INTEGER current_price_cents
+        UUID current_winner_id FK
+        TIMESTAMP end_time
+        VARCHAR status
+    }
+    bids {
+        UUID bid_id PK
+        UUID auction_id FK
+        UUID bidder_id FK
+        INTEGER amount_cents
+        VARCHAR bid_type
+        BOOLEAN is_winning
+        BIGINT sequence_number
+    }
+    proxy_bids {
+        UUID proxy_id PK
+        UUID auction_id FK
+        UUID bidder_id FK
+        INTEGER max_amount_cents
+        BOOLEAN is_active
+    }
+    escrow_payments {
+        UUID escrow_id PK
+        UUID auction_id FK
+        UUID buyer_id FK
+        UUID seller_id FK
+        INTEGER amount_cents
+        VARCHAR status
+    }
+
+    users ||--o{ auctions : "sells"
+    categories ||--o{ auctions : "categorized"
+    auctions ||--o{ bids : "receives"
+    users ||--o{ bids : "places"
+    auctions ||--o{ proxy_bids : "auto-bid on"
+    auctions ||--|| escrow_payments : "payment"
+```
+
 ### Full Database Schemas
 
 ```sql
@@ -1176,3 +1238,148 @@ Platform-wide, 50K bids/sec:
 - Kafka: 50K produces/sec + 200K consumes/sec (fan-out)
 - DB writes: 50K/sec (async batch inserts)
 ```
+
+---
+
+## 12. Sequence Diagrams
+
+### 12.1 Real-Time Bid Placement
+
+```mermaid
+sequenceDiagram
+    participant Bidder
+    participant WebSocket Gateway
+    participant BidService
+    participant Redis
+    participant PostgreSQL
+    participant Kafka
+    participant AllBidders
+
+    Bidder->>WebSocket Gateway: WS: {"action": "bid", "auction_id": "A-100", "amount": 550}
+    WebSocket Gateway->>BidService: placeBid(auction_id, bidder_id, amount=550)
+
+    BidService->>Redis: GET auction:A-100:current_bid
+    Redis-->>BidService: {amount: 500, bidder: B-3, bid_id: BID-45}
+
+    Note over BidService: Validate:<br/>- new_bid(550) > current(500) + min_increment(10) ✓<br/>- auction still active ✓<br/>- bidder not banned ✓
+
+    BidService->>Redis: EVAL lua_atomic_bid_update(A-100, 550, bidder_id)
+    Note over Redis: Lua: if current < 550 then SET; return OK<br/>else return OUTBID (race condition safe)
+    Redis-->>BidService: OK (bid accepted)
+
+    BidService->>PostgreSQL: INSERT bid(A-100, bidder_id, 550, timestamp)
+    BidService->>Kafka: publish("bid.placed", {auction, amount, bidder})
+    BidService->>Redis: ZADD auction:A-100:history 550 "BID-46"
+
+    BidService->>WebSocket Gateway: broadcast(auction=A-100)
+    WebSocket Gateway->>AllBidders: {"event": "new_bid", "amount": 550, "bidder": "B***7"}
+    WebSocket Gateway->>Bidder: {"event": "bid_accepted", "your_bid": 550}
+
+    Note over BidService: If auction end < 2min away → extend by 2min (anti-sniping)
+```
+
+### 12.2 Auction Close + Winner Determination
+
+```mermaid
+sequenceDiagram
+    participant Scheduler
+    participant AuctionService
+    participant Redis
+    participant PostgreSQL
+    participant PaymentService
+    participant NotificationService
+    participant Winner
+    participant Seller
+
+    Scheduler->>AuctionService: closeAuction(A-100) [scheduled at end_time]
+
+    AuctionService->>Redis: SET auction:A-100:status CLOSING NX
+    Note over AuctionService: Prevent new bids (atomic status change)
+
+    AuctionService->>Redis: GET auction:A-100:current_bid
+    Redis-->>AuctionService: {amount: 2350, bidder: B-7, bid_id: BID-89}
+
+    AuctionService->>Redis: ZREVRANGE auction:A-100:history 0 0
+    Redis-->>AuctionService: Confirm highest = 2350 by B-7
+
+    alt Reserve price met (reserve = $2000)
+        AuctionService->>PostgreSQL: UPDATE auction SET status=SOLD, winner=B-7, final_price=2350
+        AuctionService->>PaymentService: chargeWinner(B-7, amount=2350)
+        PaymentService-->>AuctionService: payment_confirmed
+
+        AuctionService->>NotificationService: notifyWinner(B-7, auction=A-100)
+        NotificationService-->>Winner: "Congratulations! You won A-100 for $2,350"
+
+        AuctionService->>NotificationService: notifySeller(seller_id)
+        NotificationService-->>Seller: "Your item sold for $2,350! Ship within 3 days"
+    else Reserve not met
+        AuctionService->>PostgreSQL: UPDATE auction SET status=RESERVE_NOT_MET
+        AuctionService->>NotificationService: notify all
+        NotificationService-->>Winner: "Reserve not met. Auction ended without sale."
+        NotificationService-->>Seller: "Reserve not met. Consider relisting."
+    end
+
+    AuctionService->>Redis: DEL auction:A-100:* (cleanup active state)
+```
+
+## 13. Caching Strategy
+
+### 13.1 Cache Layers
+| Data | Cache | TTL | Invalidation |
+|------|-------|-----|-------------|
+| Active auction state | Redis (primary) | No TTL (source of truth during auction) | Explicit on close |
+| Auction catalog/search | Elasticsearch | N/A | On new listing |
+| Bid history | Redis Sorted Set | Auction duration + 1h | On auction close |
+| User watchlist | Redis Set | 24h | On bid/close events |
+| Auction images | CDN (CloudFront) | 7 days | Version in URL |
+| Completed auction results | Redis | 1h, then DB only | N/A |
+
+### 13.2 Real-Time Bid State (Redis as Primary)
+```
+# During active auction, Redis IS the source of truth for current bid
+# PostgreSQL is the durable audit log (async write-behind)
+
+auction:A-100:current_bid    → {amount: 2350, bidder: B-7, ts}
+auction:A-100:status         → ACTIVE | CLOSING | CLOSED
+auction:A-100:end_time       → 1709856000 (unix timestamp)
+auction:A-100:history        → Sorted Set (score=amount, value=bid_id)
+auction:A-100:watchers       → Set of user_ids (for broadcast)
+```
+
+### 13.3 Anti-Sniping Cache Extension
+```python
+def on_bid_placed(auction_id, bid_time):
+    end_time = redis.get(f"auction:{auction_id}:end_time")
+    remaining = end_time - bid_time
+    
+    if remaining < 120:  # Less than 2 min remaining
+        new_end = bid_time + 120  # Extend by 2 min
+        redis.set(f"auction:{auction_id}:end_time", new_end)
+        broadcast(auction_id, {"event": "time_extended", "new_end": new_end})
+```
+
+## 14. Infrastructure & Deployment
+
+### 14.1 Compute & Storage
+| Layer | Technology | Spec |
+|-------|-----------|------|
+| WebSocket | API Gateway WebSocket | 500K concurrent connections |
+| Application | EKS | Bid service: 20 pods, auction service: 10 pods |
+| Real-time State | Redis Cluster | 6 shards, sub-ms bid validation |
+| Durable Store | PostgreSQL (Aurora) | Multi-AZ, audit-grade durability |
+| Event Bus | Kafka | 6 brokers, exactly-once for bid events |
+| Search | Elasticsearch | Auction discovery + filtering |
+| CDN | CloudFront | Item images, static auction pages |
+
+### 14.2 Performance Requirements
+- **Bid latency**: < 50ms (placement to broadcast)
+- **Concurrent auctions**: 100,000 active simultaneously
+- **Bids/second**: 50,000 peak (popular auction endings)
+- **WebSocket fan-out**: < 100ms to all watchers of an auction
+- **Clock sync**: NTP across all nodes (±10ms for fair auction close)
+
+### 14.3 High Availability
+- **Redis**: Cluster mode with automatic failover (< 5s)
+- **WebSocket**: Sticky sessions with re-connect logic in client
+- **Auction close**: Scheduled via distributed lock (ShedLock) — exactly-once guarantee
+- **Multi-AZ**: All components span 3 AZs, survive single AZ failure

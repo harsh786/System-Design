@@ -52,6 +52,110 @@
 
 ## 4. Data Modeling
 
+## 4. Data Modeling
+
+### Entity-Relationship Diagram
+
+```mermaid
+erDiagram
+    investors ||--o{ sips : "creates"
+    investors ||--o{ orders : "places"
+    investors ||--o{ holdings : "owns"
+    investors ||--o{ mandates : "authorizes"
+    fund_schemes ||--o{ nav_history : "priced daily"
+    fund_schemes ||--o{ sips : "invests in"
+    fund_schemes ||--o{ orders : "for"
+    sips ||--o{ sip_executions : "executed as"
+    sips }o--|| mandates : "debits via"
+    orders ||--o| holdings : "updates"
+    holdings ||--o{ transaction_lots : "tracked as"
+    investors ||--o{ goals : "maps to"
+    sips }o--o| goals : "linked to"
+
+    fund_schemes {
+        UUID scheme_id PK
+        VARCHAR scheme_code
+        VARCHAR scheme_name
+        VARCHAR category
+        VARCHAR plan_type
+        DECIMAL expense_ratio
+        DECIMAL min_sip_amount
+    }
+    investors {
+        UUID investor_id PK
+        VARCHAR pan
+        VARCHAR name
+        VARCHAR kyc_status
+        VARCHAR risk_profile
+    }
+    sips {
+        UUID sip_id PK
+        UUID investor_id FK
+        UUID scheme_id FK
+        UUID mandate_id FK
+        DECIMAL amount
+        VARCHAR frequency
+        INTEGER sip_date
+        VARCHAR status
+        DATE next_execution_date
+    }
+    mandates {
+        UUID mandate_id PK
+        UUID investor_id FK
+        VARCHAR mandate_type
+        DECIMAL max_amount
+        VARCHAR status
+        VARCHAR umrn
+    }
+    orders {
+        UUID order_id PK
+        UUID investor_id FK
+        UUID scheme_id FK
+        UUID sip_id FK
+        VARCHAR order_type
+        DECIMAL amount
+        DECIMAL allotment_units
+        VARCHAR status
+    }
+    holdings {
+        UUID holding_id PK
+        UUID investor_id FK
+        UUID scheme_id FK
+        DECIMAL units
+        DECIMAL invested_amount
+        DECIMAL current_value
+        DECIMAL xirr
+    }
+    transaction_lots {
+        UUID lot_id PK
+        UUID holding_id FK
+        UUID order_id FK
+        DATE purchase_date
+        DECIMAL purchase_nav
+        DECIMAL remaining_units
+    }
+    nav_history {
+        BIGSERIAL nav_id PK
+        UUID scheme_id FK
+        DATE nav_date
+        DECIMAL nav
+    }
+    goals {
+        UUID goal_id PK
+        UUID investor_id FK
+        VARCHAR goal_name
+        DECIMAL target_amount
+        DATE target_date
+    }
+    sip_executions {
+        UUID execution_id PK
+        UUID sip_id FK
+        DATE execution_date
+        DECIMAL amount
+        VARCHAR status
+    }
+```
+
 ### Full Database Schemas
 
 ```sql
@@ -878,3 +982,84 @@ alerts:
 | NAV source | AMFI daily file | AMC direct feed | Standardized, all schemes in one feed |
 | XIRR calculation | Server-side (scipy) | Client-side (JS) | Accuracy, large portfolios |
 | Portfolio storage | Materialized holdings table | Event-sourced (recompute from orders) | Read performance for 500K concurrent |
+
+---
+
+## 12. Sequence Diagrams
+
+### Diagram 1: SIP Execution on Trigger Date
+
+```mermaid
+sequenceDiagram
+    participant Cron as SIP Scheduler
+    participant Engine as SIP Engine
+    participant DB as SIP DB
+    participant Mandate as NACH/Autopay
+    participant Bank as Investor's Bank
+    participant Order as Order Service
+    participant BSE as BSE StAR MF
+    participant Kafka as Event Bus
+    participant Notify as Notification
+
+    Cron->>Engine: Trigger SIP batch (date=5th of month, batch_id=SIP_2024_01_05)
+    Engine->>DB: SELECT active SIPs WHERE trigger_date=5
+    DB-->>Engine: 200,000 SIPs to execute
+    
+    loop For each SIP (parallelized, idempotent on sip_id + month)
+        Engine->>DB: CHECK: Already executed this month? (idem: sip_001_2024_01)
+        DB-->>Engine: NOT EXECUTED
+        Engine->>Mandate: Debit ₹5000 from investor bank (mandate_ref=NACH_001)
+        Mandate->>Bank: NACH debit presentation
+        Bank-->>Mandate: Debit successful (UTR=NACH_789)
+        Mandate-->>Engine: Payment collected (₹5000)
+        
+        Engine->>Order: Place purchase order (scheme=AXIS_BLUECHIP, amount=5000)
+        Order->>BSE: Submit order via StAR MF API (idem_key=sip_001_2024_01)
+        BSE-->>Order: Order accepted (order_id=BSE_456, status=PENDING_ALLOTMENT)
+        Order-->>Engine: Order placed
+        
+        Engine->>DB: UPDATE sip_execution SET status=ORDER_PLACED, order_id=BSE_456
+        Engine->>Kafka: Publish sip.executed {sip_id, amount, order_id}
+    end
+    
+    Kafka-->>Notify: Send execution confirmations to investors
+
+    Note over Cron,Notify: If bank debit fails (insufficient funds): retry on date+3.<br/>If 3 consecutive failures: pause SIP, alert investor.<br/>Idempotency ensures re-running batch doesn't double-invest.
+```
+
+### Diagram 2: NAV-Based Unit Allocation
+
+```mermaid
+sequenceDiagram
+    participant AMC as AMC/RTA
+    participant NAV as NAV Service
+    participant DB as Fund DB
+    participant Alloc as Allocation Engine
+    participant Holdings as Holdings Store
+    participant Kafka as Event Bus
+    participant Investor as Investor App
+
+    AMC->>NAV: Publish NAV (scheme=AXIS_BLUECHIP, date=2024-01-05, nav=45.67)
+    Note over AMC,NAV: NAV published by 11 PM on T day (SEBI regulation)
+    NAV->>DB: INSERT nav_history (scheme, date, nav=45.67)
+    NAV->>Kafka: Publish nav.published {scheme, date, nav}
+    
+    Kafka->>Alloc: Process pending orders for this scheme+date
+    Alloc->>DB: SELECT orders WHERE scheme=AXIS_BLUECHIP AND date=2024-01-05 AND status=PENDING
+    DB-->>Alloc: 5,000 orders (total_amount=₹2.5Cr)
+    
+    loop For each order (atomic per order)
+        Alloc->>Alloc: Calculate units = amount / NAV = 5000 / 45.67 = 109.478 units
+        Alloc->>Alloc: Apply: entry_load=0%, stamp_duty=0.005%
+        Alloc->>Alloc: Effective amount = 5000 - 0.25 (stamp duty) = 4999.75
+        Alloc->>Alloc: Final units = 4999.75 / 45.67 = 109.473 units
+        
+        Alloc->>Holdings: UPDATE holdings (investor, scheme, +109.473 units)
+        Alloc->>DB: UPDATE order SET status=ALLOTTED, units=109.473, nav=45.67
+    end
+    
+    Alloc->>Kafka: Publish allotment.completed {batch: 5000 orders, date: 2024-01-05}
+    Kafka-->>Investor: Push: "SIP: 109.47 units of Axis Bluechip allotted @ NAV ₹45.67"
+
+    Note over AMC,Investor: NAV is T-day for equity (if order before 3PM cutoff).<br/>Units computed to 3 decimal places (SEBI standard).<br/>Holdings update is idempotent on order_id (re-allotment impossible).
+```
