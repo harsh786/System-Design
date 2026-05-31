@@ -109,6 +109,7 @@ For: Portfolio building, interview prep, and advanced skills
 | 40 | [End-to-End System Design](./40-end-to-end-system-design/) | How do I design complete AI systems? |
 | 41 | [AI Data Engineering](./41-ai-data-engineering/) | How do I keep AI data fresh and clean? |
 | 42 | [Synthetic Data Generation](./42-synthetic-data-generation/) | How do I generate data for testing and training? |
+| 43 | [RAG Quality at Scale](./43-rag-quality-at-scale/) | How do I scale to millions of docs with zero hallucination? |
 
 ---
 
@@ -116,7 +117,7 @@ For: Portfolio building, interview prep, and advanced skills
 
 | Skill Area | Primary Modules | Supporting Modules |
 |-----------|----------------|-------------------|
-| **RAG Architecture** | 03, 05, 41 | 24, 25, 26, 27 |
+| **RAG Architecture** | 03, 05, 41, 43 | 24, 25, 26, 27 |
 | **Agent Design** | 06, 07, 08, 28 | 37, 23 |
 | **Security** | 13, 14, 33 | 15, 30 |
 | **Production Operations** | 17, 18, 19, 22 | 12, 15, 20 |
@@ -159,6 +160,7 @@ For: Portfolio building, interview prep, and advanced skills
 | "How do I pick the right model?" | 39-model-selection-serving |
 | "How do I keep data fresh?" | 41-ai-data-engineering |
 | "How do I test AI systems?" | 09-evaluation, 42-synthetic-data |
+| "How do I scale RAG to millions with no hallucination?" | 43-rag-quality-at-scale |
 
 ---
 

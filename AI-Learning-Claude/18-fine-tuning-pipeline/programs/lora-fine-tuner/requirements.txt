@@ -1,0 +1,1 @@
+# No external dependencies - simulation uses only stdlib
