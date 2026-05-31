@@ -1,0 +1,46 @@
+NovaTech FlowEngine - API Reference (v3.0)
+
+Authentication:
+All API requests require authentication via Bearer token or API key header.
+Header format: Authorization: Bearer {token} OR X-API-Key: {api_key}
+Tokens expire after 1 hour. Use the /auth/refresh endpoint to get a new token.
+
+Workflows API:
+
+POST /api/v3/workflows
+Create a new workflow. Request body must include: name (string, required), description (string, optional), trigger_type (enum: manual, schedule, webhook, event), and steps (array of step objects).
+Response: 201 Created with workflow object including generated ID.
+
+GET /api/v3/workflows/{id}
+Retrieve a workflow by ID. Returns full workflow definition including steps, triggers, and metadata.
+Response: 200 OK with workflow object. 404 if not found.
+
+PUT /api/v3/workflows/{id}
+Update an existing workflow. Supports partial updates (only send fields to change).
+Note: Updating a published workflow creates a new version. The previous version continues to serve active executions.
+
+DELETE /api/v3/workflows/{id}
+Delete a workflow. Active executions are allowed to complete. Scheduled triggers are cancelled immediately. This action is irreversible. Requires admin or owner permission.
+
+POST /api/v3/workflows/{id}/execute
+Manually trigger a workflow execution. Optional request body can include input parameters as key-value pairs. Returns execution ID for tracking.
+Response: 202 Accepted with execution_id.
+
+Executions API:
+
+GET /api/v3/executions/{id}
+Get execution status and details. Includes: status (pending, running, completed, failed), started_at, completed_at, duration_ms, step_results (array), and error (if failed).
+
+GET /api/v3/workflows/{id}/executions
+List all executions for a workflow. Supports pagination (limit, offset), filtering by status and date range. Default sort: most recent first. Maximum: 100 results per page.
+
+Webhooks API:
+
+POST /api/v3/webhooks
+Register a new webhook endpoint. Configure: url (target URL), events (array of event types to subscribe), secret (for signature verification), active (boolean).
+Supported events: workflow.completed, workflow.failed, execution.started, execution.timeout.
+
+Webhook payloads include HMAC-SHA256 signature in X-FlowEngine-Signature header for verification.
+
+Rate Limiting:
+All endpoints are rate limited. Limits are per API key. Current limits returned in response headers: X-RateLimit-Limit, X-RateLimit-Remaining, X-RateLimit-Reset. Exceeding limits returns 429 Too Many Requests.

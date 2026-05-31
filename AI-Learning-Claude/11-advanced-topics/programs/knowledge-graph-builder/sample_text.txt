@@ -1,0 +1,15 @@
+Nextera Technologies is a mid-size software company founded by Sarah Chen in 2018. The company is headquartered in Austin, Texas and specializes in cloud infrastructure tools.
+
+Sarah Chen previously worked at Google as a Senior Engineer on the Kubernetes team from 2012 to 2017. She holds a PhD in Distributed Systems from MIT, where she studied under Professor James Walker.
+
+Nextera's flagship product is CloudMesh, a service mesh platform that competes with Istio. CloudMesh was initially developed by Marcus Rivera, who serves as CTO. Marcus joined Nextera in 2019 after leaving Amazon Web Services where he led the App Mesh team.
+
+The company raised a Series B round of $45 million in 2022, led by Sequoia Capital. Their Series A of $12 million was led by Andreessen Horowitz in 2020. The current board includes Sarah Chen, Michael Park from Sequoia, and Lisa Wong from Andreessen Horowitz.
+
+Nextera uses a microservices architecture built on Kubernetes. Their infrastructure runs on AWS, with disaster recovery on Google Cloud Platform. They recently partnered with Datadog for observability and PagerDuty for incident management.
+
+In 2023, Nextera acquired SmartRoute, a small startup focused on AI-powered traffic routing. SmartRoute was founded by David Kim, who now leads Nextera's AI division. The acquisition added 15 engineers and key patents in intelligent load balancing.
+
+CloudMesh integrates with major cloud providers including AWS, Azure, and GCP. It supports protocols including gRPC, HTTP/2, and TCP. The platform handles over 2 billion requests per day across its customer base.
+
+Key customers include Stripe (payment processing), Notion (productivity), and Databricks (data analytics). Stripe has been a customer since 2021 and processes their inter-service communication through CloudMesh.

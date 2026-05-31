@@ -1,0 +1,97 @@
+[
+  {
+    "question": "What is the refund policy for annual subscriptions?",
+    "ground_truth": "Annual subscriptions can be refunded within 30 days of purchase. After 30 days, refunds are prorated based on remaining months. No refunds are given after 6 months.",
+    "contexts": [
+      "Our refund policy states that annual subscriptions are eligible for a full refund within 30 days of the initial purchase date.",
+      "After the 30-day window, customers may request a prorated refund calculated based on the number of unused months remaining.",
+      "Please note that no refunds will be issued for annual subscriptions after 6 months from the purchase date."
+    ],
+    "generated_answer": "Annual subscriptions can be fully refunded within 30 days. After that, you can get a prorated refund based on unused months. No refunds are available after 6 months."
+  },
+  {
+    "question": "How do I reset my password?",
+    "ground_truth": "To reset your password, click 'Forgot Password' on the login page, enter your email, and follow the link sent to your inbox. The link expires in 24 hours.",
+    "contexts": [
+      "To reset your password: 1) Go to the login page, 2) Click 'Forgot Password', 3) Enter your registered email address, 4) Check your inbox for the reset link.",
+      "Password reset links are valid for 24 hours. If the link expires, you'll need to request a new one."
+    ],
+    "generated_answer": "Click 'Forgot Password' on the login page, enter your email, and check your inbox for a reset link. The link is valid for 24 hours."
+  },
+  {
+    "question": "What programming languages does the API support?",
+    "ground_truth": "The API has official SDKs for Python, JavaScript/TypeScript, Go, and Java. Community SDKs exist for Ruby, PHP, and C#.",
+    "contexts": [
+      "We provide official SDK support for Python, JavaScript (including TypeScript), Go, and Java.",
+      "Community-maintained SDKs are available for Ruby, PHP, and C#. These are not officially supported but are regularly tested against our API."
+    ],
+    "generated_answer": "The API officially supports Python, JavaScript/TypeScript, Go, and Java. There are also community SDKs for Ruby, PHP, and C#."
+  },
+  {
+    "question": "What is the maximum file upload size?",
+    "ground_truth": "The maximum file upload size is 100MB for standard plans and 500MB for enterprise plans. Files larger than 10MB are processed asynchronously.",
+    "contexts": [
+      "File upload limits: Standard plan - 100MB maximum per file. Enterprise plan - 500MB maximum per file.",
+      "Files exceeding 10MB in size will be processed asynchronously. You'll receive a webhook notification when processing is complete."
+    ],
+    "generated_answer": "The max upload size is 100MB for standard plans and 500MB for enterprise. Files over 10MB are processed asynchronously."
+  },
+  {
+    "question": "How does the billing cycle work?",
+    "ground_truth": "Billing occurs on the first of each month. You're charged based on usage from the previous month. Invoices are sent via email 3 days before the charge.",
+    "contexts": [
+      "All accounts are billed on the 1st of each month for the previous month's usage.",
+      "Invoices are generated and emailed 3 business days prior to the billing date, giving you time to review charges."
+    ],
+    "generated_answer": "You're billed on the 1st of each month for the previous month's usage. Invoices are emailed 3 days before the charge date."
+  },
+  {
+    "question": "Can I use the service in the EU?",
+    "ground_truth": "Yes, we have EU data centers in Frankfurt and Amsterdam. EU customers' data is stored exclusively in EU regions to comply with GDPR.",
+    "contexts": [
+      "We operate data centers in Frankfurt (Germany) and Amsterdam (Netherlands) for our European customers.",
+      "All data for EU-based customers is stored exclusively within EU regions, ensuring full GDPR compliance.",
+      "Our service is available globally with regional data residency options."
+    ],
+    "generated_answer": "Yes, we have EU data centers in Frankfurt and Amsterdam. Your data stays in the EU for GDPR compliance."
+  },
+  {
+    "question": "What authentication methods are supported?",
+    "ground_truth": "We support API keys, OAuth 2.0, and SAML SSO. API keys are recommended for server-to-server communication, OAuth for user-facing apps, and SAML for enterprise SSO.",
+    "contexts": [
+      "Supported authentication methods: API Keys, OAuth 2.0, and SAML-based Single Sign-On (SSO).",
+      "API keys are best for server-to-server integrations. OAuth 2.0 is recommended for applications acting on behalf of users. SAML SSO is available for enterprise customers."
+    ],
+    "generated_answer": "We support API keys (for server-to-server), OAuth 2.0 (for user-facing apps), and SAML SSO (for enterprise). API keys are the simplest option for backend integrations."
+  },
+  {
+    "question": "What happens when I exceed my rate limit?",
+    "ground_truth": "When you exceed the rate limit, you receive a 429 status code. Requests are queued for up to 60 seconds. After that, they're rejected. Rate limits reset every minute.",
+    "contexts": [
+      "Exceeding rate limits returns HTTP 429 (Too Many Requests). Your requests will be automatically queued for up to 60 seconds.",
+      "If the queue is full or 60 seconds pass without capacity, the request is rejected with a 429 error and Retry-After header.",
+      "Rate limits are calculated on a per-minute rolling window basis."
+    ],
+    "generated_answer": "You'll get a 429 error. Requests are queued for up to 60 seconds, then rejected if capacity isn't available. Limits reset per minute."
+  },
+  {
+    "question": "How do I migrate from v1 to v2 of the API?",
+    "ground_truth": "The migration guide covers 3 breaking changes: the auth header changed from X-API-Key to Authorization Bearer, response format changed from XML to JSON, and pagination switched from offset to cursor-based.",
+    "contexts": [
+      "V2 Migration Breaking Changes: 1) Authentication header changed from 'X-API-Key: <key>' to 'Authorization: Bearer <key>'.",
+      "2) All response formats are now JSON (XML responses deprecated). 3) Pagination migrated from offset-based to cursor-based for better performance.",
+      "A migration helper tool is available at /tools/migrate-v1-to-v2 that can automatically update your code."
+    ],
+    "generated_answer": "Three breaking changes in v2: auth header is now 'Authorization: Bearer', responses are JSON only (no more XML), and pagination is cursor-based instead of offset. There's a migration tool available to help."
+  },
+  {
+    "question": "What SLA do you guarantee?",
+    "ground_truth": "We guarantee 99.9% uptime for standard plans and 99.99% for enterprise. Downtime credits are 10x the cost of the downtime period. Scheduled maintenance windows are excluded.",
+    "contexts": [
+      "Service Level Agreement: Standard plans - 99.9% uptime guarantee. Enterprise plans - 99.99% uptime guarantee.",
+      "If we fail to meet the SLA, affected customers receive credits worth 10x the cost of the downtime period.",
+      "Scheduled maintenance windows (announced 72 hours in advance) are excluded from SLA calculations."
+    ],
+    "generated_answer": "Standard plans get 99.9% uptime, enterprise gets 99.99%. If we miss the SLA, you get 10x credits for the downtime period. Scheduled maintenance doesn't count against the SLA."
+  }
+]

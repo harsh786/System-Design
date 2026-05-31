@@ -1,0 +1,21 @@
+NovaTech FlowEngine - Troubleshooting Common Issues
+
+Issue: Workflows not triggering
+Symptoms: Scheduled or event-based workflows are not executing as expected.
+Possible causes: 1) Workflow is in draft mode (must be published), 2) Trigger conditions not met, 3) Integration connection expired, 4) Workflow paused due to billing issue.
+Steps: Check workflow status in dashboard. Verify trigger configuration. Test trigger manually using the "Test" button. Check integration connection health in Settings > Integrations.
+
+Issue: Slow workflow execution
+Symptoms: Workflows taking longer than expected to complete.
+Possible causes: 1) External API latency, 2) Large data volumes being processed, 3) Sequential steps that could be parallelized, 4) Region mismatch between FlowEngine and external services.
+Steps: Check execution timeline in workflow history. Identify slow steps. Consider parallel execution for independent steps. Move workflow to same region as primary integrations.
+
+Issue: Data not syncing between systems
+Symptoms: Changes in one system not reflected in connected system via FlowEngine.
+Possible causes: 1) Webhook delivery failed, 2) Field mapping incorrect, 3) Data transformation error, 4) Destination system rejecting updates due to validation.
+Steps: Check webhook delivery logs. Verify field mappings in the sync step configuration. Check error details in execution history. Test with a single record first.
+
+Issue: Memory exceeded during execution
+Symptoms: Workflow fails with "memory limit exceeded" error.
+Possible causes: 1) Processing very large datasets in a single step, 2) Unbounded loop in workflow logic, 3) Accumulating data across iterations without cleanup.
+Steps: Use pagination for large datasets. Add explicit loop limits. Use the "stream" mode for file processing. Split into sub-workflows for large operations.

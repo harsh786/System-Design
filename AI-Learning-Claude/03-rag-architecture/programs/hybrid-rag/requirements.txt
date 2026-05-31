@@ -1,0 +1,4 @@
+openai
+chromadb
+rank-bm25
+python-dotenv

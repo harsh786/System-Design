@@ -1,0 +1,2 @@
+# No external dependencies - uses only stdlib
+# asyncio (built-in)

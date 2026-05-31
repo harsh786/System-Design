@@ -1,0 +1,23 @@
+NovaTech Solutions - Q4 2023 Company Update
+
+Financial Highlights:
+Q4 2023 revenue reached $22.5 million, bringing full-year 2023 revenue to $78 million. This represents 42% year-over-year growth compared to $55 million in 2022. Net Revenue Retention (NRR) was 135%, indicating strong expansion within existing accounts. The company achieved cash-flow positive status in November 2023.
+
+Customer Metrics:
+Total paying customers: 2,400 (up from 1,800 in Q4 2022). Enterprise customers (>$100K ARR): 85 accounts. Average contract value increased from $28K to $32.5K. Customer churn rate: 4.2% annually (industry average: 7-10%).
+
+Product Updates:
+- FlowEngine v3.0 launched in October with AI-powered workflow suggestions
+- New integrations: SAP, Oracle NetSuite, Microsoft Dynamics 365
+- Performance improvement: 60% reduction in workflow execution latency
+- New feature: Conditional branching with natural language rules
+
+Strategic Priorities for 2024:
+1. International expansion: Open Tokyo office Q2 2024
+2. Enterprise focus: Hire dedicated enterprise sales team
+3. AI features: Launch AI copilot for workflow building
+4. Platform partnerships: Become a Salesforce AppExchange partner
+5. SOC 2 Type II certification: Expected completion Q1 2024
+
+Hiring Plans:
+Plan to grow from 450 to 620 employees by end of 2024. Key hires: VP of Sales (enterprise), Head of AI/ML, Director of Customer Success (EMEA), and 50 additional engineers across all domains.

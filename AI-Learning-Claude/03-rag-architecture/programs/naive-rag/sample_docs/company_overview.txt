@@ -1,0 +1,7 @@
+NovaTech Solutions is a fictional technology company founded in 2019, headquartered in Austin, Texas. The company specializes in building AI-powered workflow automation tools for mid-size enterprises.
+
+NovaTech has approximately 450 employees distributed across three offices: Austin (headquarters, 250 employees), London (120 employees), and Singapore (80 employees). The company operates in a hybrid work model where employees work from office 3 days per week (Tuesday, Wednesday, Thursday) and remotely on Mondays and Fridays.
+
+The company's main product is "FlowEngine," a no-code automation platform that allows business teams to build complex workflows without engineering support. FlowEngine integrates with over 200 third-party applications including Salesforce, HubSpot, Slack, Jira, and Google Workspace.
+
+NovaTech's annual revenue for 2023 was $78 million, representing a 42% year-over-year growth. The company has raised a total of $120 million in funding across Series A ($15M in 2020), Series B ($45M in 2021), and Series C ($60M in 2023). Key investors include Sequoia Capital, Andreessen Horowitz, and Tiger Global.

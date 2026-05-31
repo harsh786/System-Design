@@ -1,0 +1,25 @@
+NovaTech FlowEngine - Error Code Reference
+
+ERROR_CODE_1001: Authentication Failed
+Description: The API key provided is invalid or expired. Ensure your API key is active in Settings > API Keys. If using OAuth, verify the token has not expired.
+Resolution: Generate a new API key from the admin console. If using service accounts, contact your workspace admin.
+
+ERROR_CODE_1002: Rate Limit Exceeded
+Description: You have exceeded your plan's API rate limit. Free tier: 100/min, Professional: 1000/min, Enterprise: 10000/min.
+Resolution: Implement exponential backoff. Check the Retry-After header for wait time. Consider upgrading your plan.
+
+ERROR_CODE_2001: Workflow Execution Timeout
+Description: The workflow did not complete within the maximum execution time (300 seconds for Free, 900 seconds for Professional, 3600 seconds for Enterprise).
+Resolution: Break the workflow into smaller sub-workflows. Optimize slow integration steps. Check if external APIs are responding slowly.
+
+ERROR_CODE_2002: Integration Connection Lost
+Description: Connection to a third-party integration was lost during workflow execution. This may be due to the external service being unavailable.
+Resolution: Check the integration's status page. Re-authenticate the connection in Settings > Integrations. Enable automatic retry in workflow settings.
+
+ERROR_CODE_3001: Data Validation Failed
+Description: Input data did not match the expected schema. The workflow step requires specific field types that were not provided.
+Resolution: Check the step's input schema definition. Use the data transformation step to convert data types before processing.
+
+ERROR_CODE_4001: Insufficient Permissions
+Description: The workflow attempted an action that requires higher permission levels. This often occurs when a workflow runs as a user with limited access.
+Resolution: Update the workflow's execution context to use a service account with appropriate permissions. Contact your admin to adjust role assignments.

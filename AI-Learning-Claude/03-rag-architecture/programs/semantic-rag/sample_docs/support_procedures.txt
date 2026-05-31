@@ -1,0 +1,19 @@
+NovaTech Solutions - Customer Support Procedures
+
+Ticket Priority System:
+- P1 (Critical): Production system down, all users affected. Response time: 15 minutes. Resolution target: 4 hours.
+- P2 (High): Major feature broken, workaround exists. Response time: 1 hour. Resolution target: 8 hours.
+- P3 (Medium): Non-critical bug, limited impact. Response time: 4 hours. Resolution target: 48 hours.
+- P4 (Low): Feature request or minor cosmetic issue. Response time: 24 hours. Resolution target: best effort.
+
+Escalation Procedures:
+Level 1 support handles initial triage and known issues using the runbook. If unresolved within 30 minutes, escalate to Level 2 (senior support engineers). Level 2 can engage engineering on-call for P1/P2 issues. Customer Success Managers are notified automatically for any P1 affecting enterprise accounts.
+
+Refund and Credit Policy:
+Customers may request a full refund within 30 days of initial purchase. After 30 days, pro-rated refunds are available for annual contracts only. Service credits are issued automatically when SLA is breached: 10% credit for 99.9% to 99.5% uptime, 25% credit for below 99.5% uptime. Credits are applied to the next billing cycle.
+
+SLA Guarantees:
+FlowEngine guarantees 99.9% uptime for Professional plans and 99.95% for Enterprise plans. Scheduled maintenance windows (Sundays 2-4 AM UTC) are excluded from SLA calculations. Status page updates are posted within 5 minutes of any service degradation.
+
+Communication Channels:
+Support is available via: in-app chat (all plans), email support@novatech.io (all plans), phone support (Enterprise only, 24/7), dedicated Slack channel (Enterprise only). Average first response time: 8 minutes for chat, 2 hours for email.

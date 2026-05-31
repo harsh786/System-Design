@@ -1,0 +1,16 @@
+NovaTech Solutions - Security and Compliance Documentation
+
+Access Control:
+All systems use role-based access control (RBAC) with the principle of least privilege. Employee access is provisioned through Okta SSO. Multi-factor authentication (MFA) is mandatory for all employees. Hardware security keys (YubiKey) are required for accessing production systems.
+
+Data Encryption:
+All data is encrypted at rest using AES-256 encryption. Data in transit is protected with TLS 1.3. Database backups are encrypted with customer-specific keys using AWS KMS. API keys are stored in HashiCorp Vault, never in source code or environment variables directly.
+
+Compliance Certifications:
+NovaTech holds SOC 2 Type I certification (achieved Q3 2023). SOC 2 Type II certification is expected Q1 2024. The company is GDPR compliant for EU customers and CCPA compliant for California residents. HIPAA compliance is on the roadmap for Q3 2024 to support healthcare customers.
+
+Incident Response:
+Security incidents are classified into four severity levels. SEV-1 (critical data breach) requires immediate notification to CISO and legal team within 15 minutes. All incidents are documented in the incident management system. Post-incident reviews are conducted within 48 hours. Customer notification occurs within 72 hours for incidents affecting customer data, as required by GDPR.
+
+Penetration Testing:
+External penetration testing is conducted quarterly by an independent security firm. Internal red team exercises occur monthly. Bug bounty program launched in 2023 with rewards ranging from $500 to $25,000 depending on severity. All critical and high findings must be remediated within 14 days.

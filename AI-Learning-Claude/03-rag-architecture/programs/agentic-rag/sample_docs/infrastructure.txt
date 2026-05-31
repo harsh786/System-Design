@@ -1,0 +1,16 @@
+NovaTech FlowEngine - Deployment and Infrastructure
+
+Production Environment:
+FlowEngine's production infrastructure runs on AWS across three regions: us-east-1 (primary), eu-west-1, and ap-southeast-1. The platform uses Amazon EKS (Kubernetes) for container orchestration with auto-scaling groups that handle between 50 and 500 pods depending on load. Average daily request volume is 45 million API calls with peak hours seeing 3x normal traffic.
+
+Database Architecture:
+Primary data store is Amazon Aurora PostgreSQL (version 15.4) with read replicas in each region. Write operations go to the primary in us-east-1 with replication lag typically under 50ms. Redis clusters handle caching and session storage with 99.99% hit rate for frequently accessed workflows. ClickHouse is used for analytics and execution history queries, handling over 2 billion rows of execution data.
+
+Deployment Process:
+Deployments use a blue-green strategy with ArgoCD managing Kubernetes manifests. The deployment pipeline: code merge to main → automated tests (unit, integration, e2e) → build container image → deploy to staging → automated smoke tests → canary release (5% traffic) → gradual rollout over 30 minutes → full deployment. Rollback is automatic if error rate exceeds 0.1% during canary phase.
+
+Disaster Recovery:
+RTO (Recovery Time Objective): 4 hours for full region failure. RPO (Recovery Point Objective): 1 hour (point-in-time recovery from database backups). Automated failover to eu-west-1 if us-east-1 becomes unavailable. Database backups occur every hour with daily full backups retained for 30 days. Disaster recovery drills are conducted quarterly.
+
+Monitoring and Alerting:
+Full observability stack includes Datadog for metrics and APM, PagerDuty for incident management, and Sentry for error tracking. Key SLIs: API latency p99 < 500ms, error rate < 0.1%, workflow execution success rate > 99.5%. On-call engineers are alerted within 30 seconds of SLI breach.

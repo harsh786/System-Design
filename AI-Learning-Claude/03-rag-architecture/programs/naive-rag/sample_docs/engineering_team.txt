@@ -1,0 +1,27 @@
+NovaTech Solutions - Engineering Team Structure and Practices
+
+Engineering Organization:
+The engineering team consists of 180 engineers organized into 6 domains:
+- Platform (45 engineers): Core infrastructure, deployment, reliability
+- Integrations (35 engineers): Third-party connectors, API management
+- Workflow Engine (30 engineers): Core execution engine, scheduling
+- Frontend (25 engineers): Visual builder, dashboard, admin console
+- Data & Analytics (25 engineers): Metrics, reporting, ML features
+- Security (20 engineers): Authentication, encryption, compliance
+
+Tech Stack:
+- Backend: Go (primary), Python (ML services), Node.js (integration adapters)
+- Frontend: React, TypeScript, TailwindCSS
+- Databases: PostgreSQL (primary), Redis (caching), ClickHouse (analytics)
+- Infrastructure: AWS, Kubernetes, Terraform, ArgoCD
+- Observability: Datadog, PagerDuty, Sentry
+
+Engineering Levels:
+- L1 (Junior Engineer): 0-2 years experience, $95K-$120K base salary
+- L2 (Mid-Level Engineer): 2-4 years, $120K-$155K base salary
+- L3 (Senior Engineer): 4-7 years, $155K-$195K base salary
+- L4 (Staff Engineer): 7-10 years, $195K-$240K base salary
+- L5 (Principal Engineer): 10+ years, $240K-$300K base salary
+
+On-Call Policy:
+Each domain maintains a weekly on-call rotation. On-call engineers receive a $500 weekly stipend plus $200 per incident responded to outside business hours. Escalation path: On-call engineer → Team Lead → Engineering Manager → VP of Engineering. P1 incidents require response within 15 minutes. P2 within 1 hour. P3 within 4 hours.

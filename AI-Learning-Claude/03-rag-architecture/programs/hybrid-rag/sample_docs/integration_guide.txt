@@ -1,0 +1,16 @@
+NovaTech FlowEngine - Integration Guide
+
+Salesforce Integration:
+Connect FlowEngine to Salesforce using OAuth 2.0. Navigate to Settings > Integrations > Add New > Salesforce. You will be redirected to Salesforce login. Grant the requested permissions. Once connected, you can trigger workflows on Salesforce events: new lead, opportunity stage change, case creation, etc.
+
+Slack Integration:
+Install the FlowEngine Slack app from the Slack App Directory or via Settings > Integrations > Slack. The integration supports: sending messages to channels, creating channels, posting interactive messages with buttons, and listening for slash commands. Webhook URL format: https://hooks.flowengine.io/slack/{workspace_id}/{channel_id}.
+
+Database Connectors:
+FlowEngine supports direct connections to PostgreSQL, MySQL, MongoDB, and Redis. Connection strings are encrypted and stored securely. Query results can trigger workflows or be used as workflow step inputs. Maximum query result size: 10MB. Query timeout: 30 seconds.
+
+Webhook Triggers:
+Create incoming webhooks to trigger workflows from any external system. Each webhook gets a unique URL: https://api.flowengine.io/webhooks/{workflow_id}. Webhooks support JSON and form-encoded payloads. IP allowlisting available on Enterprise plans. Webhook delivery is guaranteed with automatic retry (3 attempts with exponential backoff).
+
+Custom API Integration:
+For services without pre-built connectors, use the HTTP Request step. Supports GET, POST, PUT, PATCH, DELETE methods. Headers, query parameters, and request body are fully configurable. Response parsing supports JSONPath for extracting specific fields. Authentication options: API key, Bearer token, OAuth 2.0, Basic Auth.

@@ -1,0 +1,23 @@
+FlowEngine Product Documentation - Technical Overview
+
+FlowEngine Architecture:
+FlowEngine is built on a microservices architecture deployed on AWS. The core components include:
+- Workflow Engine: Orchestrates workflow execution using an event-driven architecture
+- Integration Hub: Manages connections to 200+ third-party applications via REST APIs and webhooks
+- Visual Builder: A React-based drag-and-drop interface for workflow creation
+- Analytics Dashboard: Real-time monitoring of workflow performance and success rates
+
+API Rate Limits:
+- Free tier: 100 API calls per minute, 10,000 per day
+- Professional tier: 1,000 API calls per minute, 100,000 per day
+- Enterprise tier: 10,000 API calls per minute, unlimited per day
+- Rate limit responses return HTTP 429 with a Retry-After header
+
+Authentication:
+FlowEngine uses OAuth 2.0 for API authentication. API keys are generated in the admin console under Settings > API Keys. Each key has configurable scopes: read, write, execute, and admin. Keys can be rotated without downtime using the dual-key rotation feature.
+
+Data Retention:
+Workflow execution logs are retained for 90 days on Professional plans and 365 days on Enterprise plans. Raw data processed by workflows is not stored by FlowEngine beyond the execution window (maximum 24 hours). Customers can configure custom retention policies through the admin console.
+
+Supported Regions:
+FlowEngine is available in US-East (Virginia), US-West (Oregon), EU-West (Ireland), EU-Central (Frankfurt), and AP-Southeast (Singapore). Data residency can be configured per workspace to comply with GDPR and other regional regulations.

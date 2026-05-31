@@ -1,0 +1,51 @@
+# NovaTech FlowEngine - Complete Administration Guide
+
+## Chapter 1: User Management
+
+### Adding New Users
+To add a new user, navigate to Admin Console > Users > Add User. Enter the user's email address and select their role. Available roles are: Viewer (can view workflows but not edit), Editor (can create and edit workflows), Admin (full access including settings), and Super Admin (can manage billing and delete workspace). New users receive an email invitation that expires after 7 days. If the invitation expires, the admin must resend it manually.
+
+### Managing User Roles
+Role changes take effect immediately. When demoting a user from Admin to Editor, they lose access to Settings, Billing, and User Management sections. Any workflows they created remain accessible. When a user is removed from the workspace, their workflows are reassigned to the workspace admin by default. You can configure an alternative assignee in Settings > Defaults > Workflow Ownership.
+
+### Single Sign-On (SSO)
+Enterprise plans support SAML 2.0 SSO with providers including Okta, Azure AD, Google Workspace, and OneLogin. SSO configuration requires: Identity Provider metadata URL, Entity ID, and Assertion Consumer Service URL. Once SSO is enabled, password-based login is disabled for all users except the Super Admin (break-glass access). Just-in-time (JIT) provisioning automatically creates accounts when users first authenticate via SSO.
+
+### Audit Logging
+All user actions are logged in the audit trail. Logs include: who performed the action, what action was performed, when it occurred, and the IP address. Audit logs are retained for 1 year on Enterprise plans. Logs can be exported to SIEM systems via the Audit API or Splunk/Datadog integrations. Sensitive actions (user deletion, role changes, API key creation) trigger real-time alerts to Super Admins.
+
+## Chapter 2: Workspace Configuration
+
+### Workspace Settings
+Each workspace operates as an isolated environment with its own users, workflows, integrations, and billing. Organizations can create multiple workspaces for different teams or environments (development, staging, production). Cross-workspace workflow references are supported on Enterprise plans using workspace federation.
+
+### Environment Variables
+Store sensitive configuration (API keys, database URLs) as workspace environment variables. Variables are encrypted at rest and injected into workflow execution context. Variable naming convention: uppercase with underscores (e.g., SALESFORCE_API_KEY). Variables can be marked as "secret" which hides their values in the UI and logs.
+
+### IP Allowlisting
+Enterprise plans can restrict API access to specific IP ranges. Configure allowed IPs in Settings > Security > IP Allowlist. Changes take effect within 5 minutes. At least one IP must always be allowlisted to prevent lockout. The admin console is accessible from any IP regardless of allowlist settings (to prevent permanent lockout).
+
+### Custom Domains
+Enterprise customers can configure custom domains for their webhook URLs. Instead of https://api.flowengine.io/webhooks/{id}, webhooks can use https://workflows.yourcompany.com/{id}. Setup requires: DNS CNAME record pointing to flowengine-proxy.io, SSL certificate (auto-provisioned via Let's Encrypt), and verification of domain ownership.
+
+## Chapter 3: Billing and Plans
+
+### Plan Comparison
+Free plan: 5 workflows, 100 executions/day, 2 users, community support. Professional plan ($49/user/month): unlimited workflows, 10,000 executions/day, priority email support, 90-day log retention. Enterprise plan (custom pricing): unlimited everything, dedicated support, 365-day retention, SSO, SLA guarantees, custom contracts.
+
+### Billing Management
+Billing is managed at the workspace level. Payment methods accepted: credit card (Visa, Mastercard, Amex), ACH bank transfer (US only), wire transfer (Enterprise only). Invoices are generated monthly on the account anniversary date. Overdue payments: first notice at 7 days, service degradation warning at 14 days, read-only mode at 30 days, workspace suspension at 45 days.
+
+### Usage-Based Pricing
+Beyond plan limits, additional executions are billed at: $0.01 per execution (Professional), custom rates (Enterprise). Overage charges are included in the next monthly invoice. Usage dashboards show real-time consumption against plan limits. Alerts can be configured at 75%, 90%, and 100% of plan limits.
+
+## Chapter 4: Security Configuration
+
+### API Key Management
+API keys are created in Settings > API Keys. Each key has: a name (for identification), scopes (read, write, execute, admin), expiration (optional), and IP restrictions (optional). Keys can be rotated without downtime: create new key, update applications, delete old key. The dual-key rotation feature allows both old and new keys to work simultaneously for 24 hours during rotation.
+
+### Data Encryption
+All customer data is encrypted at rest using AES-256. Encryption keys are managed via AWS KMS. Enterprise customers can provide their own encryption keys (BYOK/CMK). Data in transit uses TLS 1.3 exclusively. Database connections from FlowEngine to customer databases require SSL/TLS.
+
+### Compliance Controls
+For regulated industries, enable compliance mode in Settings > Security > Compliance. This enforces: mandatory MFA for all users, 90-day password rotation, session timeout after 30 minutes of inactivity, disabled data export features, and enhanced audit logging. Compliance mode cannot be disabled once enabled without contacting support.

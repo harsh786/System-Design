@@ -1,0 +1,16 @@
+NovaTech Solutions - Company Policies and Guidelines
+
+Work From Anywhere (WFA) Policy:
+Employees may work from any location for up to 4 weeks per calendar year. Requests must be submitted 2 weeks in advance via the HR portal. International WFA requires additional approval from Legal due to tax implications. WFA is not available during company-wide mandatory in-office weeks (typically 2 per quarter). Time zone overlap requirement: employees must be available during at least 4 hours of their team's core hours (10 AM - 3 PM team local time).
+
+Expense Policy:
+Business expenses are reimbursed within 14 business days of submission. Receipts required for all expenses over $25. Pre-approval required for: individual expenses over $500, team events over $2,000, travel bookings over $1,500. Home office stipend: $1,000 one-time setup allowance for new employees, plus $100/month ongoing for internet and utilities. Conference attendance: up to 2 conferences per year, maximum $3,000 total including travel.
+
+Performance Review Process:
+Reviews occur twice per year (June and December). Process: self-assessment → peer feedback (3-5 peers) → manager assessment → calibration session → final rating. Rating scale: Exceeds Expectations, Meets Expectations, Needs Improvement, Does Not Meet. Promotion decisions are made during calibration. Compensation adjustments take effect in January (annual review) or July (mid-year review).
+
+Intellectual Property:
+All work produced during employment is owned by NovaTech Solutions. This includes code, designs, documentation, and inventions related to company business. Side projects are permitted if: they don't compete with NovaTech products, don't use company resources, are disclosed to your manager, and are conducted outside working hours. Open source contributions to non-competing projects are encouraged and don't require disclosure.
+
+Code of Conduct:
+NovaTech maintains a zero-tolerance policy for harassment, discrimination, and retaliation. Reports can be made anonymously via the Ethics Hotline (ethics@novatech.io) or directly to HR. All reports are investigated within 5 business days. Violations result in disciplinary action up to and including termination.
