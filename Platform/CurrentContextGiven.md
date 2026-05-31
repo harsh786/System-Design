@@ -1,12 +1,12 @@
   Current context :
-1. Current architecture Diagram
+1. Current architecture Diagram /Users/harsh.kumar01/Documents/dev/plural/Platform/CurrentContextGiven.md
 2. Merchant——>Kong——>OMS——>Postgres DB———>Debizium —firehose(generic consumer by haystack)——>OHS
    3.  OMS——>Nxt internal contract repo is used for having merchant facing contracts
    4. To Storing params in OHS, next msg contract is used which have contracts in proto format
   5.   Scrap all merchant facing contracts from https://developer.pinelabsonline.com/reference/
    6. For more context on merchant facing contract: Fetch it from GitHub https://github.com/Plural-Pvt/plural-nxt-api-contracts-internal
    7. For more context on data save in OHS, protocol contract refer: https://github.com/Plural-Pvt/nxt-message-contracts
-   8. For OMS context refer the : claude.md file https://github.com/Plural-Pvt/nxt_payment_order_service/blob/fab668dd94823978b7322ef0c93bbbaf1f966dac/CLAUDE.md
+   8. For OMS context refer the : /Users/harsh.kumar01/Documents/dev/plural/Platform/CLAUDE.md
 
 Context from Repositories:
 1. OMS: https://github.com/Plural-Pvt/nxt_payment_order_service
