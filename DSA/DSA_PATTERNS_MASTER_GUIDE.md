@@ -6,31 +6,1255 @@
 
 ## TABLE OF CONTENTS
 
-1. [Pattern Selection Decision Tree](#pattern-selection-decision-tree)
-2. [Two Pointers](#1-two-pointers)
-3. [Sliding Window](#2-sliding-window)
-4. [Binary Search](#3-binary-search)
-5. [Dynamic Programming](#4-dynamic-programming)
-6. [Greedy](#5-greedy)
-7. [Backtracking](#6-backtracking)
-8. [Graphs](#7-graphs)
-9. [Trees (Advanced)](#8-trees-advanced)
-10. [Union-Find](#9-union-find)
-11. [Divide and Conquer](#10-divide-and-conquer)
-12. [Bit Manipulation](#11-bit-manipulation)
-13. [Monotonic Stack / Queue](#12-monotonic-stack--queue)
-14. [Heap (Advanced)](#13-heap-advanced)
-15. [Trie (Advanced)](#14-trie-advanced)
-16. [Segment Tree / BIT](#15-segment-tree--bit)
-17. [Topological Sort](#16-topological-sort)
-18. [Shortest Path Algorithms](#17-shortest-path-algorithms)
-19. [Minimum Spanning Tree](#18-minimum-spanning-tree)
-20. [String Matching](#19-string-matching)
-21. [Game Theory](#20-game-theory)
-22. [Design Patterns](#21-design-patterns)
-23. [Concurrency Patterns](#22-concurrency-patterns)
+### Part A: Core Data Structures
+A1. [Arrays](#a1-arrays)
+A2. [Strings](#a2-strings)
+A3. [Hash Table](#a3-hash-table)
+A4. [Linked List](#a4-linked-list)
+A5. [Stack](#a5-stack)
+A6. [Queue](#a6-queue)
+A7. [Heap / Priority Queue](#a7-heap--priority-queue)
+A8. [Trees & BST](#a8-trees--bst)
+A9. [Trie](#a9-trie)
+A10. [Matrix](#a10-matrix)
+
+### Part B: Algorithmic Patterns
+1. [Two Pointers](#1-two-pointers)
+2. [Sliding Window](#2-sliding-window)
+3. [Binary Search](#3-binary-search)
+4. [Dynamic Programming](#4-dynamic-programming)
+5. [Greedy](#5-greedy)
+6. [Backtracking](#6-backtracking)
+7. [Graphs](#7-graphs)
+8. [Union-Find](#9-union-find)
+9. [Divide and Conquer](#10-divide-and-conquer)
+10. [Bit Manipulation](#11-bit-manipulation)
+11. [Monotonic Stack](#12-monotonic-stack)
+12. [Monotonic Queue](#13-monotonic-queue)
+13. [Segment Tree / BIT](#15-segment-tree--bit)
+14. [Topological Sort](#16-topological-sort)
+15. [Shortest Path Algorithms](#17-shortest-path-algorithms)
+16. [Minimum Spanning Tree](#18-minimum-spanning-tree)
+17. [String Matching](#19-string-matching)
+18. [Game Theory](#20-game-theory)
+19. [Design Patterns](#21-design-patterns)
+20. [Concurrency Patterns](#22-concurrency-patterns)
+21. [Prefix Sum](#24-prefix-sum)
+22. [Sweep Line](#25-sweep-line)
+23. [Recursion Patterns](#26-recursion-patterns)
 24. [Advanced Patterns](#23-advanced-patterns)
 25. [Master Cheat Sheet](#master-cheat-sheet)
+
+---
+
+# PART A: CORE DATA STRUCTURES
+
+---
+
+## A1. ARRAYS
+
+### Pattern A1.1: Kadane's Algorithm (Max Subarray Sum)
+
+**Signal:** Find maximum/minimum sum contiguous subarray.
+
+```
+maxSum = curSum = nums[0]
+for i = 1 to n-1:
+    curSum = max(nums[i], curSum + nums[i])   // extend or restart
+    maxSum = max(maxSum, curSum)
+return maxSum
+```
+
+```
+Array:  [-2, 1, -3, 4, -1, 2, 1, -5, 4]
+curSum:  -2  1  -2  4   3  5  6   1  5
+                    ^────────────^
+                    max subarray sum = 6
+
+Variant (Max Product): track both maxProd and minProd (negatives flip)
+  maxHere = max(num, maxHere * num, minHere * num)
+  minHere = min(num, maxHere * num, minHere * num)
+```
+
+**Complexity:** O(n) time, O(1) space
+
+### Pattern A1.2: Prefix Sum + HashMap (Subarray Sum = K)
+
+**Signal:** Count subarrays with exact sum K, sum divisible by K, equal 0s and 1s.
+
+```
+map = {0: 1}     // empty prefix has sum 0
+runningSum = 0, count = 0
+for num in nums:
+    runningSum += num
+    count += map.get(runningSum - k, 0)    // how many prefix sums = runningSum - k?
+    map[runningSum] = map.get(runningSum, 0) + 1
+```
+
+```
+WHY IT WORKS:
+  If prefix[j] - prefix[i] = k, then subarray (i, j] sums to k
+  We look up how many previous prefix sums equal (current - k)
+
+  nums: [1, 1, 1], k = 2
+  prefix: 0, 1, 2, 3
+  at prefix=2: check 2-2=0 → exists (1 time) → count=1
+  at prefix=3: check 3-2=1 → exists (1 time) → count=2
+  Answer: 2 subarrays [1,1]
+```
+
+**Complexity:** O(n) time, O(n) space
+
+### Pattern A1.3: Dutch National Flag (3-Way Partition)
+
+**Signal:** Sort array with 3 distinct values in-place, or partition around pivot.
+
+```
+lo = 0, mid = 0, hi = n-1
+while mid <= hi:
+    if arr[mid] == 0: swap(arr, lo, mid); lo++; mid++
+    elif arr[mid] == 1: mid++
+    else:              swap(arr, mid, hi); hi--
+
+// Invariant: [0..lo-1]=0s | [lo..mid-1]=1s | [mid..hi]=unknown | [hi+1..n-1]=2s
+```
+
+```
+[2, 0, 1, 2, 0, 1]
+ ^lo,mid         ^hi
+Step by step → [0, 0, 1, 1, 2, 2]
+```
+
+**Complexity:** O(n) time, O(1) space
+
+### Pattern A1.4: Boyer-Moore Voting (Majority Element)
+
+**Signal:** Find element appearing > n/2 times. O(1) space.
+
+```
+candidate = null, count = 0
+for num in nums:
+    if count == 0: candidate = num
+    count += (1 if num == candidate else -1)
+return candidate
+
+// Intuition: majority element survives all "cancellations"
+// For > n/3: keep two candidates with two counts
+```
+
+### Pattern A1.5: Cyclic Sort (Missing/Duplicate in [1..n])
+
+**Signal:** Array of length n with values in [1, n], find missing/duplicate.
+
+```
+for i in range(n):
+    while nums[i] != i + 1 and nums[nums[i] - 1] != nums[i]:
+        swap(nums, i, nums[i] - 1)   // put each number in its correct index
+
+// After: nums[i] != i+1 means i+1 is missing, nums[i] is misplaced
+```
+
+**Problems:** First Missing Positive, Find All Duplicates, Find Missing Number
+
+### Pattern A1.6: Interval Merge/Overlap
+
+**Signal:** Merge overlapping intervals, insert interval, find conflicts.
+
+```
+Sort by start time
+merged = [intervals[0]]
+for [start, end] in intervals[1:]:
+    if start <= merged[-1][1]:          // overlaps
+        merged[-1][1] = max(merged[-1][1], end)
+    else:
+        merged.append([start, end])
+
+// Variant: count max overlapping at any point → sweep line (see Pattern 25)
+```
+
+### Pattern A1.7: Rotate Array (Reverse Trick)
+
+```
+Rotate right by k:
+  k = k % n
+  reverse(0, n-1)       // reverse entire
+  reverse(0, k-1)       // reverse first k
+  reverse(k, n-1)       // reverse rest
+
+[1,2,3,4,5,6,7] k=3 → [7,6,5,4,3,2,1] → [5,6,7,4,3,2,1] → [5,6,7,1,2,3,4]
+```
+
+### Pattern A1.8: Two-Pass Left-Right Product
+
+**Signal:** Compute result depending on both left and right context, without division.
+
+```
+Product Except Self:
+  result[i] = leftProduct[i] * rightProduct[i]
+  
+  Optimize to O(1) space:
+  forward pass: result[i] = running product from left
+  backward pass: multiply result[i] by running product from right
+```
+
+---
+
+## A2. STRINGS
+
+### Pattern A2.1: Character Frequency Array
+
+**Signal:** Anagram check, character comparisons, frequency constraints.
+
+```
+int[] freq = new int[26];
+for (char c : s.toCharArray()) freq[c - 'a']++;
+
+// Compare: Arrays.equals(freq1, freq2) for anagram
+// Why not HashMap? Array[26] = no hashing overhead, cache-friendly, constant space
+```
+
+### Pattern A2.2: Palindrome - Expand from Center
+
+**Signal:** Find longest palindromic substring, count palindromes.
+
+```
+for center in 0..n-1:
+    // odd length: expand(center, center)
+    // even length: expand(center, center+1)
+
+expand(l, r):
+    while l >= 0 and r < n and s[l] == s[r]:
+        update answer
+        l--; r++
+```
+
+```
+  "babad"
+   ^ expand(1,1): "aba" ✓
+     ^ expand(2,2): "bab" ✓
+  Longest = 3
+```
+
+**Complexity:** O(n²) time, O(1) space. For O(n): Manacher's algorithm.
+
+### Pattern A2.3: Encode/Decode Strings
+
+**Signal:** Serialize list of strings to single string (handles any chars).
+
+```
+Encode: length + delimiter + string
+  ["hello","world"] → "5#hello5#world"
+
+Decode: read number until '#', extract that many chars, repeat
+```
+
+### Pattern A2.4: Decode Nested Strings (Stack)
+
+**Signal:** Nested patterns like `3[a2[c]]` → "accaccacc"
+
+```
+Stack of (currentString, multiplier):
+  digit → build number
+  '['  → push (current, num) to stack, reset
+  ']'  → pop (prev, num), current = prev + current * num
+  char → append to current
+```
+
+### Pattern A2.5: String Hashing / Comparison
+
+```
+Sorted key:      "eat" → "aet" (for anagram grouping)
+Frequency key:   "eat" → "1a1e1t" (O(n) vs O(n log n))
+Pattern key:     "egg" → "0.1.1" (for isomorphic/word pattern)
+```
+
+### Pattern A2.6: Parentheses Generation
+
+**Signal:** Generate all valid combinations of n pairs.
+
+```
+def generate(open, close, current):
+    if len(current) == 2*n: result.add(current)
+    if open < n: generate(open+1, close, current + "(")
+    if close < open: generate(open, close+1, current + ")")
+
+// Key constraint: close < open (never close before opening)
+// Count: Catalan number C(n) = (2n)! / ((n+1)! * n!)
+```
+
+---
+
+## A3. HASH TABLE
+
+### Pattern A3.1: Complement Lookup (Two Sum)
+
+**Signal:** Find pair with property, one-pass matching.
+
+```
+map = {}
+for i, num in enumerate(nums):
+    complement = target - num
+    if complement in map: return [map[complement], i]
+    map[num] = i
+
+// Key insight: store what you've SEEN, look up what you NEED
+```
+
+### Pattern A3.2: Frequency Counting + Bucket Sort
+
+**Signal:** Top K frequent, sort by frequency.
+
+```
+Step 1: Count frequencies → freq = Counter(nums)
+Step 2: Bucket sort → bucket[count] = [elements with that frequency]
+Step 3: Iterate buckets from high to low → collect K elements
+
+// O(n) time vs O(n log k) with heap
+```
+
+### Pattern A3.3: Group by Computed Key
+
+**Signal:** Group items sharing a property.
+
+```
+map = defaultdict(list)
+for item in items:
+    key = computeKey(item)
+    map[key].append(item)
+
+Keys:
+  Anagrams:    sorted(word) or frequency tuple
+  Isomorphic:  pattern encoding "0.1.1"
+  Word Pattern: "dog cat cat" → "0.1.1"
+```
+
+### Pattern A3.4: Hash as Visited/Cycle Detection
+
+**Signal:** Detect cycle in sequence, happy number.
+
+```
+seen = set()
+while x not in seen:
+    seen.add(x)
+    x = transform(x)
+// x is the cycle entry point
+
+// Alternative: Floyd's tortoise/hare for O(1) space
+```
+
+### Pattern A3.5: Longest Consecutive Sequence
+
+**Signal:** Find longest consecutive sequence in unsorted array. O(n).
+
+```
+numSet = set(nums)
+maxLen = 0
+for num in numSet:
+    if num - 1 not in numSet:       // only start from sequence beginning
+        length = 1
+        while num + length in numSet:
+            length++
+        maxLen = max(maxLen, length)
+```
+
+---
+
+## A4. LINKED LIST
+
+### Pattern A4.1: Fast/Slow Pointer (Floyd's)
+
+**Signal:** Detect cycle, find cycle start, find middle.
+
+```
+CYCLE DETECTION:
+  slow = fast = head
+  while fast and fast.next:
+      slow = slow.next
+      fast = fast.next.next
+      if slow == fast: return true  // cycle!
+
+FIND CYCLE START:
+  After meeting, reset slow = head
+  while slow != fast:
+      slow = slow.next
+      fast = fast.next
+  return slow  // entry point
+
+FIND MIDDLE:
+  slow = fast = head
+  while fast and fast.next:
+      slow = slow.next
+      fast = fast.next.next
+  return slow  // middle (left-middle for even length)
+```
+
+```
+Cycle Detection:
+  1 → 2 → 3 → 4 → 5
+              ↑         ↓
+              └─────────┘
+  slow: 1,2,3,4,5,3,4...
+  fast: 1,3,5,4,3,5,4...
+  Meet at 4 → cycle exists
+```
+
+### Pattern A4.2: Reverse Linked List
+
+**Signal:** Reverse whole list, reverse between positions, reverse in k-groups.
+
+```
+ITERATIVE (most common):
+  prev = null, curr = head
+  while curr:
+      next = curr.next
+      curr.next = prev
+      prev = curr
+      curr = next
+  return prev  // new head
+
+REVERSE BETWEEN [left, right]:
+  1. Advance to position left-1 (connection point)
+  2. Reverse the sublist from left to right
+  3. Reconnect: before.next.next = after, before.next = newHead
+```
+
+```
+  null ← 1 ← 2 ← 3    prev=3 (new head)
+  
+  Reverse k-group:
+  [1→2→3] → [4→5→6] → [7→8]
+  [3→2→1] → [6→5→4] → [7→8]  (last group < k stays)
+```
+
+### Pattern A4.3: Merge Sorted Lists
+
+```
+MERGE TWO:
+  dummy = ListNode(0), tail = dummy
+  while l1 and l2:
+      if l1.val <= l2.val: tail.next = l1; l1 = l1.next
+      else: tail.next = l2; l2 = l2.next
+      tail = tail.next
+  tail.next = l1 or l2
+  return dummy.next
+
+MERGE K (Divide & Conquer or Heap):
+  D&C: pair-wise merge, halving count each round → O(N log k)
+  Heap: push head of each list, pop min, push its next → O(N log k)
+```
+
+### Pattern A4.4: Dummy Head Technique
+
+**Signal:** When head might change (deletion, insertion, partition).
+
+```
+dummy = ListNode(0)
+dummy.next = head
+// operate with prev = dummy
+return dummy.next  // real head
+```
+
+**Always use dummy when:** removing nodes, partitioning, merging.
+
+### Pattern A4.5: Nth from End (Two Pointers with Gap)
+
+```
+fast = head
+for i in range(n): fast = fast.next   // advance fast by n
+slow = head
+while fast.next:
+    slow = slow.next
+    fast = fast.next
+// slow is at (n+1)th from end → slow.next is target
+```
+
+### Pattern A4.6: Reorder / Interleave
+
+**Signal:** L0→Ln→L1→Ln-1→... or odd-even split.
+
+```
+1. Find middle (fast/slow)
+2. Reverse second half
+3. Interleave/merge both halves
+
+1→2→3→4→5  →  1→5→2→4→3
+```
+
+### Pattern A4.7: Copy List with Random Pointer
+
+```
+Approach 1: HashMap (O(n) space)
+  map[original] = clone
+  Two passes: create nodes, wire next/random
+
+Approach 2: Interleave (O(1) space)
+  1→1'→2→2'→3→3'  (insert clone after each original)
+  Wire random: clone.random = original.random.next
+  Separate lists
+```
+
+---
+
+## A5. STACK
+
+### Pattern A5.1: Bracket Matching / Validation
+
+**Signal:** Valid parentheses, matching delimiters, nested structures.
+
+```
+map = {')':'(', ']':'[', '}':'{'}
+stack = []
+for c in s:
+    if c in "({[":
+        stack.push(c)
+    else:
+        if not stack or stack[-1] != map[c]: return false
+        stack.pop()
+return stack.isEmpty()
+```
+
+### Pattern A5.2: Monotonic Stack (Next Greater/Smaller)
+
+**Signal:** Next greater element, daily temperatures, stock span, largest rectangle.
+
+```
+NEXT GREATER ELEMENT:
+  stack = []  // indices, maintaining DECREASING values
+  result = [-1] * n
+  for i in range(n):
+      while stack and nums[i] > nums[stack[-1]]:
+          result[stack.pop()] = nums[i]   // found next greater
+      stack.push(i)
+```
+
+```
+nums:   [2, 1, 2, 4, 3]
+stack:  [0]           → push 2
+        [0,1]         → push 1 (1<2, no pop)
+        [2]           → 2≥1 pop→ans[1]=2; 2≥2 pop→ans[0]=2; push
+        [3]           → 4>2 pop→ans[2]=4; push 4
+        [3,4]         → 3<4, push
+result: [2, 2, 4, -1, -1]
+
+VARIANTS:
+  Next Smaller: maintain INCREASING stack
+  Previous Greater: iterate left to right, check stack top
+  Circular: iterate 2*n with i%n
+```
+
+### Pattern A5.3: Largest Rectangle in Histogram
+
+**Signal:** Largest rectangular area in histogram bars.
+
+```
+stack = [-1]  // sentinel for width calculation
+maxArea = 0
+for i in range(n + 1):
+    h = heights[i] if i < n else 0    // sentinel bar of height 0
+    while stack[-1] != -1 and h <= heights[stack[-1]]:
+        height = heights[stack.pop()]
+        width = i - stack[-1] - 1      // between current and new top
+        maxArea = max(maxArea, height * width)
+    stack.append(i)
+
+// Extension: Maximal Rectangle in 2D matrix
+//   For each row, compute histogram heights, apply this algorithm
+```
+
+```
+heights: [2, 1, 5, 6, 2, 3]
+
+  6 █
+  5 █ █
+  3 █ █     █
+  2 █ █ █ █ █ █
+  1 █ █ █ █ █ █
+    ─────────────
+    2 1 5 6 2 3
+    
+  Largest rectangle: 5*2 = 10 (columns 2-3, height 5)
+```
+
+### Pattern A5.4: Expression Evaluation (Calculator)
+
+**Signal:** Parse arithmetic with +,-,*,/,() and evaluate.
+
+```
+BASIC CALCULATOR II (no parens):
+  stack = [], num = 0, op = '+'
+  for c in s + '+':             // append dummy operator
+      if c.isdigit(): num = num * 10 + int(c)
+      elif c is operator:
+          if op == '+': stack.push(num)
+          elif op == '-': stack.push(-num)
+          elif op == '*': stack.push(stack.pop() * num)
+          elif op == '/': stack.push(trunc(stack.pop() / num))
+          op = c; num = 0
+  return sum(stack)
+
+WITH PARENTHESES:
+  On '(': push current result and operator, reset
+  On ')': pop and combine
+  OR use recursion: when '(' → recurse, when ')' → return
+```
+
+### Pattern A5.5: Stack for Simulation / Undo
+
+**Signal:** Asteroid collision, backspace compare, undo operations.
+
+```
+ASTEROID COLLISION:
+  stack = []
+  for a in asteroids:
+      alive = true
+      while alive and stack and a < 0 < stack[-1]:
+          if stack[-1] < -a:
+              stack.pop()        // top explodes
+          elif stack[-1] == -a:
+              stack.pop()        // both explode
+              alive = false
+          else:
+              alive = false      // current explodes
+      if alive:
+          stack.push(a)
+```
+
+### Pattern A5.6: Min Stack / Max Stack
+
+**Signal:** O(1) getMin/getMax alongside push/pop.
+
+```
+Approach 1: Two stacks
+  main stack + minStack (tracks min at each height)
+  push(x): push to main; push min(x, minStack.top) to minStack
+  pop(): pop both
+  getMin(): minStack.top
+
+Approach 2: Single stack storing (value, currentMin) tuples
+```
+
+### Pattern A5.7: Remove K Digits (Greedy + Stack)
+
+**Signal:** Build smallest/largest number by removing digits.
+
+```
+stack = []
+for digit in num:
+    while k > 0 and stack and stack[-1] > digit:
+        stack.pop(); k--       // remove larger digits
+    stack.push(digit)
+// remove remaining k from end
+// strip leading zeros
+```
+
+---
+
+## A6. QUEUE
+
+### Pattern A6.1: BFS Level-Order Processing
+
+**Signal:** Process graph/tree level by level, shortest path in unweighted graph.
+
+```
+queue = deque([start])
+visited = {start}
+level = 0
+while queue:
+    size = len(queue)              // CRITICAL: snapshot current level size
+    for _ in range(size):
+        node = queue.popleft()
+        process(node)
+        for neighbor in adj(node):
+            if neighbor not in visited:
+                visited.add(neighbor)
+                queue.append(neighbor)
+    level++
+```
+
+### Pattern A6.2: Multi-Source BFS
+
+**Signal:** Propagation from multiple starting points simultaneously.
+
+```
+queue = deque()
+for source in all_sources:
+    queue.append((source, 0))
+    visited.add(source)
+// BFS as normal — all sources expand simultaneously at same "level"
+
+// Key insight: instead of BFS from each source separately (expensive),
+// put ALL sources in queue at start → one BFS handles everything
+```
+
+**Problems:** Rotting Oranges, Walls and Gates, 01 Matrix, Surrounded Regions
+
+### Pattern A6.3: Monotonic Deque (Sliding Window Max/Min)
+
+**Signal:** Maximum/minimum in every sliding window of size k.
+
+```
+deque = []  // stores INDICES, front = index of maximum in window
+result = []
+for i in range(n):
+    // 1. Remove out-of-window from front
+    while deque and deque[0] <= i - k:
+        deque.popleft()
+    // 2. Remove smaller elements from back (they'll never be max)
+    while deque and nums[deque[-1]] <= nums[i]:
+        deque.pop()
+    // 3. Add current
+    deque.append(i)
+    // 4. Record answer once window is full
+    if i >= k - 1:
+        result.append(nums[deque[0]])
+```
+
+```
+nums: [1, 3, -1, -3, 5, 3, 6, 7], k=3
+deque (values): [3] → [3,-1] → [3,-1,-3] → [5] → [5,3] → [6] → [7]
+results:                  3       3         5      5      6      7
+
+Invariant: deque always DECREASING (front is max, back is recent smaller)
+```
+
+**Complexity:** O(n) time (each element enters/exits deque once), O(k) space
+
+### Pattern A6.4: Circular Queue / Deque
+
+```
+class CircularQueue:
+    arr[capacity], front = 0, rear = -1, size = 0
+    
+    enqueue(x): rear = (rear + 1) % capacity; arr[rear] = x; size++
+    dequeue():  val = arr[front]; front = (front + 1) % capacity; size--
+    isFull():   size == capacity
+    isEmpty():  size == 0
+```
+
+### Pattern A6.5: Queue with Stack Interconversion
+
+```
+QUEUE USING 2 STACKS:
+  push: push to inStack
+  pop:  if outStack empty → pour inStack into outStack (reverses order)
+        pop from outStack
+  
+  Amortized O(1): each element moves at most twice
+
+STACK USING 2 QUEUES:
+  push: enqueue to q2, pour q1 into q2, swap q1/q2
+  pop: dequeue from q1
+```
+
+### Pattern A6.6: Priority Queue as BFS (0-1 BFS, Dijkstra)
+
+```
+0-1 BFS (weights 0 or 1):
+  deque instead of priority queue
+  weight-0 edge → push to FRONT
+  weight-1 edge → push to BACK
+  O(V+E) vs Dijkstra's O((V+E)logV)
+```
+
+---
+
+## A7. HEAP / PRIORITY QUEUE
+
+### Pattern A7.1: Top-K / Kth Largest
+
+**Signal:** Find K largest/smallest/most frequent.
+
+```
+MIN-HEAP OF SIZE K (for Kth largest):
+  for num in stream:
+      heap.push(num)
+      if heap.size > k: heap.pop()   // remove smallest
+  return heap.peek()                  // kth largest = smallest in top-k
+
+WHY MIN-HEAP for Kth LARGEST?
+  Heap maintains K largest elements
+  Smallest of those K = Kth largest
+  
+  Alternative: MAX-HEAP of size (n-k) → pop (n-k) elements
+  Alternative: QuickSelect → O(n) average
+```
+
+### Pattern A7.2: Merge K Sorted Lists/Streams
+
+```
+heap = MinHeap()
+for i, list in enumerate(lists):
+    if list: heap.push((list[0].val, i, list[0]))
+
+while heap:
+    val, listIdx, node = heap.pop()
+    result.append(node)
+    if node.next:
+        heap.push((node.next.val, listIdx, node.next))
+
+Complexity: O(N log k) where N = total elements, k = number of lists
+```
+
+### Pattern A7.3: Two Heaps (Running Median)
+
+**Signal:** Maintain median as elements stream in.
+
+```
+maxHeap (left half - smaller elements)
+minHeap (right half - larger elements)
+
+addNum(x):
+    maxHeap.push(x)
+    minHeap.push(maxHeap.pop())        // ensure all left ≤ all right
+    if minHeap.size > maxHeap.size:
+        maxHeap.push(minHeap.pop())    // keep left ≥ right in size
+
+getMedian():
+    if equal sizes: (maxHeap.peek() + minHeap.peek()) / 2
+    else: maxHeap.peek()               // left heap has extra element
+```
+
+```
+Stream: [5, 2, 8, 1, 9]
+
+  Add 5: maxH=[5], minH=[]          median=5
+  Add 2: maxH=[2], minH=[5]         median=3.5
+  Add 8: maxH=[2,5], minH=[8]       median=5
+  Add 1: maxH=[1,2], minH=[5,8]     median=3.5
+  Add 9: maxH=[1,2,5], minH=[8,9]   median=5
+```
+
+### Pattern A7.4: Greedy Scheduling with Heap
+
+**Signal:** Meeting rooms, task scheduling, CPU scheduling.
+
+```
+MEETING ROOMS II (min rooms needed):
+  Sort meetings by start time
+  Min-heap of end times (tracks when rooms free up)
+  for [start, end] in meetings:
+      if heap and heap[0] <= start:
+          heap.pop()           // reuse freed room
+      heap.push(end)
+  return heap.size              // max concurrent rooms
+
+TASK SCHEDULER:
+  Max-heap of frequencies + cooldown queue
+  Each tick: pop max-freq task, decrement, add to cooldown
+  When cooldown expires: push back to heap
+```
+
+### Pattern A7.5: Lazy Deletion
+
+**Signal:** Need to remove specific elements from heap efficiently.
+
+```
+Instead of expensive heap removal:
+  Mark element as "deleted" in a HashMap/Set
+  On pop: skip any elements that are marked deleted
+
+Usage: Sliding Window Median, dynamic top-K
+```
+
+### Pattern A7.6: Reorganize / Rearrange with Heap
+
+**Signal:** Rearrange array so no two adjacent elements are same.
+
+```
+Max-heap by frequency
+prev = null
+while heap not empty:
+    curr = heap.pop()                  // most frequent available
+    result.append(curr.char)
+    curr.freq--
+    if prev and prev.freq > 0:
+        heap.push(prev)                // push back previous (now eligible)
+    prev = curr
+```
+
+---
+
+## A8. TREES & BST
+
+### Pattern A8.1: DFS Traversals (Pre/In/Post)
+
+```
+PREORDER (Root-L-R):  process BEFORE children → serialize, copy tree
+INORDER (L-Root-R):   BST gives SORTED order → kth smallest, validate
+POSTORDER (L-R-Root): process AFTER children → delete, height, diameter
+
+ITERATIVE INORDER (most common interview variant):
+  stack = [], curr = root
+  while curr or stack:
+      while curr:
+          stack.push(curr)
+          curr = curr.left
+      curr = stack.pop()
+      visit(curr)
+      curr = curr.right
+```
+
+### Pattern A8.2: Tree DP (Diameter, Max Path Sum)
+
+**Signal:** Optimization where answer at node combines subtree results.
+
+```
+TEMPLATE:
+  globalAnswer = initial
+  
+  def dfs(node) → returns value to parent:
+      if not node: return base
+      left = dfs(node.left)
+      right = dfs(node.right)
+      
+      // Update global: uses BOTH branches (path through this node)
+      globalAnswer = max(globalAnswer, combine(left, right, node))
+      
+      // Return to parent: only SINGLE branch (path up through this node)
+      return singleBranch(left, right, node)
+
+DIAMETER:
+  globalAnswer = max(globalAnswer, left + right)  // edges through node
+  return max(left, right) + 1                      // height
+
+MAX PATH SUM:
+  left = max(0, dfs(left))                         // ignore negative paths
+  right = max(0, dfs(right))
+  globalAnswer = max(globalAnswer, left + right + node.val)
+  return max(left, right) + node.val
+```
+
+### Pattern A8.3: Level Order BFS + Variants
+
+```
+STANDARD:
+  queue = [root]
+  while queue:
+      level = []
+      for _ in range(len(queue)):
+          node = queue.popleft()
+          level.append(node.val)
+          if node.left: queue.append(node.left)
+          if node.right: queue.append(node.right)
+      result.append(level)
+
+VARIANTS:
+  Right Side View: take LAST element of each level
+  Zigzag: reverse alternate levels
+  Average of Levels: compute mean per level
+  Largest Value in Each Row: take max per level
+```
+
+### Pattern A8.4: LCA (Lowest Common Ancestor)
+
+```
+GENERAL BINARY TREE:
+  def lca(node, p, q):
+      if not node or node == p or node == q: return node
+      left = lca(node.left, p, q)
+      right = lca(node.right, p, q)
+      if left and right: return node   // split point
+      return left or right
+
+BST (use ordering):
+  if p.val < node.val and q.val < node.val: go left
+  elif p.val > node.val and q.val > node.val: go right
+  else: return node                    // diverge point
+```
+
+### Pattern A8.5: Construct Tree from Traversals
+
+```
+PREORDER + INORDER:
+  root = preorder[preIdx]
+  Find root in inorder → splits into left/right subtrees
+  root.left = build(inorder left portion)
+  root.right = build(inorder right portion)
+  
+  Optimization: HashMap for O(1) inorder index lookup
+
+PREORDER + POSTORDER (only works for full binary trees):
+  More complex boundary tracking
+```
+
+### Pattern A8.6: Serialize / Deserialize
+
+```
+PREORDER WITH NULL MARKERS:
+  serialize: val + "," for each node; "null," for null
+  deserialize: queue of tokens
+      val = queue.poll()
+      if val == "null": return null
+      node = new TreeNode(val)
+      node.left = deserialize(queue)
+      node.right = deserialize(queue)
+      return node
+```
+
+### Pattern A8.7: BST Properties
+
+```
+VALIDATE BST:
+  def isValid(node, lo=-∞, hi=+∞):
+      if not node: return true
+      if node.val <= lo or node.val >= hi: return false
+      return isValid(node.left, lo, node.val) and
+             isValid(node.right, node.val, hi)
+
+KTH SMALLEST: inorder traversal, count to k (or use augmented BST with size)
+
+BST ITERATOR: stack-based controlled inorder
+  init: push all lefts
+  next: pop, push all lefts of right child
+  hasNext: stack not empty
+```
+
+### Pattern A8.8: Morris Traversal (O(1) Space Inorder)
+
+```
+curr = root
+while curr:
+    if not curr.left:
+        visit(curr)
+        curr = curr.right
+    else:
+        pred = inorder_predecessor(curr)   // rightmost in left subtree
+        if pred.right == null:
+            pred.right = curr              // create thread
+            curr = curr.left
+        else:
+            pred.right = null              // remove thread
+            visit(curr)
+            curr = curr.right
+```
+
+---
+
+## A9. TRIE
+
+### Pattern A9.1: Basic Trie (Insert / Search / StartsWith)
+
+```
+class TrieNode:
+    children = new TrieNode[26]  // or HashMap for Unicode
+    isEnd = false
+
+insert(word):
+    node = root
+    for c in word:
+        idx = c - 'a'
+        if not node.children[idx]: node.children[idx] = new TrieNode()
+        node = node.children[idx]
+    node.isEnd = true
+
+search(word): traverse, check isEnd at last char
+startsWith(prefix): traverse, return true if all chars exist (don't check isEnd)
+```
+
+```
+Words: ["app", "apple", "api", "bat"]
+
+        root
+       /    \
+      a      b
+      |      |
+      p      a
+     / \     |
+    p   i    t(end)
+    |  (end)
+    l
+    |
+    e(end)
+   (end)
+```
+
+### Pattern A9.2: Wildcard Search with '.'
+
+```
+search(word, node, idx):
+    if idx == len(word): return node.isEnd
+    if word[idx] == '.':
+        for each non-null child:
+            if search(word, child, idx+1): return true
+        return false
+    else:
+        child = node.children[word[idx]]
+        return child and search(word, child, idx+1)
+```
+
+### Pattern A9.3: Word Search II (Trie + Grid Backtracking)
+
+```
+Build trie from word list
+for each cell (i,j) in grid:
+    dfs(i, j, trieNode):
+        if trieNode.word exists: add to results, remove from trie (prune!)
+        mark (i,j) visited
+        for 4 directions:
+            if valid and trieNode has child for grid[ni][nj]:
+                dfs(ni, nj, child)
+        unmark (i,j)
+```
+
+### Pattern A9.4: XOR Trie (Maximum XOR Pair)
+
+```
+Build binary trie from MSB to LSB (32 levels)
+For max XOR with query x:
+    for bit from 31 to 0:
+        desired = 1 - bit_of_x   // want opposite to maximize XOR
+        if child[desired] exists: go there
+        else: go other way
+
+Result: O(n * 32) = O(n) for finding max XOR pair
+```
+
+### Pattern A9.5: Autocomplete / Search Suggestions
+
+```
+Build trie with frequency/priority at each end-node
+For each character typed:
+    Navigate to prefix node
+    DFS/BFS from node to collect top-k suggestions
+    Sort by frequency/lexicographic order
+```
+
+---
+
+## A10. MATRIX
+
+### Pattern A10.1: Spiral Traversal
+
+```
+top, bottom, left, right = 0, m-1, 0, n-1
+while top <= bottom and left <= right:
+    for i in left..right:   result.add(matrix[top][i])     // →
+    top++
+    for i in top..bottom:   result.add(matrix[i][right])   // ↓
+    right--
+    if top <= bottom:
+        for i in right..left: result.add(matrix[bottom][i]) // ←
+        bottom--
+    if left <= right:
+        for i in bottom..top: result.add(matrix[i][left])   // ↑
+        left++
+```
+
+### Pattern A10.2: Rotate Matrix 90° (Transpose + Reverse)
+
+```
+CLOCKWISE 90°:
+  1. Transpose: swap matrix[i][j] with matrix[j][i]
+  2. Reverse each row
+
+COUNTER-CLOCKWISE 90°:
+  1. Transpose
+  2. Reverse each column (or: reverse rows then transpose)
+
+180°: Reverse all rows, then reverse each row
+```
+
+```
+[1,2,3]   transpose   [1,4,7]   reverse rows   [7,4,1]
+[4,5,6]   -------->   [2,5,8]   ------------>   [8,5,2]
+[7,8,9]               [3,6,9]                   [9,6,3]
+```
+
+### Pattern A10.3: Search in Sorted Matrix
+
+```
+ROW+COL SORTED (240 - Search a 2D Matrix II):
+  Start from TOP-RIGHT (or bottom-left):
+  row = 0, col = n-1
+  while row < m and col >= 0:
+      if matrix[row][col] == target: found!
+      elif matrix[row][col] > target: col--   // too big, go left
+      else: row++                              // too small, go down
+  Complexity: O(m + n)
+
+ROW-MAJOR SORTED (74 - Search a 2D Matrix):
+  Treat as 1D array: idx → (idx/cols, idx%cols)
+  Standard binary search: O(log(m*n))
+```
+
+### Pattern A10.4: Island Problems (DFS/BFS Flood Fill)
+
+```
+count = 0
+for i in range(m):
+    for j in range(n):
+        if grid[i][j] == '1':
+            count++
+            flood_fill(i, j)       // mark entire island visited
+
+flood_fill(i, j):
+    if out_of_bounds or grid[i][j] != '1': return
+    grid[i][j] = '0'              // mark visited (modify in-place)
+    flood_fill(i±1, j)
+    flood_fill(i, j±1)
+
+VARIANTS:
+  Max Area: return size from dfs
+  Perimeter: count edges touching water/boundary
+  Surrounded Regions: BFS from borders first, then flip interior
+  Distinct Islands: normalize shape (canonical form via path string)
+```
+
+### Pattern A10.5: Grid DP (Paths, Cost, Square)
+
+```
+UNIQUE PATHS:     dp[i][j] = dp[i-1][j] + dp[i][j-1]
+MIN PATH SUM:     dp[i][j] = grid[i][j] + min(dp[i-1][j], dp[i][j-1])
+MAXIMAL SQUARE:   if matrix[i][j] == '1':
+                      dp[i][j] = min(dp[i-1][j], dp[i][j-1], dp[i-1][j-1]) + 1
+
+MAXIMAL RECTANGLE: for each row, compute histogram heights → apply largest rectangle
+
+Space optimization: use 1D dp array (previous row only)
+```
+
+### Pattern A10.6: Set Matrix Zeroes (In-Place Marking)
+
+```
+Use FIRST ROW and FIRST COLUMN as markers:
+  1. Record if first row/col themselves have zeros (separate booleans)
+  2. Scan rest: if matrix[i][j]==0 → set matrix[i][0]=0, matrix[0][j]=0
+  3. Use markers to zero out cells (iterate inner matrix)
+  4. Handle first row/col last using saved booleans
+
+Complexity: O(mn) time, O(1) space
+```
+
+### Pattern A10.7: Diagonal Traversal
+
+```
+Key insight: elements on same diagonal share same (i + j) value
+  Anti-diagonal: same (i - j) value
+
+for d in range(m + n - 1):
+    if d is even: traverse upward (row--, col++)
+    if d is odd:  traverse downward (row++, col--)
+    Calculate starting position based on boundary
+```
+
+### Pattern A10.8: Game of Life (In-Place State Encoding)
+
+**Signal:** Update cells simultaneously based on neighbor state.
+
+```
+Encode transitions in unused bits:
+  0 → 0: stays 0 (encode as 0)
+  1 → 0: was 1, now 0 (encode as 1, since bit0 = old state)
+  0 → 1: was 0, now 1 (encode as 2, bit1 = new state)
+  1 → 1: stays 1 (encode as 3)
+
+Count neighbors using (cell & 1) for old state
+After all updates: cell >>= 1 to get new state
+```
+
+---
+
+# PART B: ALGORITHMIC PATTERNS
 
 ---
 
