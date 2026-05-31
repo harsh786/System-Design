@@ -1,0 +1,60 @@
+# Problem 28: Streaming Data Warehouse (Real-Time Materialized Views)
+
+## Problem 28: Streaming Data Warehouse (Real-Time Materialized Views)
+
+### Architecture
+```
+┌─────────────────────────────────────────────────────────────────────────────┐
+│         STREAMING DATA WAREHOUSE (Materialized Views)                         │
+├─────────────────────────────────────────────────────────────────────────────┤
+│                                                                              │
+│  SOURCE SYSTEMS                                                              │
+│  ┌────────┐ ┌────────┐ ┌────────┐                                          │
+│  │ Orders │ │ Users  │ │ Products│                                          │
+│  │  (CDC) │ │  (CDC) │ │  (CDC)  │                                          │
+│  └───┬────┘ └───┬────┘ └───┬─────┘                                         │
+│      │          │          │                                                 │
+│  ┌───▼──────────▼──────────▼─────────────────────────────────┐             │
+│  │  KAFKA (CDC Events)                                        │             │
+│  └──────────────────────┬────────────────────────────────────┘             │
+│                          │                                                   │
+│  ┌───────────────────────▼───────────────────────────────────┐             │
+│  │  FLINK SQL (Streaming Joins + Aggregations)                │             │
+│  │                                                            │             │
+│  │  -- Real-time materialized view (continuously updated)     │             │
+│  │  CREATE TABLE revenue_by_category AS                       │              │
+│  │  SELECT                                                    │              │
+│  │    p.category,                                             │             │
+│  │    TUMBLE_START(o.order_time, INTERVAL '1' MINUTE) as ts,  │             │
+│  │    SUM(o.amount) as revenue,                               │             │
+│  │    COUNT(*) as order_count                                 │             │
+│  │  FROM orders o                                             │             │
+│  │  JOIN products p ON o.product_id = p.product_id            │             │
+│  │  GROUP BY p.category, TUMBLE(o.order_time, INTERVAL '1' MINUTE);        │
+│  │                                                            │             │
+│  │  WHY FLINK SQL:                                            │             │
+│  │  • SQL familiar to analysts                                │             │
+│  │  • Handles temporal joins (event-time semantics)           │             │
+│  │  • Exactly-once (checkpointed)                             │             │
+│  │  • Scales horizontally                                     │             │
+│  └──────────────────────┬────────────────────────────────────┘             │
+│                          │                                                   │
+│  ┌───────────────────────▼───────────────────────────────────┐             │
+│  │  SERVING (Multiple Materialized Views)                      │             │
+│  │                                                            │             │
+│  │  ┌─────────────┐  ┌─────────────┐  ┌─────────────┐       │             │
+│  │  │ Pinot       │  │ Redis       │  │ Postgres    │        │             │
+│  │  │(OLAP query) │  │(K/V lookup) │  │(Dashboards) │        │             │
+│  │  │             │  │             │  │             │         │             │
+│  │  │ Real-time   │  │ Current     │  │ Pre-aggreg  │         │            │
+│  │  │ slice&dice  │  │ state cache │  │ for Grafana │         │            │
+│  │  └─────────────┘  └─────────────┘  └─────────────┘       │             │
+│  └────────────────────────────────────────────────────────────┘            │
+│                                                                              │
+│  LATENCY: Source change → Materialized view update: <5 seconds               │
+│  FRESHNESS: Dashboards reflect data that's <5 seconds old                    │
+│  VS BATCH: Traditional warehouse: 1-24 hour delay                            │
+│                                                                              │
+└─────────────────────────────────────────────────────────────────────────────┘
+```
+
