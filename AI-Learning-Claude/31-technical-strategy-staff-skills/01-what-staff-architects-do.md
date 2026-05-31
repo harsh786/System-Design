@@ -253,3 +253,53 @@ Write a one-page "Staff Development Plan" for yourself:
 ---
 
 *"The best Staff engineers I've worked with have one thing in common: they're comfortable with ambiguity and uncomfortable with unnecessary complexity. They don't need to be told what to do, and they don't need to prove they're smart. They just quietly make everything around them better."* — A Principal Engineer at a major AI company
+
+---
+
+## Weekly Time Allocation
+
+How Staff architects typically spend their time (varies by archetype):
+
+| Activity | % of Time | Examples |
+|----------|-----------|---------|
+| **Design and architecture work** | 25-30% | Writing ADRs, reviewing designs, creating vision docs |
+| **Code and technical work** | 20-25% | Prototyping, reviewing PRs, debugging critical issues |
+| **Meetings and alignment** | 20-25% | 1:1s, cross-team syncs, stakeholder updates |
+| **Mentoring and multiplying** | 15-20% | Pairing, coaching, design reviews for growth |
+| **Strategy and planning** | 10-15% | Roadmap input, tech strategy, build-vs-buy analysis |
+
+**Common time traps to avoid:**
+- Spending >40% in meetings (you're becoming a manager without the title)
+- Spending >40% coding (you're operating as a senior IC, not multiplying)
+- Zero time on written artifacts (your impact becomes invisible)
+
+## Stakeholder Management Framework
+
+| Stakeholder | What They Care About | How to Communicate | Cadence |
+|-------------|---------------------|-------------------|---------|
+| **Engineering VP** | Velocity, reliability, cost, retention | 1-page summaries with metrics | Bi-weekly or monthly |
+| **Product leadership** | Feature velocity, competitive position | Frame tech decisions as business enablers | Weekly |
+| **Peer Staff engineers** | Technical correctness, patterns, consistency | RFCs, design docs, tech talks | Continuous |
+| **Team leads** | Clarity, unblocked teams, practical guidance | Direct conversation, office hours | Weekly |
+| **Individual engineers** | Growth, interesting work, recognition | 1:1 mentoring, PR reviews, pairing | As needed |
+
+**Key principle**: Translate the same decision into different languages for different audiences. The VP needs "this saves $200K/year." The engineer needs "this reduces our deploy time from 30 min to 5 min."
+
+## Impact Measurement
+
+How to make your Staff-level impact visible and measurable:
+
+| Impact Category | Metrics | Evidence |
+|----------------|---------|----------|
+| **Technical** | System reliability, latency, cost reduction | Dashboards, before/after comparisons |
+| **Velocity** | Time to ship features, onboarding time for new engineers | Sprint metrics, surveys |
+| **Quality** | Bug rates, incident frequency, code review turnaround | Incident reports, DORA metrics |
+| **People** | Promotions of mentees, team satisfaction, retention | Promo docs, engagement surveys |
+| **Strategic** | Decisions that avoided costly mistakes, tech debt reduction | Decision docs, tech debt burndown |
+
+**Quarterly self-assessment questions:**
+1. What decisions did I influence that wouldn't have happened without me?
+2. What problems did I prevent (not just solve)?
+3. Who grew because of my investment in them?
+4. What did I write that changed how the org operates?
+5. What would be different if I hadn't been here this quarter?

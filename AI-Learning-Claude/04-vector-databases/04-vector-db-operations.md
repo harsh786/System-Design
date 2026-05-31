@@ -219,4 +219,101 @@ If recall drops, your index may need rebuilding or parameter tuning.
 
 ---
 
+## Staff-Level: Anti-Patterns
+
+### 1. No Backup Strategy ("We Can Always Re-embed")
+
+**Mistake**: "Vectors are derived from source docs, we don't need backups."
+
+**Why it's wrong**: Re-embedding 100M documents costs $1,000+ in API calls, takes days, and your embedding model version might be deprecated. Metadata, collection config, and index parameters also need backup.
+
+**Fix**: Snapshot to object storage daily. Keep at least 3 snapshots. Test restore quarterly.
+
+### 2. Upsert Without Deduplication Check
+
+**Mistake**: Running ingestion pipelines with at-least-once delivery without deduplication. You end up with 3 copies of the same document, all with different IDs.
+
+**Why it hurts**: Duplicates inflate index size, waste memory, and pollute search results (same doc appears multiple times in top-K).
+
+**Fix**: Use content-hash as vector ID (`id = sha256(document_content)`). This makes upsert naturally idempotent.
+
+### 3. Bulk Delete Without Confirmation
+
+**Mistake**: `collection.delete(filter={"status": "old"})` in production without first counting how many vectors match.
+
+**Why it hurts**: One wrong filter deletes your entire collection. Vector DBs don't have transactions or easy rollback.
+
+**Fix**: Always count first: `count(filter)` → confirm → delete. For large deletes (>10% of collection), trigger index rebuild afterward.
+
+### 4. Not Monitoring Index Health
+
+**Mistake**: Deploy and forget. Six months later, recall has degraded from 97% to 85% due to fragmentation from many updates/deletes.
+
+**Fix**: Weekly recall sampling (compare ANN vs brute-force on 100 random queries). Alert on >3% degradation. Schedule index optimization/compaction.
+
+---
+
+## Staff-Level: Trade-offs
+
+### Consistency vs Availability (Vector DB CAP)
+
+| Pattern | Consistency | Availability | Latency | Use Case |
+|---------|-------------|-------------|---------|----------|
+| Sync writes to all replicas | Strong | Lower (waits for ack) | Higher write | Financial, compliance |
+| Async replication | Eventual (100ms-5s lag) | High | Low write | Search, RAG, recommendations |
+| Write to primary, read from any | Read-your-writes (with routing) | High | Low read | Most production systems |
+
+**Staff insight**: For vector search, eventual consistency is almost always acceptable. Users won't notice if a newly indexed document takes 2 seconds to appear in search. Optimize for read availability.
+
+### Batch vs Stream Indexing
+
+| Approach | Throughput | Freshness | Complexity | Best For |
+|----------|-----------|-----------|-----------|----------|
+| Batch (hourly/daily) | Very high (can optimize index) | Stale (hours) | Low | Analytics, archival, large corpus |
+| Micro-batch (every 1-5 min) | High | Near real-time | Medium | Most SaaS products |
+| Stream (per-document) | Low per-doc | Real-time | High | Chat, live feeds, urgent updates |
+
+**Decision**: Default to micro-batch. Only use stream if users need sub-minute freshness. Batch for initial loads and re-indexing jobs.
+
+---
+
+## Staff-Level: Operational Runbook
+
+### Issue: Query Latency Spike (p99 > 500ms)
+
+```
+1. Check memory utilization → if >90%, vectors are swapping to disk
+   Fix: Scale vertically (more RAM) or enable quantization
+2. Check segment count → if >50, compaction is overdue
+   Fix: Trigger manual compaction (qdrant: POST /collections/{name}/compact)
+3. Check ef_search / nprobe → may have been accidentally increased
+   Fix: Reset to tuned values
+4. Check concurrent query load → thundering herd?
+   Fix: Add read replicas, implement query queuing
+```
+
+### Issue: Recall Degradation (below 92%)
+
+```
+1. Run recall benchmark (ANN vs brute-force on 100 queries)
+2. If recall is low AND index is old → rebuild index (HNSW graph may be fragmented)
+3. If recall is low AND data distribution changed → retune parameters (M, ef_search)
+4. If recall is low AND recently switched models → vectors are mixed (old+new model)
+   Fix: Complete re-embedding migration
+```
+
+### Issue: Upsert Throughput Drops >50%
+
+```
+1. Check batch sizes → ensure ≥100 vectors per batch
+2. Check WAL/journal disk → may be full
+   Fix: Increase disk, trigger WAL rotation
+3. Check if index is being rebuilt concurrently
+   Fix: Schedule rebuilds during low-traffic windows
+4. Check payload index overhead → too many indexed fields?
+   Fix: Only index fields you actually filter on
+```
+
+---
+
 *Next: [05 - Embedding Strategies](./05-embedding-strategies.md)*

@@ -196,4 +196,118 @@ graph TB
 
 ---
 
+## Staff-Level: Anti-Patterns
+
+### 1. Using the Wrong Embedding Model for Your Domain
+
+**Mistake**: Using a general-purpose model (text-embedding-3-small) for specialized domains like medical, legal, or code search without evaluation.
+
+**Why it hurts**: General models encode "MI" as Michigan, not myocardial infarction. Legal "consideration" maps to everyday meaning. Code variable names become noise.
+
+**Fix**: Always evaluate on YOUR queries first. If recall@10 < 85% on domain-specific test set, fine-tune or switch to domain-specific model.
+
+### 2. Not Evaluating Embedding Quality Before Production
+
+**Mistake**: Choosing a model based on MTEB leaderboard scores alone, deploying without measuring on your actual data.
+
+**Why it hurts**: MTEB is averaged across diverse tasks. A model ranked #1 overall may rank #15 on your specific retrieval task.
+
+**Fix**: Create a golden test set (50-100 query/document pairs). Measure recall@10 and nDCG@10 on YOUR data before choosing.
+
+### 3. Treating All Text Equally (Title vs Body vs Metadata)
+
+**Mistake**: Concatenating title + body + metadata into one string and embedding it all together.
+
+**Why it hurts**: Titles are information-dense; body text dilutes the signal. A 500-word paragraph's embedding is dominated by common filler words, not the key concepts.
+
+**Fix**: Embed title and body separately with different weights. Use title embeddings for initial retrieval, body for re-ranking. Or prepend structured prefixes: `"title: ... body: ..."`.
+
+### 4. Embedding Without Preprocessing
+
+**Mistake**: Embedding raw HTML, markdown with formatting, text with excessive whitespace, boilerplate headers/footers.
+
+**Why it hurts**: Noise in input = noise in embedding. HTML tags, nav menus, and cookie banners pollute the semantic signal.
+
+**Fix**: Strip formatting, remove boilerplate, normalize whitespace, chunk intelligently BEFORE embedding.
+
+---
+
+## Staff-Level: Dimension Trade-offs
+
+| Dimension | Storage (100M vectors) | Annual Storage Cost | Quality (retrieval) | Best Use Case |
+|-----------|----------------------|--------------------|--------------------|---------------|
+| 256 | 100 GB | ~$200/yr | 85-88% recall | Mobile/edge, real-time autocomplete |
+| 768 | 300 GB | ~$600/yr | 92-95% recall | General production, balanced |
+| 1536 | 600 GB | ~$1,200/yr | 95-97% recall | High-quality search, RAG |
+| 3072 | 1.2 TB | ~$2,400/yr | 97-98% recall | Maximum quality, cost not a concern |
+
+**Staff decision framework**: Start with 1024 or 1536. Only go lower if latency/cost forces it. Only go higher if quality metrics justify the 2x storage bump.
+
+---
+
+## Staff-Level: Real Costs at Scale (1M Documents, ~500 tokens each)
+
+| Provider | Model | Cost to Embed 1M Docs | Monthly Re-query Cost (100K queries) | Notes |
+|----------|-------|----------------------|-------------------------------------|-------|
+| OpenAI | text-embedding-3-small | $10 | $1 | Cheapest quality option |
+| OpenAI | text-embedding-3-large | $65 | $6.50 | 2x quality bump, 6.5x cost |
+| Cohere | embed-v4 | $50 | $5 | Good multilingual support |
+| Voyage AI | voyage-3 | $30 | $3 | Best quality/cost ratio |
+| Self-hosted | all-MiniLM-L6-v2 | $5 (GPU hours) | $0 (amortized) | Break-even at ~50M tokens/month |
+| Self-hosted | BGE-large | $15 (GPU hours) | $0 (amortized) | Higher quality, slower |
+
+**Hidden costs staff engineers catch**:
+- Re-embedding when models update: budget for full re-embed 1-2x/year
+- A/B testing new models: 2x storage during migration
+- Embedding cache misses during cold starts
+- Token counting surprises: code and non-English text tokenize to 2-3x more tokens
+
+---
+
+## Embedding Model Selection Framework
+
+### Decision Criteria (Ranked by Impact)
+
+| Factor | Weight | Considerations |
+|--------|--------|---------------|
+| Task alignment | 40% | Code search → code-trained model; multilingual → multilingual model |
+| Dimension vs. quality | 25% | Higher dims ≠ always better; diminishing returns after 768 for most tasks |
+| Latency budget | 20% | Real-time (<50ms) limits you to smaller models or cached embeddings |
+| Cost at scale | 15% | Per-token pricing compounds; 1B docs × re-embed = significant cost |
+
+### Provider Cost Comparison (2024-2025 pricing, per 1M tokens)
+
+| Provider | Model | Dimensions | Cost/1M tokens | Quality (MTEB avg) |
+|----------|-------|-----------|----------------|---------------------|
+| OpenAI | text-embedding-3-small | 1536 | $0.02 | 62.3 |
+| OpenAI | text-embedding-3-large | 3072 | $0.13 | 64.6 |
+| Cohere | embed-v3 | 1024 | $0.10 | 64.5 |
+| Google | text-embedding-004 | 768 | $0.025 | 63.8 |
+| Voyage AI | voyage-large-2 | 1536 | $0.12 | 65.2 |
+| Local (BGE) | bge-large-en-v1.5 | 1024 | GPU cost only | 63.6 |
+
+### Embedding Dimension Trade-offs
+
+```
+Dimension impact on system design:
+  256d  → 1KB/vector  → 1B vectors = ~1TB storage, fastest search
+  768d  → 3KB/vector  → 1B vectors = ~3TB storage, good quality/cost balance
+  1536d → 6KB/vector  → 1B vectors = ~6TB storage, diminishing quality gains
+  3072d → 12KB/vector → 1B vectors = ~12TB storage, marginal improvement for most tasks
+```
+
+**Staff insight on dimension selection**:
+- OpenAI's `text-embedding-3` models support **Matryoshka representations** — you can truncate to lower dimensions (e.g., 256 from 3072) with graceful quality degradation
+- This enables a two-tier strategy: store full-dimension embeddings, but use truncated versions for initial candidate retrieval (cheaper index, faster search), then re-rank with full vectors
+- Rule of thumb: if your recall@10 at 256d is within 3% of full-dimension, use 256d for the index layer
+
+**Cost modeling formula**:
+```
+Monthly embedding cost = (new_docs/month × avg_tokens/doc × price_per_token)
+                       + (re-embed_fraction × total_docs × avg_tokens/doc × price_per_token)
+Storage cost          = total_vectors × dimensions × 4 bytes × replication_factor
+```
+
+---
+
 *Next: [02 - Vector Database Fundamentals](./02-vector-database-fundamentals.md)*

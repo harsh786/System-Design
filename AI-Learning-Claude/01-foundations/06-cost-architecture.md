@@ -226,3 +226,120 @@ Don't forget:
 - Cost per quality unit matters more than cost per request
 - Self-hosting breaks even around $15K/month in API costs
 - Set budget alerts and circuit breakers — production AI needs financial guardrails
+
+---
+## Anti-Patterns
+1. **No cost tracking per feature** - Can't optimize what you don't measure
+2. **Using expensive models for simple tasks** - GPT-4 for keyword extraction
+3. **No caching** - Paying full price for repeated queries
+4. **Unlimited retries** - Failed request × 3 retries × exponential = massive bills
+5. **No budget alerts** - Discovering $50K bill on Monday morning
+6. **Ignoring embedding costs** - They add up: 1M docs × re-embed = $100+
+
+## Cost Optimization Hierarchy (Ordered by Impact)
+1. **Model routing** (save 60-80%): cheap model for easy queries
+2. **Caching** (save 30-50%): semantic cache for similar queries
+3. **Prompt optimization** (save 20-40%): shorter prompts = fewer tokens
+4. **Batch processing** (save 50%): batch API is half price
+5. **Self-hosting** (save 40-70% at scale): break-even at ~$10K/month
+
+## Real-World Cost Examples (2025)
+| Use Case | Queries/day | Model Strategy | Monthly Cost |
+|----------|:-----------:|----------------|:------------:|
+| Customer chatbot | 50K | GPT-4o-mini + GPT-4o fallback | ~$3K |
+| Document search (RAG) | 200K | Embeddings + GPT-4o-mini | ~$8K |
+| Code assistant | 500K | Claude Haiku + Sonnet cascade | ~$25K |
+| Enterprise platform | 2M | Multi-model router + cache | ~$80K |
+
+---
+
+## FinOps for AI
+
+### What is AI FinOps?
+
+FinOps (Financial Operations) for AI applies cloud cost management principles to AI-specific spending. Unlike traditional cloud where costs are tied to provisioned resources, AI costs are tied to **usage patterns** that are harder to predict and control.
+
+### The Three Pillars of AI FinOps
+
+```mermaid
+graph TD
+    A[AI FinOps] --> B[Inform<br/>Visibility & Attribution]
+    A --> C[Optimize<br/>Reduce Waste]
+    A --> D[Operate<br/>Governance & Automation]
+    
+    B --> B1[Per-team cost dashboards]
+    B --> B2[Per-feature cost tracking]
+    B --> B3[Cost-per-quality-unit metrics]
+    
+    C --> C1[Model routing]
+    C --> C2[Caching strategies]
+    C --> C3[Prompt optimization]
+    
+    D --> D1[Budget alerts & circuit breakers]
+    D --> D2[Approval workflows for expensive models]
+    D --> D3[Automated scaling policies]
+```
+
+### Cost Allocation Strategies
+
+| Strategy | How It Works | Best For |
+|----------|-------------|----------|
+| **Per-feature tagging** | Every API call tagged with feature ID | Product-level cost visibility |
+| **Per-team allocation** | Each team has a model API budget | Accountability without micromanagement |
+| **Per-customer attribution** | Track cost per customer/tenant | SaaS margin analysis |
+| **Shared pool + chargeback** | Central budget, monthly chargeback by usage | Enterprise orgs with shared platform |
+
+### Chargeback Models
+
+**Direct chargeback:** Teams pay for exactly what they use. Simple but can discourage experimentation.
+
+**Tiered chargeback:** First $X/month free (innovation budget), then charged at cost. Balances innovation with accountability.
+
+**Showback only:** Show teams their costs but don't charge them. Good for building awareness before enforcing budgets.
+
+### Cost Monitoring and Alerting
+
+Production AI systems need multi-level alerting:
+
+| Alert Level | Trigger | Action |
+|-------------|---------|--------|
+| **Info** | Daily spend > 120% of 7-day average | Notification to team Slack |
+| **Warning** | Hourly spend > 5x normal | Page on-call engineer |
+| **Critical** | Single request > $1 | Immediate investigation |
+| **Emergency** | Daily budget exhausted | Circuit breaker: block non-critical requests |
+
+```python
+# Circuit breaker pattern for cost control
+class CostCircuitBreaker:
+    def __init__(self, daily_budget: float, critical_threshold: float = 0.8):
+        self.daily_budget = daily_budget
+        self.critical_threshold = critical_threshold
+    
+    def should_allow(self, request_priority: str, spent_today: float) -> bool:
+        utilization = spent_today / self.daily_budget
+        if utilization >= 1.0:
+            return request_priority == "critical"  # Only critical requests pass
+        if utilization >= self.critical_threshold:
+            return request_priority in ["critical", "high"]  # Shed low-priority
+        return True  # Under budget, allow all
+```
+
+### Budget Management at Org Scale
+
+**Quarterly planning formula:**
+```
+Quarterly AI Budget = (Current monthly spend × 3) × Growth Factor × Buffer
+                    = $50K × 3 × 1.5 × 1.3
+                    = $292,500/quarter
+
+Where:
+  Growth Factor = projected usage growth (1.5 = 50% growth)
+  Buffer = 1.3 (30% for price changes, experiments, spikes)
+```
+
+**Budget governance checklist:**
+1. Every AI feature has a cost estimate before development starts
+2. Cost is reviewed in sprint demos alongside quality metrics
+3. Teams that exceed budget by >20% must submit a cost reduction plan
+4. New model adoption requires cost comparison vs current model
+5. Monthly cost review meeting with engineering leadership

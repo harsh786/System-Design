@@ -260,3 +260,65 @@ When presented with this scenario:
 4. **Include measurement** — How will you KNOW it's getting better?
 5. **Acknowledge tradeoffs** — Reducing hallucination may increase "I don't know" rate
 6. **Give specific numbers** — "I'd expect this fix to reduce hallucination by ~5%"
+
+---
+
+## Incident Timeline Reconstruction
+
+When presenting this case study, structure the story chronologically:
+
+| Time | Event | Signal |
+|------|-------|--------|
+| Week 0 | New knowledge base content deployed | No quality check gate |
+| Week 1 | Customer complaints increase 20% | Support team notices but doesn't escalate |
+| Week 2 | NPS drops 5 points | Product team raises alarm |
+| Week 2, Day 3 | War room formed | Engineering investigates |
+| Week 2, Day 4 | Root cause identified: chunking broke on new doc format | Retrieval recall dropped from 85% to 60% |
+| Week 2, Day 5 | Hot fix deployed (chunk size adjustment) | Recall recovers to 78% |
+| Week 3 | Systematic fixes begin | Full quality pipeline implemented |
+| Week 6 | Quality exceeds pre-incident levels | Monitoring prevents recurrence |
+
+## Root Cause Analysis Template
+
+Use the "5 Whys + Contributing Factors" format:
+
+1. **Why** did quality drop? → Retrieval returned irrelevant chunks
+2. **Why** were chunks irrelevant? → New documents had different formatting, broke chunking logic
+3. **Why** didn't chunking handle new formats? → No validation on chunk quality at ingestion time
+4. **Why** was there no validation? → Quality gates weren't part of the ingestion pipeline
+5. **Why** weren't they included? → Original system was built with a single document format assumed
+
+**Contributing factors (not root causes but amplifiers):**
+- No automated quality monitoring (detected by humans, not systems)
+- No staging environment for knowledge base changes
+- No rollback mechanism for knowledge base deployments
+- Alert thresholds set too loosely on answer quality metrics
+
+## Quality Monitoring Setup
+
+After the crisis, implement this monitoring stack:
+
+```
+┌─────────────────────────────────────────────┐
+│            Quality Monitoring Dashboard       │
+├─────────────────────────────────────────────┤
+│ Real-time Metrics:                           │
+│  • Retrieval recall (sampled, every 5 min)   │
+│  • Answer relevance score (LLM-judged)       │
+│  • Hallucination rate (citation verification)│
+│  • User satisfaction (thumbs up/down ratio)  │
+│  • "I don't know" rate (should be 5-15%)     │
+├─────────────────────────────────────────────┤
+│ Alerts:                                      │
+│  • Recall drops >10% vs 7-day avg → P2       │
+│  • Hallucination rate >5% → P1              │
+│  • User satisfaction drops >15% → P1         │
+│  • "I don't know" rate >25% → P2            │
+└─────────────────────────────────────────────┘
+```
+
+**Weekly quality review ritual:**
+- Sample 50 random conversations, have domain expert grade them
+- Compare automated metrics to human judgment (calibrate)
+- Review all conversations that received negative feedback
+- Track quality trends by topic/category (find weak spots early)

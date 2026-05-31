@@ -300,3 +300,25 @@ Version your **prompts** independently from your API:
 - Always return token usage and cost estimates in responses
 - Implement fallback model chains — single-model is a single point of failure
 - AI error handling must go beyond HTTP status codes
+
+---
+## Anti-Patterns
+1. **Synchronous-only for long tasks** - Users get timeouts; use async + webhooks
+2. **No request IDs** - Can't debug production issues
+3. **Unbounded response size** - max_tokens not set, streaming not implemented
+4. **No rate limiting** - Single user can exhaust your API budget
+5. **Breaking changes without versioning** - AI output format changes break consumers
+6. **No idempotency** - Retry causes duplicate processing and double billing
+
+## Trade-Offs
+| Pattern | Pros | Cons | Use When |
+|---------|------|------|----------|
+| Sync request/response | Simple | Timeout risk | <5s responses |
+| Streaming (SSE) | Great UX | Complex error handling | User-facing chat |
+| Async + polling | No timeouts | Higher latency | Long tasks (>30s) |
+| Async + webhooks | Efficient | Requires webhook infra | Backend processing |
+
+## Real-World API Design Examples
+- **OpenAI API**: Streaming via SSE, structured output mode, tool_choice parameter
+- **Anthropic API**: Message-based with system/user/assistant, content blocks for multi-modal
+- **Cohere API**: Separate endpoints for different capabilities (chat, embed, rerank)

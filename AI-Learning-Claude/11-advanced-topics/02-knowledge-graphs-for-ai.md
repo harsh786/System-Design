@@ -285,3 +285,84 @@ flowchart TB
 ## Next Steps
 
 - Build the [Knowledge Graph Builder Program](./programs/knowledge-graph-builder/) to see extraction and traversal in action
+
+---
+
+## Anti-Patterns
+
+### 1. Building KG from Scratch When Existing Ontologies Exist
+
+**What goes wrong:** Team spends 6 months defining entity types and relationships that already exist in public ontologies (Schema.org, FHIR for healthcare, Dublin Core for documents, SNOMED CT for medical).
+
+**Fix:** Start with existing ontologies, extend only where domain-specific. Your custom entities should layer on top, not replace well-defined standards.
+
+### 2. KG Without Maintenance Strategy (Goes Stale)
+
+**What goes wrong:** Graph is built once, never updated. Within months, relationships are outdated (people changed roles, companies merged, products deprecated). Users lose trust, abandon the system.
+
+**Reality check:** Building a KG is 20% of the work. Maintaining it is 80%.
+
+**Fix:**
+- Automated ingestion pipeline triggered by source changes
+- Temporal validity on all edges (start_date, end_date)
+- Staleness alerts: flag entities not refreshed in N days
+- Regular reconciliation against authoritative sources
+
+### 3. Over-Engineering KG for Simple Relationships
+
+**What goes wrong:** Team builds a full Neo4j deployment with complex ontology for what is essentially a lookup table or simple hierarchy. Massive overhead for simple parent-child or tag relationships.
+
+**Signs you're over-engineering:**
+- Max relationship depth is 1-2 hops
+- No multi-hop queries in your use cases
+- Relationships are all the same type
+- A SQL JOIN or simple JSON would work fine
+
+**Fix:** Ask "Do I need multi-hop traversal?" If no, use simpler data structures.
+
+### 4. Treating KG as Replacement for Vector Search
+
+**What goes wrong:** Team assumes KG will handle all retrieval. But KG only works when you know the entities to start from. Vague or novel queries with no entity matches return nothing.
+
+**Fix:** KG augments vector search, never replaces it. Vector search handles fuzzy/semantic discovery. KG handles structured traversal from known starting points.
+
+---
+
+## Key Trade-offs
+
+### KG + Vector (Powerful, Complex) vs Vector-Only (Simple, Misses Relationships)
+
+| Factor | KG + Vector (Graph RAG) | Vector-Only |
+|--------|------------------------|-------------|
+| Multi-hop reasoning | Excellent | Poor (hopes context is in one chunk) |
+| Setup complexity | High (graph DB + vector DB + extraction pipeline) | Low (embed + index) |
+| Maintenance cost | High (graph must stay current) | Low (re-embed on change) |
+| Explainability | High (show reasoning path) | Low (similarity score only) |
+| Cold start | Hard (need extraction before anything works) | Easy (embed docs immediately) |
+
+**Decision:** Start vector-only. Add KG when you have specific multi-hop questions that vector search consistently fails on, AND you have the team to maintain the graph.
+
+### Graph DB (Neo4j) vs Embedded Triples (RDF/JSON-LD)
+
+| Factor | Graph DB (Neo4j) | Embedded Triples |
+|--------|-----------------|------------------|
+| Query power | Full Cypher, complex traversals | SPARQL or custom, limited |
+| Operational cost | Separate service to manage | Stored alongside documents |
+| Scale | Millions-billions of nodes | Thousands-millions |
+| Tooling | Rich visualization, admin UI | Minimal |
+| Best for | Production systems, complex queries | Prototyping, simple lookups, static KGs |
+
+### When KGs Actually Help vs Over-Engineering
+
+**KGs genuinely help when:**
+- Questions require 3+ hop traversal ("Who reports to the manager of the person who wrote this doc?")
+- Relationships have properties (temporal, weighted, typed)
+- Explainability is a hard requirement (regulated industries)
+- Data is naturally graph-shaped (org charts, supply chains, molecular structures)
+
+**KGs are over-engineering when:**
+- All questions are "find similar to X" (vector search wins)
+- Relationships are implicit in text (let the LLM reason)
+- Data changes faster than you can update the graph
+- Team lacks graph DB operational expertise
+- You have fewer than 10,000 entities

@@ -340,3 +340,159 @@ The most effective production prompts combine multiple patterns:
 - Combine patterns for production-grade prompts
 - Gate + Chain patterns form the basis of agentic systems
 - Build an organizational pattern library with tested examples
+
+---
+
+## Staff Architect: Trade-offs Per Pattern
+
+| Pattern | Best For | Avoid When | Cost Impact | Latency Impact | Failure Mode |
+|---------|----------|------------|-------------|----------------|--------------|
+| **Persona** | Domain-specific expertise, consistent tone | Task requires objectivity/neutrality; persona creates bias | None (prompt-only) | None | Over-specified persona locks model into one perspective |
+| **Audience** | Multi-stakeholder communication, documentation | Single-consumer APIs where format is fixed | None | None | "ELI5" loses critical nuance; "expert" assumes too much |
+| **Constraint** | Fitting UI slots, meeting API contracts, compliance | Creative/exploratory tasks where constraints limit quality | None | None | Contradictory constraints cause model to violate some |
+| **Verification** | Code gen, financial calcs, medical/legal content | Simple lookups, high-volume low-stakes tasks | 1.5-2x tokens | +30-50% latency | Verification itself can be wrong; false confidence |
+| **Decomposition** | Complex multi-step analysis, PR reviews, audits | Single-step tasks; atomic operations | 1.5-3x tokens | +50-100% latency | Sub-problems solved independently may miss global context |
+| **Reflection** | Improving first-draft quality, catching errors | Time-critical paths; already-validated outputs | 2x tokens | +50% latency | Infinite revision loops; model "changes its mind" to something worse |
+| **Meta-prompting** | Novel tasks, prompt optimization, bootstrapping | Well-understood tasks with proven prompts | 2-3x tokens | 2x latency (extra call) | Generated prompt may be verbose/suboptimal |
+| **Template** | Parsed outputs, fixed UI, downstream processing | Open-ended conversation, creative exploration | None | None | Rigid templates prevent model from expressing uncertainty |
+| **Chain** | Complex multi-stage pipelines, document processing | Simple tasks; when latency budget is tight | Nx calls | Nx latency | Error propagation — one bad link corrupts downstream |
+| **Gate** | Multi-intent routing, conditional logic | When all inputs should be handled the same way | Minimal | Minimal | Misclassification routes to wrong handler |
+
+### Pattern Selection Decision Tree
+
+```mermaid
+graph TD
+    A[Task] --> B{Output consumed by code?}
+    B -->|Yes| C[Template + Constraint patterns]
+    B -->|No| D{Domain expertise needed?}
+    D -->|Yes| E[Persona + Audience]
+    D -->|No| F{Complex/multi-step?}
+    F -->|Yes| G{Single prompt sufficient?}
+    G -->|Yes| H[Decomposition + Verification]
+    G -->|No| I[Chain pattern]
+    F -->|No| J{High stakes?}
+    J -->|Yes| K[Verification + Reflection]
+    J -->|No| L[Minimal patterns — keep it simple]
+```
+
+## Staff Architect: Patterns in Production Systems
+
+### 1. Customer Support Routing (Gate + Persona + Template)
+
+```python
+# Production system handling 50K tickets/day
+ROUTING_PROMPT = """
+[Gate Pattern]
+Classify this customer message:
+- billing_issue → Route to billing team
+- technical_bug → Route to engineering
+- feature_request → Log and acknowledge
+- churn_risk → Route to retention team (HIGH PRIORITY)
+- spam → Discard
+
+[Template Pattern]
+Return: {"intent": "...", "priority": "high|medium|low", "confidence": 0.0-1.0}
+
+[Constraint Pattern]  
+If confidence < 0.7, set intent to "needs_human_review".
+"""
+
+# Specialized handler uses Persona pattern
+TECHNICAL_BUG_HANDLER = """
+[Persona] You are a senior support engineer who has deep knowledge of our API.
+[Decomposition] 
+1. Identify the error from the customer's description
+2. Check if it matches a known issue
+3. Provide specific troubleshooting steps
+[Template] Return: {"diagnosis": "...", "steps": [...], "escalate": bool}
+"""
+```
+
+### 2. Document Analysis Pipeline (Chain + Decomposition + Reflection)
+
+```python
+# Used by legal tech company processing contracts
+CHAIN = [
+    # Step 1: Extract (Decomposition pattern)
+    "Extract all parties, dates, obligations, and termination clauses from this contract.",
+    
+    # Step 2: Analyze (Persona + Verification)
+    """You are a contract analyst. For each obligation identified:
+    1. Classify risk level
+    2. Identify ambiguous language
+    3. Flag missing standard clauses
+    Verify: Are all obligations assigned to a specific party?""",
+    
+    # Step 3: Summarize (Audience + Template + Reflection)
+    """Summarize for a non-legal executive. Use the template:
+    ## Key Risks (top 3)
+    ## Missing Protections
+    ## Recommended Actions
+    
+    After writing, review: Would a CEO understand this without legal training? Revise if not."""
+]
+```
+
+### 3. Code Review Agent (Decomposition + Verification + Gate)
+
+```python
+CODE_REVIEW_PROMPT = """
+[Gate] First determine the type of change:
+- bug_fix → Focus on: Does it actually fix the bug? Any regression risk?
+- feature → Focus on: Architecture fit, edge cases, test coverage
+- refactor → Focus on: Behavior preservation, performance impact
+- config_change → Focus on: Environment safety, rollback plan
+
+[Decomposition] For the identified type, evaluate:
+1. Correctness (logic errors, off-by-ones, null handling)
+2. Security (injection, auth, data exposure)
+3. Performance (N+1 queries, unbounded loops, memory leaks)
+4. Maintainability (naming, complexity, documentation)
+
+[Verification] Before submitting review:
+- Did you check every file in the diff?
+- Are your suggestions specific (line numbers, code examples)?
+- Would you approve this for production?
+
+[Template]
+{"verdict": "approve|request_changes|discuss", "findings": [...], "summary": "..."}
+"""
+```
+
+### 4. Content Moderation (Gate + Constraint + Multi-Model Verification)
+
+```python
+# High-volume system: 1M posts/day, <200ms latency requirement
+# Uses lightweight Gate pattern for speed
+FAST_CLASSIFIER = """
+Classify content safety. Return ONLY one word:
+safe | review | block
+
+Content: {content}
+"""
+
+# If "review" → escalate to detailed analysis (Decomposition + Reflection)
+DETAILED_REVIEW = """
+[Decomposition] Evaluate this content against each policy:
+1. Hate speech / discrimination
+2. Violence / threats
+3. Sexual content
+4. Misinformation / fraud
+5. Self-harm
+
+[Reflection] For each policy flagged:
+- Rate confidence (1-10)
+- Consider: Could this be satire, news reporting, or educational content?
+- If confidence < 7, recommend human review over auto-block
+
+[Constraint] Never auto-block news articles or educational content.
+"""
+```
+
+### Key Production Lessons
+
+1. **Start with the simplest pattern that works** — don't over-engineer
+2. **Gate pattern is your router** — it's the entry point of most production systems
+3. **Chain pattern needs error handling between every link** — one failure shouldn't crash the pipeline
+4. **Verification pattern pays for itself on high-stakes paths** — but skip it on high-volume low-stakes
+5. **Template pattern is non-negotiable for machine-consumed output** — humans can interpret; code cannot

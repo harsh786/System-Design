@@ -285,3 +285,107 @@ LOW IMPACT (do last or skip):
 4. **Track unit economics** — cost per user must be sustainable with your pricing
 5. **Set budget guardrails** — automatic throttling prevents surprise bills
 6. **Self-host only when the math works** — below $30K/month, managed is usually cheaper
+
+---
+
+## Staff-Level: Anti-Patterns
+
+### 1. Optimizing Cost Before Validating Quality
+Teams that start with "use the cheapest model everywhere" often ship a product that doesn't work, then spend months debugging quality issues. The correct order:
+1. Build with the best model (prove the feature works)
+2. Measure quality baselines
+3. Downgrade models one-by-one, measuring quality at each step
+4. Stop downgrading when quality drops below acceptable threshold
+
+Premature cost optimization is the root of many failed AI products.
+
+### 2. No Cost Tracking Per Feature/Team
+"Our AI bill is $80K/month" tells you nothing actionable. Without per-feature attribution, you can't answer: Which feature is the cost hog? Which team is over-budget? Where is the ROI negative?
+
+**Fix:** Tag every API call with `feature_id`, `team_id`, `user_tier`. Aggregate costs by these dimensions daily. Make teams own their AI spend like they own their cloud spend.
+
+### 3. Using Most Expensive Model Everywhere "Just in Case"
+"GPT-4 is better, so let's use it for everything." But 60-70% of production queries are simple enough for GPT-3.5-turbo. The difference: $0.002/1K vs $0.03/1K — a 15x cost multiplier for marginal quality improvement on easy tasks.
+
+### 4. Not Leveraging Batch API When Possible
+Many AI workloads aren't truly real-time: daily report generation, document processing, eval runs, embedding updates. OpenAI's Batch API offers 50% discount for 24-hour turnaround. If even 30% of your workload can tolerate batch, that's 15% total cost reduction for free.
+
+---
+
+## Staff-Level: Trade-offs
+
+### Quality vs Cost: The Pareto Frontier
+You cannot optimize both simultaneously. Every cost reduction has a quality trade-off:
+
+```
+Quality Score
+    │
+1.0 │     ●  GPT-4 (expensive, best quality)
+    │    ●   GPT-4o-mini (good balance)
+0.9 │   ●    Fine-tuned Llama-70B (self-hosted, good quality)
+    │  ●     Llama-8B (cheap, adequate for simple tasks)
+0.8 │ ●      Cached responses (free, stale risk)
+    │●       Rule-based (free, limited scope)
+    └────────────────────────────────────────── Cost/request
+    $0      $0.001    $0.01     $0.03     $0.10
+```
+
+**The Pareto frontier:** Points where you can't improve quality without increasing cost (or vice versa). Your job is to stay ON the frontier — many teams operate below it (paying more than necessary for their quality level).
+
+### Latency vs Cost
+| Approach | Latency | Cost | When |
+|----------|---------|------|------|
+| Real-time API | 500ms-5s | $$$ | User waiting in chat |
+| Batch API (50% off) | 1-24 hours | $$ | Background processing |
+| Self-hosted spot instances | 100ms-2s | $ | Predictable workloads |
+| Pre-computed (cache) | <50ms | ~$0 | Common queries |
+
+### Build vs Buy at Different Scales
+
+| Monthly Spend | Recommendation | Reasoning |
+|--------------|----------------|-----------|
+| <$5K | Buy (managed API) | Engineering time > API cost |
+| $5K-$30K | Buy + optimize | Add caching, routing, compression |
+| $30K-$100K | Evaluate self-hosting | Break-even zone, depends on team |
+| >$100K | Build (self-host) | ROI on infrastructure investment clear |
+
+---
+
+## Staff-Level: Cost Optimization Decision Tree
+
+```mermaid
+flowchart TD
+    Start[Monthly AI Spend] --> Q1{> $30K/month?}
+    
+    Q1 -->|No| Q2{Cache hit rate > 30%?}
+    Q1 -->|Yes| Q3{Have ML engineering team?}
+    
+    Q2 -->|No| A1[Implement semantic caching<br/>Expected: 30-50% savings]
+    Q2 -->|Yes| Q4{Using model routing?}
+    
+    Q4 -->|No| A2[Implement complexity-based routing<br/>Expected: 50-70% savings]
+    Q4 -->|Yes| Q5{Batch workloads > 20%?}
+    
+    Q5 -->|No| A3[Optimize prompts + reduce context<br/>Expected: 20-40% savings]
+    Q5 -->|Yes| A4[Move to Batch API<br/>Expected: 15-25% savings]
+    
+    Q3 -->|No| A5[Hire/upskill, then re-evaluate<br/>Self-hosting needs expertise]
+    Q3 -->|Yes| Q6{Traffic predictable?}
+    
+    Q6 -->|Yes| A6[Self-host on reserved instances<br/>Expected: 40-60% savings vs API]
+    Q6 -->|No| A7[Hybrid: self-host base + API for burst<br/>Expected: 30-50% savings]
+    
+    style A1 fill:#90EE90
+    style A2 fill:#90EE90
+    style A4 fill:#90EE90
+    style A6 fill:#90EE90
+    style A7 fill:#FFD93D
+```
+
+**Optimization sequence (apply in order, measure after each):**
+1. Caching (easiest, highest ROI)
+2. Model routing (medium effort, huge savings)
+3. Prompt compression (low effort, moderate savings)
+4. Batch API for non-real-time (low effort, moderate savings)
+5. Self-hosting (high effort, high savings at scale)
+6. Knowledge distillation (highest effort, best long-term economics)

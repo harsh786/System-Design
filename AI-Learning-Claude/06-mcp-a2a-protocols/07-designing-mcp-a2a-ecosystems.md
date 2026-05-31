@@ -328,3 +328,64 @@ When designing your MCP/A2A ecosystem, document decisions:
 5. **Monitor everything** — Trace requests end-to-end
 6. **Govern access** — Not every user needs every tool
 7. **Version carefully** — Breaking changes break trust
+
+---
+
+## Staff-Level Considerations
+
+### Anti-Patterns
+
+**1. Building Ecosystem Before Proving Single Agent Works**
+Teams that jump to designing registries, gateways, and multi-agent orchestration before having one working MCP server with one useful tool waste months on infrastructure. Prove value with a single server → single host integration. Then scale.
+
+**2. No Governance for Who Can Publish Servers**
+Without a publishing policy, you get shadow MCP servers — unreviewed, unmonitored, potentially insecure tools that anyone can register. This is the same problem as ungoverned microservices but worse because AI agents will discover and use them autonomously.
+
+**3. Version Hell Across Ecosystem**
+When 50 MCP servers evolve independently with no coordination, clients face a combinatorial explosion of version compatibility. Server A v2 works with Server B v1 but not v3. Without ecosystem-wide version policies and compatibility matrices, upgrades become impossible.
+
+### Staff Decision: When to Adopt MCP/A2A vs Internal Protocols
+
+**Adopt MCP when:**
+- You're building tools that multiple AI applications will consume
+- You want to leverage the growing ecosystem of pre-built servers
+- Your organization uses multiple AI hosts (Claude, Copilot, custom)
+- You want portability — avoid vendor lock-in to one AI platform
+
+**Adopt A2A when:**
+- You have genuinely autonomous agents that need to discover and delegate to each other
+- Cross-organizational agent collaboration is a requirement
+- You need standardized task lifecycle across heterogeneous agent frameworks
+- Agent substitutability matters (swap providers without client changes)
+
+**Keep internal protocols when:**
+- All components are in one deployment/monorepo and won't be exposed externally
+- Performance requirements preclude protocol overhead (sub-10ms calls)
+- The "agents" are really just microservices with deterministic logic
+- You're iterating rapidly and the protocol would slow you down
+- Team size is small enough that informal contracts work
+
+### How the Ecosystem is Evolving
+
+**Anthropic** — Created MCP, ships first-party servers for filesystem, GitHub, Slack, etc. Claude Desktop is the reference MCP host. Driving spec evolution toward Streamable HTTP (replacing SSE), OAuth2 integration, and elicitation (agents asking users for input mid-tool-call).
+
+**Microsoft** — Embraced MCP in GitHub Copilot, VS Code, and Azure AI Foundry. Contributing to the spec. Building enterprise gateway patterns. Investing in MCP + A2A interop scenarios where Copilot agents delegate via A2A.
+
+**Community** — Hundreds of community MCP servers on GitHub. Quality varies wildly — some are production-grade, many are proof-of-concepts. The "awesome-mcp-servers" lists are useful but unvetted. Always audit before deploying.
+
+**Google** — Originated A2A protocol. Integrating with Vertex AI agents. Focused on enterprise multi-agent orchestration scenarios and standardized discovery.
+
+### Ecosystem Maturity Assessment
+
+| Signal | Early (Now) | Mature (Future) |
+|--------|-------------|-----------------|
+| Server quality | Variable, many PoCs | Certified, SLA-backed |
+| Discovery | Manual, lists | Automated registries |
+| Security | Per-server, ad-hoc | Ecosystem-wide policies |
+| Versioning | Breaking changes common | Semantic versioning enforced |
+| Monitoring | DIY | Standard observability |
+| Governance | None | Tiered publishing, review |
+
+### Architecture Recommendation
+
+For most organizations today: start with MCP for tool access (it's mature enough), be cautious with A2A (the spec is still evolving), and design your internal architecture so you can *adopt* A2A later without rewriting. This means: give your agents identities, define their capabilities formally, implement task lifecycle even if internal — so when A2A stabilizes, you wrap rather than rewrite.

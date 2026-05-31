@@ -374,3 +374,64 @@ Incorporates **conversation history** as an additional retrieval source.
 3. **Agentic RAG is most powerful but most expensive** — use only when needed
 4. **Combine patterns**: Real systems often use 3-4 patterns together
 5. **Each pattern adds complexity** — justify with measurable improvement
+
+---
+
+## Staff-Level Anti-Patterns
+
+### Anti-Pattern 1: Using Complex Patterns When Naive RAG Suffices
+A team builds Agentic RAG with multi-step retrieval, query decomposition, and self-correction for a FAQ bot over 50 documents. The naive approach would have worked at 1/10th the cost and latency. Complexity is not a feature.
+
+### Anti-Pattern 2: Not Measuring If Advanced Pattern Actually Improves Over Simple
+You implement HyDE because a paper said it's better. But you never A/B test against basic hybrid search on YOUR data. On some corpora, HyDE actually degrades performance because the hypothetical answer misleads search.
+
+### Anti-Pattern 3: Implementing Corrective RAG Without Evaluation Baseline
+CRAG adds a "check if retrieval is relevant" step. But if you can't measure retrieval quality already, how do you know CRAG is helping? You need metrics BEFORE adding corrective mechanisms, or you're flying blind.
+
+### Anti-Pattern 4: Stacking Patterns Without Understanding Interactions
+Adding multi-query + HyDE + reranking + CRAG all at once. These patterns interact — multi-query already improves recall, so adding HyDE on top may add latency without benefit. Add one pattern at a time, measure, then decide.
+
+---
+
+## Staff Decision Framework
+
+> "Start with naive RAG, measure, then upgrade only the bottleneck component."
+
+### The Diagnostic Upgrade Path
+
+| Symptom (Measured) | Bottleneck | Pattern to Add | Expected Improvement |
+|-------------------|-----------|----------------|---------------------|
+| Low recall (missing relevant docs) | Retrieval coverage | Multi-query or HyDE | +10-20% recall |
+| Low precision (irrelevant docs in top-K) | Ranking quality | Reranking (cross-encoder) | +10-15% precision |
+| Wrong answers despite good retrieval | Generation quality | Better prompting, CRAG | +5-10% faithfulness |
+| Fails on complex multi-part questions | Query complexity | Query decomposition | Handles new query types |
+| Vocabulary mismatch (user ≠ docs) | Embedding gap | HyDE or multi-query | +10-15% recall |
+| Needs exact + semantic matching | Search modality | Hybrid (BM25 + vector) | +15-20% recall |
+| Answers lack context | Chunk scope | Parent-child | Better answer quality |
+
+### The Upgrade Ceremony (Do This Every Time)
+
+1. **Baseline**: Run evaluation on golden dataset with current system
+2. **Hypothesis**: "Adding X will improve metric Y because we observe Z failure mode"
+3. **Implement**: Add the single pattern
+4. **Evaluate**: Run same golden dataset, compare metrics
+5. **Decision**: Keep if improvement > threshold (typically >5% on key metric), revert if not
+
+---
+
+## When Each Pattern Is Overkill vs Essential
+
+| Pattern | Overkill When... | Essential When... |
+|---------|-----------------|-------------------|
+| **Naive RAG** | Never overkill — it's the baseline | Always start here |
+| **Hybrid Search** | Corpus is purely natural language with no technical terms | Corpus has IDs, codes, names mixed with prose |
+| **Reranking** | Latency budget < 500ms total, or corpus < 1000 docs | Precision-critical (medical, legal, financial) |
+| **Multi-Query** | Queries are specific and well-formed | Users ask vague, ambiguous questions |
+| **HyDE** | Documents and queries use same vocabulary | Questions are casual, docs are formal |
+| **Parent-Child** | All documents are short (< 500 tokens) | Documents are long, answers need surrounding context |
+| **CRAG** | You can't measure retrieval quality yet | Safety-critical, must catch retrieval failures |
+| **Agentic** | Query is answerable from a single retrieval | Research-style queries needing iteration |
+| **Graph RAG** | No entity relationships matter | Domain is inherently relational (orgs, supply chains) |
+| **Query Decomposition** | Queries are simple factual lookups | "Compare X and Y" or multi-part questions |
+
+**The 80/20 rule**: Hybrid RAG + Reranking covers ~80% of production use cases. Everything else is for the remaining 20% where you've measured specific failure modes.

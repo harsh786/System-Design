@@ -290,3 +290,58 @@ flowchart TB
 5. **Data contracts prevent surprises** — agree on format, freshness, quality upfront
 6. **Incremental > full reindex** — process only what changed for speed and cost
 7. **Multi-source is the norm** — design for 10+ data sources from day one
+
+---
+
+## Staff+ Deep Dive: Anti-Patterns, Trade-offs, and AI-Specific Challenges
+
+### Anti-Patterns to Avoid
+
+**1. ETL Pipelines That Ignore AI-Specific Needs**
+Traditional ETL moves rows between databases. AI data engineering needs: chunking strategies (how to split documents), embedding generation (compute-intensive), metadata extraction, and relationship preservation. Teams that reuse their existing ETL for AI end up with pipelines that produce data the AI system can't effectively use.
+
+Fix: Build AI-aware pipelines that understand: chunk boundaries matter (don't split mid-sentence), embeddings must be regenerated when the embedding model changes, and metadata (source, date, author) must travel with the content.
+
+**2. No Data Quality Monitoring for AI Inputs**
+Traditional data quality checks (null checks, type checks, range checks) don't catch AI-specific issues: embedding drift (vectors shifting as model updates), semantic duplicates (same content, different wording counted twice), stale documents still being retrieved, or chunks that lost context during splitting.
+
+Fix: AI-specific quality metrics — embedding distribution monitoring, retrieval relevance sampling, freshness SLAs per data source, and periodic human evaluation of retrieved context quality.
+
+**3. Batch-Only When Real-Time Freshness Matters**
+Running nightly batch ingestion when users expect current information. "The document was updated 2 hours ago, why does the AI still give the old answer?" This erodes trust faster than anything else.
+
+Fix: Hybrid architecture — batch for bulk historical data, streaming (CDC/webhooks) for updates to frequently-changing sources. Define freshness SLAs per source: legal docs can be daily, product inventory must be real-time.
+
+**4. Ignoring Data Lineage for AI**
+When the AI gives a wrong answer, can you trace back to: which chunks were retrieved, from which documents, ingested when, processed by which pipeline version? Without lineage, debugging AI quality issues is guesswork.
+
+### Critical Trade-offs
+
+**Real-Time Ingestion vs. Batch**
+
+| Dimension | Real-Time (Streaming) | Batch |
+|-----------|----------------------|-------|
+| Freshness | Seconds to minutes | Hours to days |
+| Cost | 3-10x more expensive | Baseline |
+| Complexity | High (event ordering, dedup) | Low (simple scheduled jobs) |
+| Error handling | Complex (dead letter queues) | Simple (retry the whole batch) |
+| When to use | User-facing, trust-critical | Internal analytics, historical |
+
+**Managed Services vs. Custom Pipelines**
+- Managed (Azure AI Search indexers, Pinecone ingest, Weaviate cloud): faster to start, less control over chunking/processing, vendor lock-in
+- Custom (Airflow/Dagster + custom code): full control, more engineering effort, portable
+- Decision framework: use managed until you hit a limitation that costs you quality, then custom for that specific pipeline
+
+### AI-Specific vs. Traditional Data Engineering
+
+| Challenge | Traditional | AI-Specific |
+|-----------|-------------|-------------|
+| Schema | Fixed, enforced | Semi-structured, evolving |
+| Quality metric | Completeness, accuracy | Retrieval relevance, context quality |
+| Processing | Transform, aggregate | Chunk, embed, extract relationships |
+| Storage | Tables, lakes | Vector stores + metadata stores |
+| Update granularity | Row-level | Chunk-level (one doc = many chunks) |
+| Deletion | Delete row | Delete all chunks + vectors + references |
+| Versioning | Schema versions | Embedding model versions change everything |
+
+**The Embedding Model Update Problem**: When you upgrade your embedding model (which you will — they improve constantly), ALL existing vectors become incompatible. You need to re-embed your entire corpus. At scale (millions of documents), this is a multi-day, expensive operation. Plan for it: maintain infrastructure to do full re-indexing within your freshness SLA, or run dual indexes during transition.

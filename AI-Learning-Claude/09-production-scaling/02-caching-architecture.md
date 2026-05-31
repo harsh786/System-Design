@@ -300,3 +300,74 @@ With caching (40% hit rate):
 4. **Safety first** — never serve stale auth or outdated critical data
 5. **Monitor hit rates** — if below target, investigate and optimize
 6. **Version your caches** — model changes should invalidate response caches
+
+---
+
+## Staff-Level: Anti-Patterns
+
+### 1. Exact-Match-Only Cache (Low Hit Rate for AI)
+Users never ask the same question the same way twice. "What are your hours?" vs "When do you open?" vs "Are you open on weekends?" — all semantically similar but exact-match sees them as three cache misses. Without semantic caching, hit rates stay at 5-15% instead of 30-60%.
+
+### 2. No Cache Invalidation Strategy
+"We'll set TTL to 24 hours and forget about it." But what happens when:
+- The underlying data changes (product prices updated)
+- The model version changes (old cached answers may be wrong)
+- A prompt injection was cached and is now being served to other users
+- Regulatory information changes (compliance risk from stale answers)
+
+### 3. Caching Non-Deterministic Outputs as If Deterministic
+LLMs with temperature > 0 produce different outputs for identical inputs. Caching one response and serving it forever removes the variability users might expect. Worse: if the one cached response happens to be a bad generation, it's served repeatedly.
+
+**Fix:** Cache with confidence scoring — only cache responses that pass quality checks. Or cache at temperature=0 and add variability at the response layer.
+
+### 4. Caching Without TTL
+"The answer is always valid." Nothing is always valid. Even "What is 2+2?" might get a different system prompt context next month. Every cache entry needs a TTL, even if it's long (7 days). Unbounded caches become ghost answers from dead system states.
+
+---
+
+## Staff-Level: Trade-offs
+
+### Semantic Cache vs Exact Cache
+| Dimension | Semantic Cache | Exact Cache |
+|-----------|---------------|-------------|
+| Hit rate | 30-60% | 5-15% |
+| Complexity | High (needs embedding + ANN search) | Low (hash lookup) |
+| Latency overhead | 10-50ms (embedding + search) | <1ms |
+| Risk of wrong answer | Medium (similar ≠ same) | Zero |
+| Storage | Large (embeddings + metadata) | Small (key-value) |
+| Maintenance | Needs threshold tuning | Set and forget |
+
+**Decision:** Use exact cache as L1 (free, zero risk), semantic cache as L2 (higher hit rate, some risk). Never use semantic cache alone.
+
+### Cache Size vs Freshness
+- **Large cache, long TTL:** Higher hit rate but stale answers. Good for static knowledge domains.
+- **Small cache, short TTL:** Always fresh but low hit rate. Good for dynamic data (stock prices, news).
+- **Sweet spot:** Tiered TTL by content type. FAQ answers: 7 days. Data-dependent answers: 1 hour. Real-time data: 5 minutes.
+
+### Memory vs Latency
+Every cache layer adds memory cost. A semantic cache with 1M entries at 1536 dimensions = ~6GB of embeddings alone. At scale, cache infrastructure can cost more than the inference it saves. Track: `cache_infrastructure_cost < (hit_rate × inference_cost_per_request × request_volume)`.
+
+---
+
+## Staff-Level: Real Numbers
+
+### Achievable Cache Hit Rates with Semantic Caching
+Based on production deployments across different domains:
+
+| Domain | Exact-Match Hit Rate | Semantic Hit Rate | Threshold Used |
+|--------|---------------------|-------------------|----------------|
+| Customer support bot | 12% | 55% | 0.92 |
+| Internal knowledge base | 8% | 42% | 0.90 |
+| Code generation | 3% | 18% | 0.95 (strict) |
+| E-commerce product Q&A | 15% | 61% | 0.91 |
+| Healthcare triage | 5% | 28% | 0.96 (very strict) |
+
+**Key insight:** Repetitive domains (support, FAQ) benefit enormously from semantic caching. Creative/generative tasks (code, writing) benefit less because queries are more unique.
+
+**Cost impact at 50% semantic hit rate:**
+```
+100K requests/day × $0.03/request = $3,000/day without cache
+50% hit rate → $1,500/day savings = $45,000/month
+Semantic cache infrastructure cost: ~$2,000/month
+Net savings: $43,000/month (28x ROI on cache infrastructure)
+```

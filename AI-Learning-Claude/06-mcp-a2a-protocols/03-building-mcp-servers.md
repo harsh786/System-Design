@@ -366,3 +366,60 @@ atexit.register(cleanup)
 ```
 
 7. **Iterate** — add more tools, improve descriptions, handle edge cases
+
+---
+
+## Staff-Level Considerations
+
+### Anti-Patterns
+
+**1. No Input Validation**
+Trusting that the AI model will always send well-formed inputs is naive. Models hallucinate parameter values, send wrong types, and construct malicious-looking inputs when manipulated via prompt injection. Every tool must validate inputs independently of the caller.
+
+**2. No Rate Limiting on MCP Server**
+A model stuck in a retry loop can hammer your MCP server thousands of times per minute. Without rate limiting, this cascades into downstream service outages. Always rate limit at the tool level, especially for tools that call external APIs or databases.
+
+**3. Synchronous Tools Blocking Other Requests**
+MCP uses JSON-RPC which supports concurrent requests. If your tool does a 30-second API call synchronously and blocks the event loop, all other tool calls queue behind it. Use async implementations for I/O-bound tools.
+
+**4. No Health Check Endpoint**
+Production MCP servers need observability. Without a health check, you can't integrate with load balancers, monitoring systems, or automated restart policies. Add a lightweight ping/health tool or endpoint.
+
+**5. No Versioning**
+Changing tool schemas without versioning breaks clients silently. The AI model learned your old schema — if you rename a parameter, it will keep sending the old name. Version your server and maintain backward compatibility.
+
+### Trade-offs
+
+| Decision | stdio Transport | HTTP/SSE Transport |
+|----------|----------------|-------------------|
+| **Latency** | Minimal (IPC) | Network overhead |
+| **Security** | Process isolation | Requires TLS + auth |
+| **Multi-client** | One client only | Multiple concurrent |
+| **Deployment** | Bundled with host | Independent service |
+| **Debugging** | Harder (subprocess) | Standard HTTP tools |
+| **When to choose** | Local dev tools, IDE plugins | Shared team servers, production |
+
+| Decision | Stateful Server | Stateless Server |
+|----------|----------------|-----------------|
+| **Scaling** | Sticky sessions needed | Horizontal scale |
+| **Complexity** | Session management | Simpler |
+| **Use case** | DB connections, auth sessions | Pure computation, lookups |
+| **Failure recovery** | State loss on crash | Restart freely |
+
+### How Real Products Implement MCP
+
+**Cursor** — Runs MCP servers as stdio subprocesses. Each workspace can configure different servers. Tools appear in the model's context automatically. Limits tool count to prevent context bloat.
+
+**Claude Desktop** — Configures MCP servers via `claude_desktop_config.json`. Supports both stdio and HTTP. Implements user approval for sensitive tool calls (human-in-the-loop). Server lifecycle tied to app lifecycle.
+
+**Zed** — Integrates MCP servers as editor extensions. Tools become available as slash commands. Focuses on developer-centric servers (LSP bridge, terminal, file system).
+
+### Production Architecture Checklist
+
+1. **Graceful shutdown** — Handle SIGTERM, close connections, flush logs
+2. **Structured logging** — JSON logs with request IDs for correlation
+3. **Timeout on every external call** — Never let a tool hang indefinitely
+4. **Circuit breaker for downstream services** — Fail fast when dependencies are down
+5. **Schema validation at the boundary** — Don't pass unvalidated input to business logic
+6. **Secrets via environment variables** — Never in code, never in tool parameters
+7. **Container-ready** — Dockerfile, health endpoint, configurable via env vars

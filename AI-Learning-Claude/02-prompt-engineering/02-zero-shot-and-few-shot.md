@@ -206,3 +206,113 @@ Casual:"""
 - Order matters — put the most relevant example last
 - Modern models need fewer examples than older ones
 - In production, examples should be dynamically selected, not hardcoded
+
+---
+
+## Staff Architect: Anti-Patterns
+
+| Anti-Pattern | Why It's Harmful | Fix |
+|-------------|-----------------|-----|
+| **Too many examples consuming context** | 10+ examples at 200 tokens each = 2K tokens wasted per request; at scale this costs thousands in unnecessary spend and may push out actually relevant context | Cap at 3-5 examples; measure marginal accuracy gain per example added |
+| **Examples that don't match production distribution** | If real inputs are messy/informal but examples are clean/formal, the model learns the wrong pattern | Sample examples from actual production inputs, not hand-crafted ideal cases |
+| **Cherry-picked examples** | Selecting only "easy" examples that the model would already handle correctly teaches nothing | Include examples that represent the *hard* cases — ambiguous inputs, edge cases, format violations |
+| **Same examples for every query** | Static examples may be irrelevant to the current input, wasting context and potentially confusing the model | Implement dynamic few-shot: retrieve semantically similar examples per query |
+| **Examples with inconsistent format** | If examples show slightly different output structures, the model interpolates unpredictably | Enforce strict format consistency across all examples; validate with a linter |
+| **Not measuring example ROI** | Adding examples "because more is better" without measuring whether accuracy actually improves | A/B test zero-shot vs N-shot on your eval set; only keep examples that measurably improve metrics |
+
+## Staff Architect: Decision Framework — Zero-Shot vs Few-Shot
+
+```mermaid
+graph TD
+    A[New Task] --> B{Model is GPT-4/Claude 3.5+?}
+    B -->|Yes| C{Task is standard?<br/>classification, summary, translation}
+    B -->|No| F[Use few-shot 3-5 examples]
+    C -->|Yes| D{Output format matters?}
+    C -->|No| F
+    D -->|No| E[Zero-shot is sufficient]
+    D -->|Yes| G[1-2 examples for format only]
+    F --> H{Accuracy still insufficient?}
+    H -->|Yes| I{Budget allows?}
+    I -->|Yes| J[Dynamic few-shot with retrieval]
+    I -->|No| K[Consider fine-tuning instead]
+    H -->|No| L[Ship it]
+```
+
+| Factor | Favors Zero-Shot | Favors Few-Shot |
+|--------|-----------------|-----------------|
+| Model capability | Strong (GPT-4o, Claude 3.5) | Weak (GPT-3.5, small models) |
+| Task type | Standard/well-known | Custom/domain-specific |
+| Input diversity | Highly varied inputs | Consistent input patterns |
+| Cost sensitivity | High volume, cost matters | Low volume, accuracy matters |
+| Output format | Flexible | Must be exact |
+| Latency requirements | Strict latency SLA | Accuracy > speed |
+
+## Staff Architect: Dynamic Few-Shot Architecture
+
+Static few-shot hardcodes examples. **Dynamic few-shot** retrieves the most relevant examples per query at runtime.
+
+```python
+from sentence_transformers import SentenceTransformer
+import numpy as np
+
+class DynamicFewShotSelector:
+    """Retrieve semantically similar examples for each query."""
+    
+    def __init__(self, example_bank: list[dict], model_name="all-MiniLM-L6-v2"):
+        self.encoder = SentenceTransformer(model_name)
+        self.examples = example_bank
+        self.embeddings = self.encoder.encode([ex["input"] for ex in example_bank])
+    
+    def select(self, query: str, k: int = 3) -> list[dict]:
+        query_embedding = self.encoder.encode([query])
+        similarities = np.dot(self.embeddings, query_embedding.T).flatten()
+        top_indices = similarities.argsort()[-k:][::-1]
+        return [self.examples[i] for i in top_indices]
+
+# Usage
+selector = DynamicFewShotSelector(example_bank=load_examples_from_db())
+relevant_examples = selector.select(user_query, k=3)
+prompt = build_prompt_with_examples(relevant_examples, user_query)
+```
+
+### When to Use Dynamic Few-Shot
+
+| Scenario | Static Few-Shot | Dynamic Few-Shot |
+|----------|----------------|------------------|
+| < 10 distinct input patterns | Sufficient | Overkill |
+| 100+ distinct input patterns | Examples won't cover space | Essential for coverage |
+| Domain with evolving categories | Requires prompt updates | Add new examples to bank without changing prompt logic |
+| Multi-tenant with different needs | One-size-fits-all | Per-tenant example banks |
+| Latency-sensitive | No retrieval overhead | Adds 10-50ms for embedding + search |
+
+### Production Considerations
+- **Example bank size:** 100-1000 examples is typical; beyond that, clustering/deduplication needed
+- **Embedding model:** Use a small, fast model (MiniLM) — not your main LLM
+- **Cache:** Cache embeddings; recompute only when example bank changes
+- **Diversity:** After retrieving top-K by similarity, optionally re-rank for diversity (avoid K examples from same cluster)
+- **Monitoring:** Track which examples get selected most/least to identify gaps in coverage
+
+---
+
+## Staff Decision: When to Move from Few-Shot to Fine-Tuning
+
+Few-shot prompting has limits. Here's when to graduate to fine-tuning:
+
+| Signal | Few-Shot Still Works | Time to Fine-Tune |
+|--------|:-------------------:|:-----------------:|
+| Examples needed | 3-5 sufficient | 8+ and still inconsistent |
+| Token cost of examples | < 20% of total prompt | > 40% of total prompt |
+| Output format consistency | > 90% parse rate | < 85% even with examples |
+| Task complexity | Standard patterns | Highly specialized domain |
+| Volume | < 100K requests/day | > 500K requests/day (cost of examples dominates) |
+| Quality bar | "Good enough" | Must be near-perfect |
+
+**The crossover calculation:**
+```
+Few-shot cost  = (base_prompt + N_examples × tokens_per_example) × price × volume
+Fine-tune cost = training_cost + (base_prompt_only × price × volume)
+
+If few-shot_cost - fine-tune_cost > fine-tune training cost within 30 days → fine-tune
+```
+
+**Rule of thumb:** If you're spending >$5K/month on example tokens alone, fine-tuning likely pays for itself within one month.

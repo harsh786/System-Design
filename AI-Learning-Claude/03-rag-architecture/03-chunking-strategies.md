@@ -338,3 +338,65 @@ graph TD
 4. **Overlap prevents boundary splits** — always use some overlap
 5. **Include structural context** (headings, titles) in each chunk
 6. **Chunk size affects everything downstream** — test empirically
+
+---
+
+## Staff-Level Anti-Patterns
+
+### Anti-Pattern 1: Fixed-Size Chunks Ignoring Semantics
+Blindly chunking at 512 tokens regardless of content. A chunk that starts mid-sentence and ends mid-paragraph is useless for retrieval AND generation. The embedding captures noise, and the LLM receives incoherent context.
+
+### Anti-Pattern 2: Chunks Too Small (Lose Context)
+Chunking at 100 tokens seems like it would improve precision, but it destroys context. "The dosage is 5mg" without knowing which drug, which patient population, and which condition is dangerous in medical RAG.
+
+### Anti-Pattern 3: Chunks Too Large (Dilute Relevance)
+Chunking at 2000 tokens means the embedding represents a blend of multiple topics. When you search, the chunk matches weakly on many queries rather than strongly on the right one. The signal-to-noise ratio drops.
+
+### Anti-Pattern 4: Not Preserving Document Hierarchy
+Chunking a document without carrying forward its heading path. A chunk that says "see above for exceptions" is useless without the parent section context. Always prepend the heading breadcrumb.
+
+### Anti-Pattern 5: Chunking Without Overlap for Narrative Content
+Narrative documents (reports, papers) often have answers that span paragraph boundaries. Zero overlap means these answers exist in no single chunk. For narrative content, 10-20% overlap is essential.
+
+---
+
+## Trade-offs Table: Chunk Size vs Retrieval Precision vs Context Usage
+
+| Chunk Size | Retrieval Precision | Context Window Usage | Embedding Quality | Best For |
+|-----------|--------------------|--------------------|-------------------|----------|
+| 64-128 tokens | Very high (specific) | Low (many chunks fit) | Poor (too little context for good embedding) | Sentence-level FAQ |
+| 256-512 tokens | High | Medium | Good (sweet spot for most embedding models) | General purpose |
+| 512-1024 tokens | Medium | High (fewer chunks fit) | Good | Long-form content, legal |
+| 1024-2048 tokens | Low (diluted) | Very high | Declining (too much noise) | Only with parent-child |
+
+**The fundamental tension**: Small chunks → better retrieval precision but worse embeddings and less context per chunk. Large chunks → better embeddings and more context but worse retrieval precision (match too broadly).
+
+**Resolution**: Parent-child chunking. Search on small (256 token) children, return large (1024 token) parents. This is why parent-child is the production standard.
+
+---
+
+## Real-World: Different Document Types Need Different Strategies
+
+| Document Type | Recommended Strategy | Chunk Size | Overlap | Why |
+|--------------|---------------------|-----------|---------|-----|
+| **Code** | Function/class-level | Variable (per function) | None | Functions are natural semantic units |
+| **Legal contracts** | Clause-level (heading-aware) | 512-1024 tokens | 100 tokens | Clauses cross-reference; need full clause |
+| **Medical literature** | Section-aware + parent-child | 256 (child) / 1024 (parent) | 50 tokens | Precision critical; context needed for safety |
+| **Conversational (Slack/chat)** | Message-group (5-10 messages) | Variable | 2-3 messages | Conversations are sequential; context is temporal |
+| **API documentation** | Endpoint-level | Variable (per endpoint) | None | Each endpoint is self-contained |
+| **Financial reports** | Table-aware + section-level | 512 tokens (text), full table | 50 tokens | Tables must never be split |
+| **Research papers** | Abstract + section-level | 512 tokens | 1 paragraph | Sections are topically coherent |
+| **Meeting notes** | Topic-level (agenda items) | Variable | None | Each agenda item is a unit |
+
+### The "One Strategy Per Document Type" Rule
+
+Production systems should classify documents at ingestion time and route to different chunking strategies:
+
+```python
+def chunk_document(doc):
+    doc_type = classify_document_type(doc)  # code, legal, medical, etc.
+    strategy = CHUNKING_STRATEGIES[doc_type]
+    return strategy.chunk(doc)
+```
+
+This single architectural decision — matching chunking to document type — typically improves retrieval recall by 15-30% over uniform chunking.

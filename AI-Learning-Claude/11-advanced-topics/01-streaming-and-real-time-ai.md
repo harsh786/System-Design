@@ -279,3 +279,89 @@ flowchart TB
 
 - Build the [Streaming Pipeline Program](./programs/streaming-pipeline/) to see real-time RAG in action
 - Explore [Real-Time RAG Program](./programs/real-time-rag/) for immediate searchability
+
+---
+
+## Anti-Patterns
+
+### 1. No Backpressure Implementation
+
+**What goes wrong:** Producer sends tokens/events faster than consumer can process. Memory grows unbounded, system crashes or drops data silently.
+
+**The pattern:**
+```
+Producer (1000 events/sec) → Consumer (100 events/sec) → OVERFLOW
+```
+
+**Fix:** Implement backpressure at every boundary:
+- Consumer signals capacity to producer (reactive streams)
+- Buffer with bounded size + overflow policy (drop oldest, reject new, or slow producer)
+- Monitor buffer fill rate as early warning
+
+### 2. Streaming Without Error Recovery
+
+**What goes wrong:** Mid-stream failure (network blip, model timeout) kills the entire response. User sees partial output with no indication of failure and no way to resume.
+
+**Fix:**
+- Checkpoint streaming progress (last acknowledged token/chunk)
+- On failure: reconnect and resume from last checkpoint
+- Client-side: detect incomplete streams, show retry option
+- Server-side: keep response buffer for replay window (30-60 seconds)
+
+### 3. Buffering Entire Response Before Sending
+
+**What goes wrong:** Defeats the purpose of streaming. System waits for complete response, then sends it all at once. User perceives high latency despite model already generating tokens.
+
+**Common cause:** Middleware that collects the full response for logging, validation, or transformation before forwarding.
+
+**Fix:** Use tee/passthrough patterns — forward tokens to user AND to logging/validation simultaneously. Validate incrementally where possible.
+
+### 4. No Timeout on Streaming Connections
+
+**What goes wrong:** Idle connections stay open forever. Resource exhaustion as thousands of zombie connections accumulate. Server runs out of file descriptors or memory.
+
+**Fix:**
+- Idle timeout: close if no data for 30 seconds
+- Maximum connection duration: hard cap at 5 minutes
+- Heartbeat/ping frames to detect dead connections
+- Server-side connection tracking with cleanup sweeps
+
+---
+
+## Key Trade-offs
+
+### SSE vs WebSocket
+
+| Factor | SSE | WebSocket |
+|--------|-----|-----------|
+| Direction | Server → Client only | Bidirectional |
+| Protocol | HTTP (works with proxies, CDNs) | Upgrade from HTTP (some proxies break) |
+| Reconnection | Built-in auto-reconnect | Manual implementation needed |
+| Complexity | Simple, text-based | More complex, binary capable |
+| Best for | Token streaming, notifications | Chat with user interrupts, real-time collaboration |
+
+**Decision:** Use SSE unless you need client-to-server streaming mid-response (e.g., user cancels generation, sends corrections while streaming).
+
+### Token-by-Token vs Chunk Streaming
+
+| Factor | Token-by-token | Chunk (sentence/paragraph) |
+|--------|---------------|---------------------------|
+| Perceived latency | Lowest (first token in ~200ms) | Higher (first chunk in ~1-2s) |
+| Network overhead | High (many tiny packets) | Lower (fewer, larger packets) |
+| Client complexity | Higher (need to handle partial words) | Lower (complete units) |
+| Post-processing | Hard (can't validate partial output) | Easier (validate complete chunks) |
+
+**Decision:** Token-by-token for chat UX (user sees "thinking"). Chunk for structured output (JSON, code) where partial tokens are meaningless.
+
+### Streaming Complexity vs UX Benefit
+
+**When streaming is worth the complexity:**
+- User-facing chat (massive perceived latency improvement)
+- Long-running generation (> 3 seconds)
+- Real-time collaboration features
+
+**When streaming is NOT worth it:**
+- Backend-to-backend calls (no human waiting)
+- Short responses (< 1 second total)
+- Structured outputs that need validation before display
+- Batch processing pipelines

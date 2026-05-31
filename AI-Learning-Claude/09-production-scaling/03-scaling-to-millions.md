@@ -295,3 +295,90 @@ flowchart TB
 4. **Stream responses** — users perceive streaming as 10-15x faster
 5. **Degrade gracefully** — a simple answer is better than a timeout
 6. **Capacity plan with peaks** — lunch hour traffic can be 3-5x average
+
+---
+
+## Staff-Level: Anti-Patterns
+
+### 1. Scaling AI Like Traditional Web Services
+Web services are CPU-bound and scale horizontally trivially. AI inference is GPU-bound with fundamentally different constraints:
+- GPUs are scarce (weeks to provision, not seconds)
+- GPU memory is fixed (can't add RAM like CPU servers)
+- Model loading takes minutes (not the milliseconds of starting a web server)
+- Batch size affects throughput non-linearly (GPU utilization depends on concurrent requests)
+
+Applying auto-scaling rules designed for web services (scale on CPU > 70%) to GPU inference clusters leads to either massive over-provisioning or catastrophic under-capacity.
+
+### 2. No Autoscaling (Fixed Capacity)
+"We'll provision for peak and run 24/7." At $30/hour per A100, fixed capacity for peak (3x average) means 67% waste during off-peak. AI workloads have extreme variance — batch jobs at night, interactive peaks during business hours.
+
+### 3. Ignoring Cold Start Latency for Model Loading
+A Llama-70B model takes 2-5 minutes to load into GPU memory. If your autoscaler provisions a new instance when queue depth hits threshold, users wait 5 minutes before the new capacity is available. By then the queue has exploded.
+
+**Fix:** Pre-warm pools. Keep N+1 instances warm with model loaded but idle. Scale the warm pool, not from zero.
+
+### 4. Not Separating Read-Heavy from Write-Heavy Paths
+In AI systems:
+- **Read-heavy:** Inference requests, retrieval queries, cache lookups
+- **Write-heavy:** Document ingestion, embedding generation, index updates, fine-tuning jobs
+
+These have completely different scaling profiles. Inference needs low-latency GPUs. Ingestion needs high-throughput batch processing. Mixing them on the same infrastructure means neither is optimized.
+
+---
+
+## Staff-Level: Trade-offs
+
+### Horizontal vs Vertical Scaling for Inference
+| Dimension | Horizontal (more GPUs) | Vertical (bigger GPUs) |
+|-----------|----------------------|----------------------|
+| Latency | Higher (network hops) | Lower (single device) |
+| Throughput | Linear scaling | Limited by single device |
+| Cost efficiency | Better at scale | Better for large models |
+| Failure blast radius | Small (one node) | Large (lose all capacity) |
+| Model size limit | Unlimited (tensor parallelism) | Limited by GPU VRAM |
+
+**Rule of thumb:** If the model fits on one GPU, scale horizontally. If it requires multi-GPU (70B+ params), you need vertical scaling first, then horizontal replication of multi-GPU pods.
+
+### Pre-Warming vs Cold Start
+- **Pre-warming:** Keep idle GPUs with models loaded. Cost: $30/hr per idle A100. Benefit: instant scaling.
+- **Cold start:** Scale from zero. Cost: $0 when idle. Penalty: 2-5 minutes before new capacity serves traffic.
+- **Hybrid:** Keep minimum warm pool + allow cold-start expansion for extreme bursts. Queue absorbs the cold-start delay.
+
+### Over-Provisioning vs Queue-Based
+- **Over-provisioning:** Always have 2x needed capacity. Users never wait. Cost: 2x.
+- **Queue-based:** Provision for average load, queue bursts. Users wait 5-30s during peaks. Cost: 1x.
+- **Sweet spot:** Provision for P80 traffic, queue the P80-P99 burst, shed/reject P99+ with graceful errors.
+
+---
+
+## Staff-Level: Real Numbers — Throughput Per GPU Type
+
+### Inference Throughput (tokens/second, output generation)
+
+| GPU | Llama-7B | Llama-13B | Llama-70B | GPT-4 class |
+|-----|----------|-----------|-----------|-------------|
+| A10G (24GB) | 80 tok/s | 45 tok/s | N/A (won't fit) | N/A |
+| A100-40GB | 150 tok/s | 95 tok/s | 25 tok/s (needs 2) | N/A |
+| A100-80GB | 180 tok/s | 120 tok/s | 45 tok/s | N/A |
+| H100-80GB | 350 tok/s | 220 tok/s | 90 tok/s | ~50 tok/s |
+
+### Batch throughput (with continuous batching, e.g., vLLM)
+
+| GPU | Concurrent Users | Throughput (tok/s total) | Latency P50 |
+|-----|-----------------|------------------------|-------------|
+| H100 + Llama-70B | 1 | 90 | 11ms/tok |
+| H100 + Llama-70B | 8 | 400 | 20ms/tok |
+| H100 + Llama-70B | 32 | 900 | 35ms/tok |
+| H100 + Llama-70B | 64 | 1100 | 58ms/tok |
+
+**Key insight:** Throughput scales sub-linearly with batch size, but latency increases. There's an optimal batch size where throughput/$ is maximized — typically 16-32 concurrent requests per GPU for large models.
+
+### Cost per 1M output tokens by deployment
+
+| Deployment | Model | Cost/1M tokens | Latency P50 |
+|-----------|-------|---------------|-------------|
+| OpenAI API | GPT-4o | $15.00 | 800ms |
+| OpenAI API | GPT-4o-mini | $0.60 | 400ms |
+| Self-hosted H100 | Llama-70B | $0.80 | 500ms |
+| Self-hosted A100 | Llama-70B | $1.50 | 900ms |
+| Self-hosted H100 | Llama-8B | $0.10 | 100ms |

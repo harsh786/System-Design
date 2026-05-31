@@ -197,3 +197,140 @@ if total_tokens > TOKEN_BUDGET:
 - Main cost: more tokens and slower execution
 - Use for complex tasks; skip for simple ones
 - Always implement loop detection and max iterations
+
+---
+
+## Staff-Level: Anti-Patterns
+
+| Anti-Pattern | Why It Fails | Fix |
+|-------------|-------------|-----|
+| Infinite reasoning loops | Agent thinks in circles without making progress — burns tokens endlessly | Cap iterations (hard max), detect thought similarity >0.85, inject "try a completely different approach" |
+| Not capping iterations | A 50-step ReAct trace costs $2-5 in tokens and takes minutes | Set max_iterations=5-10 for most tasks; force final_answer at limit |
+| ReAct for simple direct-answer questions | "What's 2+2?" doesn't need Thought→Action→Observation — massive overkill | Route simple queries to direct response; only use ReAct for multi-step tasks |
+| No observation validation | Tool returns garbage/error, agent treats it as valid data and reasons on top of noise | Validate observations before injecting: check for error codes, empty results, nonsensical outputs |
+| Thoughts that don't add information | "I should search for this" (adds nothing vs just searching) — wastes tokens | Prompt the model to include NEW reasoning: what it learned, what changed, why this next action |
+
+---
+
+## Staff-Level: Trade-offs
+
+### ReAct vs Function-Calling vs Plan-Then-Execute
+
+| Dimension | ReAct | Native Function Calling | Plan-Then-Execute |
+|-----------|-------|------------------------|-------------------|
+| **Transparency** | High (explicit thoughts) | Low (reasoning hidden) | Medium (plan visible) |
+| **Speed** | Slow (thought tokens) | Fast (minimal overhead) | Medium (plan + execute) |
+| **Token cost** | High (2-3x more tokens) | Low | Medium |
+| **Complex reasoning** | Excellent | Adequate for simple | Good for structured |
+| **Debugging** | Easy (read the trace) | Hard (why did it pick that?) | Medium (see the plan) |
+| **Error recovery** | Good (can reason about errors) | Limited (retry or fail) | Good (can re-plan) |
+| **Best for** | Novel/complex tasks | Routine/simple tasks | Tasks with known structure |
+
+**Decision rule**: Use function-calling by default. Add ReAct only when you need debuggability or the task requires multi-step reasoning that function-calling gets wrong.
+
+---
+
+## Staff-Level: When ReAct Fails
+
+ReAct degrades significantly in these scenarios:
+
+1. **Tasks requiring >5 steps** — Context fills up with thoughts, observations get pushed out, agent loses track of earlier findings. Solution: summarize every 3-4 steps.
+
+2. **Tasks needing precise upfront planning** — ReAct is greedy (one step at a time). For tasks where step 5 depends on choices at step 1, plan-then-execute wins because it considers the full path.
+
+3. **High-throughput production systems** — The 2-3x token overhead of thoughts makes ReAct expensive at scale. Reserve for complex cases, use lightweight patterns for routine work.
+
+4. **Tasks with strict output format** — ReAct's free-form thoughts can drift. The model forgets the required output schema after many reasoning steps.
+
+5. **Concurrent/parallel tasks** — ReAct is inherently sequential (think→act→observe). If subtasks are independent, a DAG executor is more efficient.
+
+**Staff insight**: In production, most teams implement a "hybrid" — ReAct-style reasoning for the first few steps to establish approach, then switch to direct execution for the remaining mechanical steps. This gives you debuggability where it matters without the full token cost.
+
+---
+
+## ReAct Variants and Extensions
+
+### ReWOO (Reasoning Without Observation)
+
+```
+Key difference: Plan ALL tool calls upfront, execute in batch, then reason over results.
+
+Flow:  Plan → [Tool1, Tool2, Tool3] → Execute all → Synthesize
+
+Advantages:
+- Parallel tool execution (3-5x faster for independent calls)
+- Lower token cost (no interleaved reasoning between each tool)
+- Predictable latency (know upfront how many calls)
+
+Disadvantages:
+- Can't adapt mid-execution (no course correction)
+- Wasted calls if early results would have changed the plan
+- Poor for exploratory tasks where next step depends on previous result
+
+Best for: Well-structured tasks with independent data gathering steps
+```
+
+### LATS (Language Agent Tree Search)
+
+```
+Key difference: Explore multiple reasoning paths, backtrack on failures.
+
+Flow:  Think → Act → Observe → Score → Branch/Backtrack
+
+Advantages:
+- Higher success rate on complex tasks (explores alternatives)
+- Self-correcting (backtracks from bad paths)
+- Produces confidence scores per path
+
+Disadvantages:
+- 5-20x more expensive than standard ReAct (multiple paths)
+- High latency (sequential exploration)
+- Complex to implement and debug
+
+Best for: High-value tasks where correctness > cost (code generation, complex reasoning)
+```
+
+### Comparison Matrix
+
+| Variant | Token Cost | Latency | Adaptability | Implementation Complexity |
+|---------|-----------|---------|--------------|--------------------------|
+| Standard ReAct | 2-3x base | Medium | High | Low |
+| ReWOO | 1.5x base | Low (parallel) | None (fixed plan) | Medium |
+| LATS | 5-20x base | High | Very high | High |
+| Hybrid (ReAct → Direct) | 1.5-2x base | Medium-Low | Medium | Low |
+
+## Production Tuning for ReAct Loops
+
+```
+Key parameters to tune:
+  max_iterations:     Start at 5, increase only with evidence (most tasks solve in 3)
+  thought_budget:     Limit reasoning tokens per step (150-300 tokens usually sufficient)
+  early_termination:  If confidence > threshold after step N, skip remaining
+  retry_policy:       Tool failures get 1 retry, then force alternative approach
+  
+Anti-patterns to detect:
+  - Loop repetition: Same thought/action appearing twice → force terminate
+  - Observation ignoring: Model repeats action despite contradicting observation
+  - Goal drift: Thought diverges from original task → inject reminder
+```
+
+## Cost Management for Iterative Agents
+
+```
+Per-request cost model:
+  Cost = Σ(input_tokens + output_tokens) × price_per_token × num_iterations
+
+Cost controls:
+  1. Hard budget per request: $0.50 max → terminate gracefully at limit
+  2. Escalating model: Start with cheap model (GPT-4o-mini), promote to expensive (Claude Opus)
+     only if cheap model fails after 3 iterations
+  3. Cache observations: If same tool+args seen before, reuse result (saves tool cost + latency)
+  4. Thought compression: Summarize history every 5 steps instead of carrying full trace
+
+Monitoring:
+  - Track cost per successful completion vs. cost per failure
+  - Alert if avg iterations trending up (may indicate prompt/tool regression)
+  - Dashboard: cost distribution across users/tasks to find outliers
+```
+
+**Staff rule of thumb**: If your ReAct agent averages more than 5 iterations, you likely have a tool design problem (tools too granular) or a prompt problem (unclear goal specification), not an algorithm problem.

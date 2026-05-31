@@ -199,3 +199,176 @@ Allocate a budget per component and enforce it:
 - Cost = tokens × price — small per request, massive at scale
 - Always calculate: what does this design cost at 100K requests/day?
 - Use token budgets to prevent context window overflow
+
+---
+## Anti-Patterns
+1. **Not counting tokens** - Discovering overflow in production
+2. **Wasting context on verbose prompts** - Every token costs money and attention
+3. **Ignoring the "lost in the middle" problem** - Models attend poorly to middle of long contexts
+4. **Fixed context allocation** - Same context strategy for simple and complex queries
+5. **No token budget per component** - System prompt eating 50% of available context
+
+## Trade-Offs
+| Decision | Option A | Option B | Guidance |
+|----------|----------|----------|----------|
+| Long context vs RAG | Stuff everything in | Retrieve relevant only | RAG wins at >100 docs |
+| Precise vs approximate counting | tiktoken (exact) | word/4 estimate | Use exact for production |
+| Context priority | More examples | More retrieved docs | Depends on task type |
+
+## Real-World Numbers (2025)
+- GPT-4o: 128K context, ~$2.50/M input tokens
+- Claude 3.5: 200K context, ~$3.00/M input tokens  
+- Gemini 1.5 Pro: 2M context, ~$1.25/M input tokens
+- Cost of max context: 200K tokens × $3/M = $0.60 per request
+- At 1M requests/day with full context: $600K/day = $18M/month (this is why context management matters!)
+
+---
+
+## Token Budgeting Strategies for Production
+
+### The Budget Allocation Framework
+
+In production systems, every token must be justified. Define explicit budgets per component:
+
+```mermaid
+graph TD
+    A[Total Token Budget<br/>e.g., 12,000 tokens] --> B[Fixed Allocation<br/>System prompt: 500<br/>Output reserve: 2,000]
+    A --> C[Dynamic Allocation<br/>Context: 4,000-8,000<br/>History: 1,000-4,000]
+    A --> D[Overflow Strategy<br/>What to cut when budget exceeded]
+    
+    D --> E[Cut oldest history first]
+    D --> F[Reduce RAG chunks]
+    D --> G[Summarize instead of raw]
+```
+
+### Priority-Based Token Management
+
+```python
+# Production token budget manager
+class TokenBudget:
+    def __init__(self, max_tokens=12000, output_reserve=2000):
+        self.max_input = max_tokens - output_reserve
+        self.allocations = {
+            "system_prompt": {"budget": 500, "priority": 1, "compressible": False},
+            "user_query": {"budget": 500, "priority": 1, "compressible": False},
+            "retrieved_context": {"budget": 5000, "priority": 2, "compressible": True},
+            "conversation_history": {"budget": 3000, "priority": 3, "compressible": True},
+            "few_shot_examples": {"budget": 1000, "priority": 4, "compressible": True},
+        }
+    
+    def allocate(self, components: dict) -> dict:
+        """Fit components within budget, cutting lowest priority first."""
+        # Priority 1 items always included
+        # Priority 4 items cut first when over budget
+        ...
+```
+
+### Context Window Management at Scale
+
+| Strategy | Latency Impact | Quality Impact | Implementation Complexity |
+|----------|:-------------:|:--------------:|:------------------------:|
+| Sliding window (drop old messages) | None | Medium loss | Low |
+| Periodic summarization | +200ms | Low loss | Medium |
+| RAG over conversation history | +100ms | Minimal loss | High |
+| Hierarchical compression | +150ms | Low loss | High |
+| Hybrid (summarize + retrieve) | +250ms | Minimal loss | Very High |
+
+### Real Cost Calculations at Scale
+
+**Scenario: Enterprise SaaS with 10K daily active users**
+
+| Parameter | Conservative | Aggressive |
+|-----------|:----------:|:---------:|
+| Requests per user/day | 20 | 50 |
+| Avg input tokens/request | 3,000 | 8,000 |
+| Avg output tokens/request | 500 | 1,500 |
+| Daily requests | 200K | 500K |
+| Model | GPT-4o-mini | GPT-4o |
+
+**Conservative (GPT-4o-mini):**
+```
+Input:  200K × 3,000 × $0.15/1M = $90/day
+Output: 200K × 500 × $0.60/1M = $60/day
+Total: $150/day = $4,500/month
+```
+
+**Aggressive (GPT-4o):**
+```
+Input:  500K × 8,000 × $2.50/1M = $10,000/day
+Output: 500K × 1,500 × $10.00/1M = $7,500/day
+Total: $17,500/day = $525,000/month
+```
+
+**The difference between smart and naive token management is $4,500/mo vs $525,000/mo.**
+
+---
+
+## Token Optimization Techniques
+
+### 1. Prompt Compression
+Remove redundant language while preserving meaning:
+```
+# Before (87 tokens)
+"You are a helpful assistant. Your job is to help users with their questions. 
+Please make sure to provide accurate information. If you don't know the answer, 
+please let the user know that you don't have that information available."
+
+# After (32 tokens)  
+"You are a helpful assistant. Answer accurately. Say 'I don't know' when uncertain."
+```
+**Savings:** 63% fewer tokens per request.
+
+### 2. Context Summarization
+For long conversations, summarize older turns:
+```
+# Raw history: 3,000 tokens
+Turn 1: User asked about pricing... (400 tokens)
+Turn 2: Assistant explained tiers... (600 tokens)
+Turn 3: User asked about enterprise... (400 tokens)
+...
+
+# Summarized: 200 tokens
+"Previous conversation: User inquired about pricing tiers. 
+Discussed Pro ($50/mo) and Enterprise (custom) plans. 
+User is evaluating Enterprise for a 500-person team."
+```
+
+### 3. Selective RAG Retrieval
+Don't retrieve K chunks blindly — use relevance scores:
+```
+# Bad: Always retrieve top 10 chunks (5,000 tokens)
+# Good: Retrieve top 10, filter by relevance > 0.75, keep max 5
+#   → Average 3 chunks used (1,500 tokens), 70% savings
+```
+
+### 4. Response Length Control
+Set `max_tokens` appropriately per task type:
+
+| Task | Appropriate max_tokens | Anti-pattern |
+|------|:---------------------:|:------------:|
+| Classification | 10-50 | 4,096 |
+| Entity extraction | 200-500 | 4,096 |
+| Summarization | 200-800 | 4,096 |
+| Code generation | 1,000-2,000 | 4,096 |
+| Long-form writing | 2,000-4,000 | 16,384 |
+
+---
+
+## Context Window Evolution Timeline
+
+| Year | Largest Context | Model | Significance |
+|------|:--------------:|-------|-------------|
+| 2022 | 4K tokens | GPT-3.5 | Could barely fit a long email |
+| 2023 Q1 | 32K tokens | GPT-4 | First "long context" era |
+| 2023 Q3 | 100K tokens | Claude 2 | Could fit a short book |
+| 2024 Q1 | 200K tokens | Claude 3 | Novel-length documents |
+| 2024 Q2 | 1M tokens | Gemini 1.5 Pro | Multiple books simultaneously |
+| 2024 Q4 | 2M tokens | Gemini 1.5 Pro | Entire codebases |
+| 2025 | 1M+ standard | Multiple | Context is commoditized |
+
+### Implications for Architects
+
+1. **Longer context doesn't eliminate RAG** — cost scales linearly, so stuffing 1M tokens costs ~$3 per request
+2. **"Lost in the middle" problem persists** — models attend poorly to information in the middle of very long contexts
+3. **Hybrid strategies win** — use long context for always-needed info, RAG for query-specific retrieval
+4. **Cost discipline matters more** — with bigger windows, the temptation to "just put it all in" grows, but so does the bill

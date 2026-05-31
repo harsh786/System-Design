@@ -263,3 +263,53 @@ Use a 2×2 matrix:
 3. **The first 3 migrations teach you everything** — Don't over-plan; learn by doing
 4. **Governance is a product** — Treat internal teams as customers
 5. **Cost savings fund the platform** — Use saved money to justify platform investment
+
+---
+
+## Migration Risk Assessment Framework
+
+For each system being migrated, score these dimensions (1-5):
+
+| Risk Dimension | Score Criteria | Mitigation Strategy |
+|---------------|----------------|---------------------|
+| **Data complexity** | 1=stateless, 5=complex state with relationships | Start with stateless services; use CDC for stateful |
+| **Traffic criticality** | 1=internal tool, 5=revenue-critical path | Shadow traffic testing before cutover |
+| **Team readiness** | 1=experienced with new stack, 5=no familiarity | Pair programming, training sprints pre-migration |
+| **Integration density** | 1=standalone, 5=10+ downstream consumers | Build adapter layer; migrate consumers incrementally |
+| **Rollback difficulty** | 1=instant rollback, 5=irreversible (schema changes) | Maintain dual-write capability during transition |
+
+**Risk score interpretation:**
+- 5-10: Low risk — Migrate early to build confidence
+- 11-17: Medium risk — Needs detailed planning and staged rollout
+- 18-25: High risk — Requires executive sponsorship and dedicated team
+
+## Rollback Decision Criteria
+
+Define these BEFORE migration begins:
+
+1. **Error rate threshold**: If error rate exceeds 2x baseline for >5 minutes → automatic rollback
+2. **Latency threshold**: If p99 latency exceeds 3x baseline for >10 minutes → manual decision
+3. **Data consistency**: Any detected data loss or corruption → immediate rollback
+4. **Business metric impact**: If conversion/revenue drops >1% → pause and investigate
+5. **Rollback window**: First 72 hours = instant rollback capability required
+
+**Rollback types:**
+- **Hot rollback**: Traffic switch back to old system (seconds) — requires both systems running
+- **Warm rollback**: Redeploy old version (minutes) — requires maintained deployment pipeline
+- **Cold rollback**: Restore from backup + replay events (hours) — last resort
+
+## Communication Plan Template
+
+| Audience | When | Channel | Content |
+|----------|------|---------|---------|
+| Engineering teams | 4 weeks before | Tech all-hands + doc | Timeline, what changes for them, support plan |
+| Stakeholders/PMs | 2 weeks before | Email + meeting | Business impact, risk mitigations, success metrics |
+| On-call teams | 1 week before | Runbook update + training | New alerts, escalation paths, rollback procedures |
+| All engineering | Day of migration | Slack channel | Real-time status updates, who to contact |
+| Leadership | Day after | Summary email | Results, metrics comparison, next steps |
+
+**Key communication principles:**
+- Over-communicate during the migration window
+- Establish a dedicated Slack channel for real-time coordination
+- Name a single "migration commander" who makes go/no-go decisions
+- Send "all clear" signal explicitly — silence breeds anxiety

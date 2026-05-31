@@ -367,3 +367,69 @@ Track these metrics:
 4. **Handle updates and deletions** — stale data is a liability
 5. **Monitor everything** — silent failures are the worst kind
 6. **Use incremental sync** — don't re-process unchanged documents
+
+---
+
+## Staff-Level Anti-Patterns
+
+### Anti-Pattern 1: One-Size-Fits-All Chunking
+Using 512-token fixed chunks for PDFs, code, tables, and chat logs alike. Each document type has different information density and structure. A legal contract needs different chunking than a Slack export.
+
+### Anti-Pattern 2: No Metadata Extraction
+Ingesting raw text without source, date, section, or author metadata. This makes it impossible to filter by recency, apply permissions, or provide citations. Metadata is not optional — it's the difference between a toy and a production system.
+
+### Anti-Pattern 3: Synchronous Ingestion Blocking Users
+User uploads a document and waits 30 seconds while it's chunked, embedded, and indexed. Ingestion should be async — acknowledge the upload immediately, process in background, notify when ready.
+
+### Anti-Pattern 4: No Deduplication
+The same content indexed multiple times (from Confluence AND SharePoint AND email attachment). Your retrieval now returns 3 copies of the same chunk, wasting context window slots.
+
+### Anti-Pattern 5: Ignoring Document Structure
+Treating a PDF as flat text when it has clear headings, tables, lists, and hierarchy. Flattening structure loses the relationships between sections that help retrieval quality.
+
+---
+
+## Trade-offs: Real-Time vs Batch Ingestion
+
+| Dimension | Real-Time (Event-Driven) | Batch (Scheduled) |
+|-----------|------------------------|-------------------|
+| Freshness | Seconds-minutes | Hours-days |
+| Infrastructure cost | High (always-on workers) | Low (scheduled jobs) |
+| Complexity | High (webhooks, queues, retry logic) | Low (cron + script) |
+| Error handling | Must handle per-doc failures gracefully | Can retry entire batch |
+| Monitoring | Real-time dashboards needed | Daily reports sufficient |
+| Best for | Chat messages, tickets, wiki edits | Full database syncs, initial loads |
+
+### Accuracy of Parsing vs Speed
+
+| Parser | Speed (pages/sec) | Accuracy | Cost |
+|--------|-------------------|----------|------|
+| PyPDF2 (text extraction) | 100+ | 60-70% (tables broken) | Free |
+| Unstructured.io | 10-20 | 85-90% | Free (local) |
+| Azure Doc Intelligence | 5-10 | 95%+ (forms/tables) | ~$0.01/page |
+| LlamaParse (LLM-based) | 2-5 | 90-95% | ~$0.003/page |
+| Human review | 0.1 | 99%+ | ~$0.50/page |
+
+---
+
+## Real Numbers: 1M Document Ingestion
+
+| Configuration | Time | Cost | Notes |
+|--------------|------|------|-------|
+| PyPDF2 + fixed chunk + OpenAI embed | ~4 hours | ~$200 (embedding) | Fast but poor quality on complex docs |
+| Unstructured + semantic chunk + OpenAI embed | ~20 hours | ~$500 | Good balance for most corpora |
+| Azure Doc Intelligence + heading-aware chunk + local embed | ~40 hours | ~$10,000 (parsing) | Best quality, highest cost |
+| LlamaParse + parent-child chunk + Cohere embed | ~80 hours | ~$3,000 (parsing) + $100 (embed) | Excellent for mixed doc types |
+
+**Key insight**: The bottleneck is always parsing, not embedding. Invest in parsing quality — bad parsing cascades into bad chunks into bad retrieval into bad answers. You cannot fix upstream data quality problems downstream.
+
+### Production Pipeline Architecture
+
+```
+Upload → Queue (SQS/Kafka) → Worker Pool → Parse → Clean → Chunk → Embed → Index
+                                  ↓                                        ↓
+                           Dead Letter Queue                        Completion Event
+                           (failed docs)                            (notify user)
+```
+
+**Rule of thumb**: Plan for 10% of documents to fail parsing. Have a dead-letter queue and manual review process for failures.

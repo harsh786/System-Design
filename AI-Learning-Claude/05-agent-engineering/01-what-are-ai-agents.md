@@ -191,3 +191,115 @@ The key architectural decision: **how much autonomy to grant** based on the cons
 - Agents exist on a spectrum from simple chatbot to fully autonomous
 - The architect's job is choosing the right autonomy level and building guardrails
 - Multi-step tasks that require judgment are where agents shine
+
+---
+
+## Staff-Level: Anti-Patterns
+
+| Anti-Pattern | Why It's Wrong | What To Do Instead |
+|-------------|---------------|-------------------|
+| Calling any LLM wrapper an "agent" | Conflates chatbots, pipelines, and agents — leads to wrong architecture decisions | Apply the litmus test: does it have a goal, plan, act, observe loop? If not, it's not an agent |
+| Agents without a clear objective function | No way to measure success or know when to stop | Define explicit success criteria before building: "task is done when X is true" |
+| No stop condition (runs forever) | Cost explosion, user frustration, resource exhaustion | Always define: max iterations, token budget, time limit, AND a goal-completion check |
+| Agents that can't explain their reasoning | Impossible to debug, audit, or trust | Require reasoning traces (ReAct-style) or at minimum structured logging of decisions |
+| "Agent" that just calls one API | Over-engineering a simple function call into a complex system | Use a simple function/pipeline — agents are for multi-step decision-making |
+
+---
+
+## Staff-Level: Trade-offs
+
+### Autonomy vs Control
+
+```
+More Autonomy                              More Control
+├── Faster execution                       ├── Predictable behavior
+├── Handles novel situations               ├── Easier to audit/comply
+├── Less human bottleneck                  ├── Lower risk of catastrophic errors
+└── Higher risk of wrong actions           └── Slower, requires human availability
+```
+
+**Decision framework**: Match autonomy to consequence severity.
+- Low consequence (summarize text) → high autonomy
+- High consequence (send money, delete data) → low autonomy + human approval
+
+### Flexibility vs Predictability
+
+| Flexible Agent | Predictable Agent |
+|---------------|------------------|
+| Can handle unexpected inputs | Follows known paths reliably |
+| May produce surprising outputs | Output format is consistent |
+| Better for exploratory tasks | Better for production workflows |
+| Harder to test exhaustively | Easy to write regression tests |
+
+---
+
+## Staff-Level: The Defining Rule
+
+> **"If it doesn't have a planning loop, it's not an agent — it's a chatbot with tools."**
+
+The critical differentiator:
+- **Chatbot with tools**: User says something → LLM picks a tool → returns result. One-shot. No iteration.
+- **Agent**: Receives goal → plans approach → executes step → observes result → decides next step → iterates until done OR gives up.
+
+The **loop** is what makes it an agent. Without the loop, you have a tool-augmented LLM — which is fine! But don't call it an agent and don't architect it like one.
+
+**Practical test for your system**:
+1. Can it take >1 action without user intervention? (minimum bar)
+2. Does it decide its OWN next action based on previous results? (not pre-scripted)
+3. Does it have a termination condition tied to goal completion? (not just "ran out of steps")
+
+If all three are yes → agent. Otherwise → something simpler, and that's okay.
+
+---
+
+## Agent Taxonomy: Simple → Autonomous Spectrum
+
+| Level | Type | Description | Example |
+|-------|------|-------------|---------|
+| 0 | Prompt/Response | Single LLM call, no tools | Chatbot, text summarizer |
+| 1 | Tool-augmented LLM | LLM + tools, single turn | RAG query, calculator use |
+| 2 | Simple agent | Fixed loop: reason → act → observe, 2-5 steps | Customer support with lookup |
+| 3 | Complex agent | Dynamic planning, 5-20 steps, error recovery | Code generation agent |
+| 4 | Multi-agent | Multiple agents coordinating | Research + writing pipeline |
+| 5 | Autonomous agent | Long-running, self-directed, minimal human input | Devin-style coding agent |
+
+**Staff insight**: Most production value is at Level 1-2. Levels 4-5 are research-grade — impressive demos but fragile in production. Don't over-architect.
+
+## Production Readiness Assessment
+
+Before deploying an agent to production, score these dimensions:
+
+```
+Reliability:     Can it handle 95% of inputs without failure?        [1-5]
+Predictability:  Does it produce consistent results for same input?  [1-5]
+Cost control:    Is worst-case cost bounded and acceptable?          [1-5]
+Observability:   Can you debug a failed run from logs alone?         [1-5]
+Graceful failure: Does it fail safely (no side effects, clear error)? [1-5]
+Latency:         Is end-to-end time acceptable for the use case?     [1-5]
+
+Score ≥ 24/30: Production ready
+Score 18-23:   Staging/internal only
+Score < 18:    Prototype — not ready for users
+```
+
+## Agent Complexity Decision Framework
+
+```
+Start here: Can you solve this with a single LLM call + structured output?
+  YES → Do that. You don't need an agent.
+  NO  ↓
+
+Do you need external data or actions (API calls, DB queries)?
+  YES, 1-2 tools, single turn → Tool-augmented LLM (Level 1)
+  YES, multiple steps needed  ↓
+
+Is the sequence of steps predictable/fixed?
+  YES → Pipeline/workflow (deterministic), not an agent
+  NO  → You need an agent (Level 2+)  ↓
+
+Do steps require different expertise/models?
+  NO  → Single agent with multiple tools (Level 2-3)
+  YES → Consider multi-agent only if single agent fails (Level 4)
+```
+
+**The golden rule**: Always start one level simpler than you think you need. Promote to higher complexity only when you have evidence the simpler approach fails.

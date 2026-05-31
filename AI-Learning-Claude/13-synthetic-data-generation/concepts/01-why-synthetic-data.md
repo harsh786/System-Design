@@ -248,3 +248,63 @@ Synthetic data is not a replacement for real data — it's a **multiplier**.
 - 0 real data (privacy) + synthetic generation = usable training set
 
 The key is knowing **when** to use it, **how** to validate it, and **what** its limits are. The rest of this chapter teaches you exactly that.
+
+---
+
+## Synthetic Data Quality Metrics
+
+How do you know if your synthetic data is actually good? Measure these:
+
+| Metric | What It Measures | Target | How to Compute |
+|--------|-----------------|--------|----------------|
+| **Diversity score** | Vocabulary and structural variety | >0.7 (normalized) | Unique n-grams / total n-grams across dataset |
+| **Faithfulness** | Factual accuracy vs source material | >95% | LLM-judge or human audit on sample |
+| **Naturalness** | Does it sound like real data? | >4/5 human rating | Blind evaluation: mix synthetic + real, humans rate |
+| **Distribution match** | Statistical similarity to real data | KL divergence <0.1 | Compare feature distributions (length, complexity, topics) |
+| **Downstream utility** | Does training on it improve the model? | >baseline performance | Train with/without synthetic, compare eval scores |
+| **Deduplication rate** | How much is near-duplicate? | <5% duplicates | MinHash or embedding similarity clustering |
+
+## Validation Frameworks
+
+### Three-Layer Validation
+
+1. **Automated checks** (run on 100% of generated data)
+   - Format validation (JSON schema, field presence)
+   - Length bounds (not too short, not too long)
+   - Language detection (correct language?)
+   - Deduplication (remove near-duplicates)
+
+2. **LLM-as-judge** (run on 100%, cheap model)
+   - Relevance to the intended task
+   - Factual consistency with source
+   - No harmful/biased content
+   - Appropriate difficulty level
+
+3. **Human audit** (run on 5-10% sample)
+   - Would this fool an expert into thinking it's real?
+   - Is the label/annotation correct?
+   - Does it cover the intended edge case?
+   - Calibrate automated metrics against human judgment
+
+## When NOT to Use Synthetic Data
+
+| Scenario | Why Not | Alternative |
+|----------|---------|-------------|
+| **Safety-critical domains** (medical, legal) | Synthetic errors could cause real harm | Use real data with expert annotation |
+| **Your real data distribution is unknown** | Can't validate synthetic matches reality | Collect real data first, then augment |
+| **Model is already overfitting** | More data of same type won't help | Improve model architecture or regularization |
+| **Regulatory compliance requires real data provenance** | Auditors need traceable data lineage | Use real data with proper consent |
+| **The task requires genuine cultural/contextual nuance** | LLMs often generate "average" examples lacking authentic diversity | Crowdsource from diverse real users |
+| **You haven't validated your eval pipeline** | Synthetic data quality depends on measuring it | Build golden dataset first |
+
+## Cost Comparison: Synthetic vs Real Data Collection
+
+| Method | Cost per 1,000 examples | Time | Quality | Diversity |
+|--------|--------------------------|------|---------|-----------|
+| Manual annotation (in-house) | $500-2,000 | 1-2 weeks | High | Medium |
+| Crowdsourcing (MTurk/Scale) | $200-800 | 3-5 days | Medium | High |
+| Synthetic (GPT-4 class) | $5-20 | Hours | Medium-High | Medium |
+| Synthetic (open-source LLM) | $0.50-2 | Hours | Medium | Medium |
+| Hybrid (seed real + synthetic augmentation) | $50-200 | 1-3 days | High | High |
+
+**Key insight**: The hybrid approach almost always wins. Use expensive real data for seeds and validation, cheap synthetic data for volume and coverage. The 50 real + 5,000 synthetic pattern typically costs 10x less than 5,000 real examples while achieving 85-95% of the quality.

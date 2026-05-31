@@ -221,3 +221,99 @@ Periodically merge and clean memories:
 - Memory must be managed: summarization, forgetting, consolidation
 - Privacy and safety: encrypt PII, support deletion, isolate per user
 - The memory manager is a critical architectural component
+
+---
+
+## Staff-Level: Anti-Patterns
+
+| Anti-Pattern | Why It Fails | Fix |
+|-------------|-------------|-----|
+| Unbounded memory (grows forever) | Costs explode (vector DB storage + retrieval tokens), retrieval quality degrades as noise increases | Set memory budgets: max N items per type, TTL on entries, periodic garbage collection |
+| No memory relevance filtering | Agent retrieves 20 irrelevant memories, wastes context window, confuses reasoning | Score relevance before injection; only inject top-K with similarity > threshold (e.g., 0.75) |
+| Storing hallucinated "facts" | Agent "remembers" something it made up → reinforces hallucinations across sessions | Validate before storing: only store tool outputs, user-confirmed facts, or high-confidence extractions |
+| Shared memory without access control | User A's data leaks into User B's context; compliance nightmare | Strict tenant isolation; memory keys include user_id; never query across users |
+| Storing everything verbatim | "ok", "thanks", "hmm" clog memory with noise | Filter by information density: only store memories that contain actionable facts or decisions |
+| No memory versioning | User updates preference but old version persists → contradictions | Upsert pattern: new fact on same key replaces old; keep audit trail separately |
+
+---
+
+## Staff-Level: Trade-offs
+
+### Memory Size vs Retrieval Quality
+
+| Large Memory (100K+ entries) | Small Memory (<1K entries) |
+|-----------------------------|-----------------------------|
+| More knowledge available | Faster retrieval, less noise |
+| Higher storage costs | Lower costs |
+| Retrieval precision drops | Every memory is high-value |
+| Needs sophisticated ranking | Simple top-K works fine |
+
+### Episodic vs Semantic Memory
+
+| Episodic (events) | Semantic (facts) |
+|-------------------|-----------------|
+| "On Jan 5, user reported bug X" | "User prefers Python" |
+| Rich context, time-stamped | Compressed, general |
+| Useful for debugging, continuity | Useful for personalization |
+| Grows linearly with interactions | Grows sublinearly (facts consolidate) |
+
+### Persistence vs Privacy
+
+| Full Persistence | Ephemeral/Limited |
+|-----------------|-------------------|
+| Better personalization over time | GDPR/privacy compliant by default |
+| Users feel "known" | No risk of stale data |
+| Higher liability | Users must re-state preferences |
+
+---
+
+## Staff-Level: Real Implementation Patterns
+
+### How ChatGPT/Claude Implement Conversation Memory
+- **Within session**: Full conversation in context window (working memory)
+- **Cross-session** (ChatGPT Memory): Extracts key facts → stores as semantic memory → injects relevant facts into system prompt
+- **Pattern**: LLM-as-memory-extractor — after each conversation, a separate LLM call identifies "memorizable facts" and upserts them
+
+### How Coding Agents (Cursor, Devin, OpenCode) Implement Project Memory
+- **Codebase indexing**: Embed files/functions into vector store; retrieve relevant code on each query
+- **Session memory**: Track what files were edited, what errors occurred, what was tried
+- **Rules/preferences**: `.cursorrules`, `AGENTS.md` — static procedural memory loaded every session
+- **Pattern**: Hierarchical retrieval — static rules always loaded + dynamic retrieval for code context
+
+### Key Difference
+- **Chat assistants**: Memory is about the USER (preferences, history, relationships)
+- **Coding agents**: Memory is about the PROJECT (codebase structure, conventions, past decisions)
+- **Both**: Need garbage collection, relevance filtering, and bounded growth
+
+---
+
+## Memory System Selection Framework
+
+| Use Case | Memory Type | Storage | Cost Driver |
+|----------|-------------|---------|-------------|
+| Remember user preferences | Long-term semantic | Vector DB | Storage + retrieval queries |
+| Track conversation context | Short-term (buffer) | In-context window | Token cost per request |
+| Learn from past mistakes | Episodic | Vector DB + metadata | Embedding + retrieval |
+| Follow project conventions | Procedural (static) | File system (loaded at init) | Context window space |
+| Cache expensive computations | Working memory | Redis/KV store | Memory + TTL management |
+
+## Memory Cost at Scale
+
+```
+Cost model per user:
+  Semantic memory:  ~100 memories × 1536d × 4 bytes = 600KB storage per user
+  Retrieval cost:   ~3 queries/session × $0.0001/query = $0.0003/session
+  Embedding cost:   ~5 new memories/session × 500 tokens × $0.00002 = $0.00005/session
+
+At 1M users:
+  Storage: 600GB vector storage (~$150/month on managed DB)
+  Retrieval: 3M queries/day = ~$300/month
+  Embedding: 5M embeddings/day = ~$50/month
+  Total: ~$500/month for memory infrastructure at 1M users
+
+Scaling concern: Not storage cost — it's RELEVANCE DECAY.
+  More memories → more noise in retrieval → worse agent behavior
+  Solution: Decay scores, consolidation (merge similar memories), hard caps per category
+```
+
+**Staff insight**: The biggest memory cost isn't dollars — it's quality degradation. A memory system that never forgets eventually poisons retrieval with irrelevant or contradictory information. Implement aggressive pruning early.

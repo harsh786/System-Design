@@ -233,3 +233,82 @@ A 10x architect doesn't write 10x more code. They:
 | Flexible work | Remote/hybrid for focus time |
 | Equity refresh | Annual grants, not just initial |
 | Signing bonus | Compensate for unvested equity elsewhere |
+
+---
+
+## Compensation Bands by Level and Location (AI/ML, 2024-2025)
+
+| Level | SF/NYC Total Comp | Seattle/Austin | Remote (US) | London |
+|-------|-------------------|----------------|-------------|--------|
+| Senior (L5/E5) | $250-350K | $220-310K | $200-280K | £120-180K |
+| Staff (L6/E6) | $350-500K | $310-440K | $280-400K | £160-250K |
+| Senior Staff (L7) | $500-700K | $440-600K | $380-520K | £220-350K |
+| Principal (L8) | $700K-1M+ | $600-850K | $500-750K | £300-500K |
+
+**Notes:**
+- Total comp = base + bonus + equity (annualized over 4 years)
+- AI/ML commands 15-30% premium over general SWE at same level
+- Startups: lower base, higher equity (value highly uncertain)
+- These are ranges; top of band requires competing offers
+
+## Negotiation Scripts
+
+### Opening (after receiving offer)
+> "Thank you for the offer. I'm excited about the role and the team. I'd like to take a day to review the full package. Can you send me the details in writing?"
+
+### Counter-offer
+> "I've reviewed the offer carefully. Based on my research into market rates for Staff-level AI architects, and considering [specific competing offer / current comp / unique expertise], I was hoping we could get closer to $X base and Y shares. Here's my reasoning..."
+
+### When they say "that's our best offer"
+> "I understand there may be constraints on base salary. Are there other levers we can explore? I'm thinking about signing bonus, equity refresh schedule, title, or scope of the role."
+
+### When you have competing offers
+> "I want to be transparent — I have another offer at $X from [company type]. I prefer your team and mission, but I need the compensation to be competitive. Can we close the gap?"
+
+**Never say:**
+- "I need this because of personal expenses" (irrelevant to your market value)
+- "My friend at X makes Y" (hearsay, not leverage)
+- "This is my final number" (unless it truly is and you'll walk away)
+
+## Counter-Offer Evaluation Framework
+
+When your current employer counter-offers after you get an external offer:
+
+| Factor | Weight | Questions to Ask |
+|--------|--------|-----------------|
+| Why now? | High | Would they have given this without the external offer? |
+| Trust | High | Will they view you as a flight risk going forward? |
+| Root cause | Critical | Did you leave because of comp, or something deeper? |
+| Promotion path | High | Does the counter include level/scope change or just money? |
+| Statistics | Informative | 80% of people who accept counter-offers leave within 18 months |
+
+**Decision framework:**
+- If you left purely for comp and love the team/work → counter-offer may work
+- If you left for growth/impact/culture → money won't fix those; decline the counter
+- If the counter doesn't match the external offer → they're not valuing you at market
+
+## Career Progression Milestones for AI Architects
+
+### Senior → Staff (typically 2-4 years)
+- [ ] Led a cross-team technical initiative end-to-end
+- [ ] Written and driven adoption of an architectural standard
+- [ ] Mentored 2+ engineers to promotion
+- [ ] Presented at internal tech talks (5+) or external conferences (1+)
+- [ ] Reduced system cost or improved reliability by measurable amount (>20%)
+- [ ] Built relationships with product and business stakeholders
+
+### Staff → Senior Staff (typically 3-5 years)
+- [ ] Defined technical strategy for a business unit or product area
+- [ ] Influenced hiring and team structure decisions
+- [ ] Drove a migration or platform initiative affecting 5+ teams
+- [ ] Established an engineering practice adopted org-wide
+- [ ] Demonstrated business impact quantified in revenue or cost ($M+ scale)
+- [ ] Built and led a technical working group or guild
+
+### Senior Staff → Principal (typically 4-7 years)
+- [ ] Set technical direction for the entire engineering organization
+- [ ] Represented the company externally as a technical thought leader
+- [ ] Made build-vs-buy decisions at the $10M+ scale
+- [ ] Influenced company strategy at the executive level
+- [ ] Created a new technical capability that became a competitive advantage
+- [ ] Developed multiple Staff+ engineers through mentorship

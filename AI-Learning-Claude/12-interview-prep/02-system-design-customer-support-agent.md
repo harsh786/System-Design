@@ -282,3 +282,36 @@ Session (TTL: 24h):
 | Refund authority | $50 limit | Covers 90% of cases, 10% need human |
 | Model choice | GPT-4o-mini for routing, GPT-4o for complex | Cost vs quality balance |
 | Vector DB | Managed (Pinecone/Azure AI Search) | Cost vs operational burden |
+
+---
+
+## Scaling Discussion Points
+
+When the interviewer asks "how does this scale to 10x?":
+
+- **Horizontal scaling**: Stateless API tier scales trivially; conversation state in Redis/DynamoDB
+- **Model bottleneck**: Batch similar queries, use model routing (cheap model for simple, expensive for complex)
+- **Knowledge base growth**: Shard vector DB by product category; re-index incrementally
+- **Multi-region**: Deploy models in each region to reduce latency; centralize analytics
+- **Queue-based decoupling**: Async processing for non-real-time tasks (summarization, analytics)
+
+## Cost Analysis Section
+
+| Component | Monthly Cost (10K conversations/day) | Scaling Factor |
+|-----------|--------------------------------------|----------------|
+| LLM calls (routing) | ~$500 (GPT-4o-mini) | Linear with volume |
+| LLM calls (complex) | ~$3,000 (GPT-4o, 20% of traffic) | Linear with volume |
+| Vector DB | ~$200 (managed) | Sub-linear |
+| Infrastructure | ~$800 (compute, Redis, queues) | Step function |
+| **Total** | **~$4,500/month** | |
+| **Cost per conversation** | **~$0.015** | Decreases at scale |
+
+Compare: Human agent cost is ~$5-15 per conversation. Even at 50% automation, ROI is massive.
+
+## Follow-up Questions to Expect
+
+1. "How do you handle a customer who is angry and the AI keeps misunderstanding them?"
+2. "What happens when your knowledge base has contradictory information?"
+3. "How would you A/B test a new model version without degrading customer experience?"
+4. "What's your strategy for handling PII in conversation logs?"
+5. "How do you prevent the agent from making promises the company can't keep?"

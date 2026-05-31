@@ -243,3 +243,59 @@ flowchart TD
 3. **Routing is not static** — it learns and improves from production feedback
 4. **Multiple dimensions matter** — complexity, cost, latency, capability, availability
 5. **Measure, don't guess** — use A/B testing to validate routing decisions with real data
+
+---
+
+## Staff+ Deep Dive: Anti-Patterns, Trade-offs, and Real Numbers
+
+### Anti-Patterns to Avoid
+
+**1. Manual Routing Rules That Don't Adapt**
+Hand-written rules like "if query length > 100, use GPT-4" seem reasonable initially but quickly become stale. Query complexity doesn't correlate well with length. The real world is messier — a short query about quantum physics needs a better model than a long query asking for a list of colors.
+
+Fix: Use routing signals from production (success rate, user satisfaction, task completion) to continuously update routing decisions.
+
+**2. Always Routing to the Most Expensive Model**
+The "just use GPT-4 for everything" approach. It feels safe — best model, best results. But at scale, you're burning 10-20x the cost for tasks where a smaller model produces identical output. This becomes untenable at enterprise volumes (millions of requests/day).
+
+**3. No Fallback Chain**
+When the primary model is unavailable or rate-limited, requests simply fail. No degraded experience, just errors. Users see failures for minutes while the team scrambles.
+
+Fix: Every routing decision should have a fallback chain: primary → secondary → tertiary → cached/degraded response. Define this upfront, not during an incident.
+
+**4. Routing Without Measuring Routing Quality**
+You built a router, but how do you know it's making good decisions? If you're not comparing "what the router chose" vs. "what would have been optimal," you can't improve. This is the meta-problem of routing — you need evaluation of the evaluator.
+
+### Critical Trade-offs
+
+**Cost-Based vs. Quality-Based Routing**
+- Cost-based: always pick cheapest model that "might work" → saves money but quality degrades silently over time as query distribution shifts
+- Quality-based: always pick best model unless explicitly simple → expensive but predictable quality
+- Hybrid (what works): quality-based with cost budgets per team/feature, and automatic downgrade when budget exhausted
+
+**Static Rules vs. ML-Based Router**
+- Static rules: interpretable, debuggable, no training needed, but brittle and can't generalize
+- ML-based router (a small classifier that predicts which model will succeed): adapts, generalizes, but adds latency (10-50ms for inference), needs training data, and is itself a model that can fail
+- Practical middle ground: start with rules, collect data, train a router when you have 10K+ labeled routing decisions
+
+**The Latency of the Routing Decision Itself**
+If your router takes 200ms to decide which model to use, you've already added 200ms to every request. For interactive use cases (chat, autocomplete), the router must decide in <20ms. This constrains router complexity — you can't call an LLM to decide which LLM to call.
+
+### Real Numbers from Production Systems
+
+**The 60-80% Rule**: In practice across multiple enterprises, 60-80% of AI queries are "simple" — summarization of short text, extraction of well-defined fields, classification into known categories. These can use models at 1/10th the cost (GPT-4o-mini, Claude Haiku, Gemini Flash) with <2% quality degradation as measured by human evaluation.
+
+**Cost Impact at Scale**:
+- 1M requests/day, all GPT-4: ~$30K/day ($900K/month)
+- Same traffic with smart routing (70% to mini, 30% to GPT-4): ~$6K/day ($180K/month)
+- Savings: $720K/month — this is why routing is a Staff-level priority
+
+**Routing Accuracy Benchmarks**:
+- Rule-based routers: 70-75% optimal routing accuracy
+- ML-based routers (trained on production data): 85-92% optimal routing accuracy
+- The gap represents both cost savings and quality improvements
+
+**Latency Overhead**:
+- Embedding-based classifier router: 15-25ms added latency
+- Rule-based router: <1ms added latency
+- LLM-as-router (asking a small model to classify): 200-500ms — usually too slow for real-time

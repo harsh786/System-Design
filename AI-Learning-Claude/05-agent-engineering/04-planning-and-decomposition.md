@@ -264,3 +264,64 @@ This separation gives you:
 - Build re-planning into the system — failures WILL happen
 - The planner-executor split mirrors how effective teams work
 - DAG plans enable parallelism, which reduces total execution time
+
+---
+
+## Staff-Level: Anti-Patterns
+
+| Anti-Pattern | Why It Fails | Fix |
+|-------------|-------------|-----|
+| Over-decomposition (100 subtasks for a simple problem) | Coordination overhead exceeds task complexity; each subtask needs an LLM call | Limit decomposition to 3-7 subtasks. If you need more, create hierarchical levels |
+| No replanning when a subtask fails | Agent blindly continues executing a plan that's already invalidated | After any failure, re-evaluate: is the plan still valid? Do remaining steps still make sense? |
+| Plans that aren't executable | Pretty plans with steps like "solve the problem" that no tool can actually do | Every plan step MUST map to a concrete tool call or a sub-plan that eventually maps to tools |
+| Ignoring dependencies between subtasks | Parallel execution of dependent steps → garbage results | Explicitly model dependencies as a DAG; topological sort before execution |
+| Planning without resource awareness | Plan requires 50 API calls but budget allows 10 | Include cost/time estimates per step; validate total against budget before starting |
+| Infinite recursive decomposition | Agent decomposes tasks into subtasks into sub-subtasks endlessly | Hard cap: max 2-3 levels of decomposition. If a subtask needs further splitting, it's still too complex |
+
+---
+
+## Staff-Level: Trade-offs
+
+### Upfront Planning vs Iterative Planning
+
+| Upfront (plan everything first) | Iterative (plan as you go) |
+|-------------------------------|---------------------------|
+| Better for well-understood tasks | Better for exploratory/unknown tasks |
+| Can estimate total cost before starting | Cost is unpredictable |
+| Parallelizable (DAG execution) | Mostly sequential |
+| Brittle if assumptions are wrong | Adapts to surprises |
+| Lower total token cost (one planning call) | Higher token cost (repeated planning) |
+
+**Decision rule**: If you can describe the task type in advance (e.g., "write a report from these 3 sources"), use upfront planning. If the task outcome depends on what you discover (e.g., "debug this issue"), use iterative.
+
+### Plan Granularity
+
+```
+Too coarse:                    Too fine:                     Just right:
+"1. Do research"               "1. Open browser"             "1. Search for X on Y"
+"2. Write report"              "2. Type URL"                 "2. Extract key metrics"
+                               "3. Click search"             "3. Compare across sources"
+                               "4. Read first result"        "4. Write summary with findings"
+                               ...50 more steps...
+```
+
+---
+
+## Staff-Level: The 2-3 Level Rule
+
+> **Best agents plan at 2-3 levels max, not infinitely recursive.**
+
+```
+Level 0 (Goal):     "Create competitive analysis report"
+Level 1 (Phases):   Research → Analysis → Writing
+Level 2 (Steps):    Research: [search A, search B, search C]
+                    Analysis: [compare features, compare pricing]
+                    Writing:  [draft, review, finalize]
+```
+
+Going deeper than this creates diminishing returns:
+- **Level 3+ adds coordination cost** that exceeds the benefit of finer decomposition
+- **The executor is an LLM** — it can handle steps with some ambiguity; you don't need assembly-language precision
+- **Re-planning handles the rest** — if a Level 2 step is too complex at execution time, the agent can decompose it then (just-in-time planning)
+
+**Production pattern**: Plan at Level 1 upfront, decompose each Level 1 phase into Level 2 steps just before executing that phase. This gives you the benefits of upfront planning (cost estimation, parallelism) without the brittleness of over-specifying everything.

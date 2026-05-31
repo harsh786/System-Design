@@ -176,4 +176,145 @@ For 1,000 tenants, each with 100K vectors (1536d):
 
 ---
 
+## Staff-Level: Anti-Patterns
+
+### 1. Shared Index Without Namespace Isolation
+
+**Mistake**: Using a single HNSW index for all tenants with only application-level filtering (no DB-level enforcement).
+
+**Why it's catastrophic**: A single missing `tenant_id` filter in one API endpoint leaks data across ALL tenants. This is a security incident, not a bug.
+
+**Fix**: Use DB-native isolation (namespaces, partitions) as the primary boundary. Application-level filter is defense-in-depth, not the primary mechanism.
+
+### 2. Tenant Data Leakage via Similarity Search
+
+**Mistake**: Pre-filter is post-filter in disguise. Some DBs compute top-K across ALL vectors first, then filter by tenant. If a tenant has sparse data, results from other tenants may "leak" through the ANN graph traversal.
+
+**Why it happens**: HNSW graph connects vectors from different tenants. Traversal visits cross-tenant vectors even if they're filtered from results. With post-filtering, if your tenant has <K relevant results, you return fewer results — or worse, the DB returns nothing.
+
+**Fix**: Use pre-filtering with partition-aware indexes (Qdrant payload index, Pinecone namespaces). Verify with tests: query as tenant A, ensure NO results from tenant B appear under any condition.
+
+### 3. No Per-Tenant Resource Limits
+
+**Mistake**: One tenant uploads 50M vectors while others have 10K each. The large tenant's data dominates the index, degrading performance for everyone.
+
+**Why it hurts**: Uncontrolled growth causes memory pressure, longer query times, and unfair resource allocation. One whale tenant can DoS your entire system.
+
+**Fix**: Implement per-tenant quotas (max vectors, max QPS, max storage). Monitor and alert on tenants approaching limits. Offer tier upgrades for more capacity.
+
+### 4. One Index for All Tenants (Performance Coupling)
+
+**Mistake**: All tenants in one massive HNSW index. When it's time to rebuild, compact, or migrate, ALL tenants are affected simultaneously.
+
+**Why it hurts**: Maintenance windows impact everyone. One tenant's bulk delete triggers compaction that slows queries for all. Rolling updates are impossible.
+
+**Fix**: For >10K tenants, use sharded architecture where tenants map to shard groups. Maintenance can roll shard-by-shard. Critical tenants get their own shard.
+
+---
+
+## Staff-Level: Isolation Pattern Trade-offs (Deep Dive)
+
+| Dimension | Index-Per-Tenant | Namespace Partitioning | Metadata Filtering |
+|-----------|-----------------|----------------------|-------------------|
+| **Isolation guarantee** | Physical (strongest) | Logical (strong) | Application-level (weakest) |
+| **Cost at 100 tenants** | 100x base cost | 1.2x base cost | 1x base cost |
+| **Cost at 10K tenants** | Impossible | 1.5x base cost | 1x base cost |
+| **Tenant deletion** | Drop collection (instant) | Delete namespace (fast) | Filter-delete (slow, fragmentation) |
+| **Performance isolation** | Perfect | Good (shared compute) | Poor (noisy neighbor) |
+| **Cross-tenant analytics** | Expensive (query each) | Possible (remove namespace filter) | Easy |
+| **Operational complexity** | Very high | Medium | Low |
+| **Compliance/audit** | Easiest to prove isolation | Medium | Hardest (prove filter always applied) |
+
+**Staff decision matrix:**
+- Regulated enterprise (healthcare, finance) → Index-per-tenant for top-tier, namespace for standard
+- B2B SaaS (100-10K tenants) → Namespace partitioning
+- B2C or marketplace (100K+ "tenants") → Metadata filtering with strict middleware enforcement
+
+---
+
+## Staff-Level: How Real Systems Handle Multi-Tenancy
+
+### Pinecone Namespaces
+- Each namespace is a logical partition within an index
+- Queries are scoped to exactly one namespace (no cross-namespace search)
+- Deletion: `delete(namespace="tenant_a", delete_all=True)` — clean, fast
+- Limit: No hard limit on namespaces, but each must have vectors to exist
+- **Gotcha**: Cannot query across namespaces in one call (need fan-out)
+
+### Qdrant Collections + Payload Filtering
+- Recommended pattern: shared collection with `tenant_id` payload field + payload index
+- Payload index on `tenant_id` makes filtered search nearly as fast as unfiltered
+- Alternative: separate collection per tenant (supported, but operational overhead)
+- **Gotcha**: Without payload index on tenant_id, filtering scans linearly — O(n) degradation
+
+### Weaviate Multi-Tenancy (native)
+- First-class multi-tenancy: `class.with_tenant("tenant_a")`
+- Tenants can be individually activated/deactivated (cold storage)
+- Each tenant gets isolated shard — no cross-tenant graph connections
+- **Best of both worlds**: isolation of separate collections + operational simplicity of shared infrastructure
+
+### Milvus Partitions
+- Partitions within a collection (logical grouping)
+- Query can target specific partition: `search(partition_names=["tenant_a"])`
+- Limit: 1024 partitions per collection (for >1K tenants, need partition key strategy)
+- **Gotcha**: Partition key approach (hash-based) doesn't guarantee tenant isolation
+
+---
+
+## Cost Isolation Strategies
+
+### Per-Tenant Cost Attribution
+
+```
+Challenge: In shared infrastructure, how do you bill/attribute costs per tenant?
+
+Approach 1 — Metered queries:
+  Track: queries_per_tenant, vectors_stored_per_tenant
+  Bill:  (query_count × cost_per_query) + (vector_count × cost_per_vector_month)
+
+Approach 2 — Resource-weighted allocation:
+  Track: CPU-seconds consumed, memory-hours, storage bytes
+  Bill:  proportional share of infrastructure cost
+
+Approach 3 — Tiered isolation pricing:
+  Shared partition: $0.01/1K queries (noisy neighbor risk)
+  Dedicated namespace: $0.05/1K queries (logical isolation)
+  Dedicated cluster: $500/month base (full isolation)
+```
+
+### Noisy Neighbor Mitigation
+
+| Problem | Solution | Trade-off |
+|---------|----------|-----------|
+| One tenant's bulk ingestion slows queries | Rate limit ingestion per tenant; separate ingest/query paths | Ingest latency for heavy tenants |
+| Large tenant's index rebuild affects all | Schedule rebuilds per-partition; use incremental indexes (HNSW) | Complexity |
+| Query hot-spot (one tenant 80% of traffic) | Auto-detect hot tenants → migrate to dedicated shard | Operational overhead |
+| Memory pressure from uneven vector counts | Shard by vector count, not tenant count | Rebalancing needed |
+
+**Staff pattern — Adaptive isolation**:
+```
+Monitor: p99_latency per tenant, query_rate per tenant
+If tenant.p99 > SLA_threshold for 5min:
+  → Check if caused by co-located tenant activity
+  → If yes: auto-migrate to less-loaded shard (or dedicated)
+  → Alert platform team for capacity review
+```
+
+### Tenant Migration Patterns
+
+**When tenants outgrow their tier**:
+1. **Shard split**: Tenant grows beyond partition limits → migrate to dedicated namespace
+2. **Cluster promotion**: Tenant needs SLA guarantees → provision dedicated cluster, copy vectors, swap routing
+3. **Region migration**: Tenant needs data residency → replicate to target region, validate, cut over
+
+**Zero-downtime migration steps**:
+1. Provision target (new shard/cluster/region)
+2. Enable dual-write: new vectors go to both old and new
+3. Backfill historical vectors to new target
+4. Shadow-read: query both, validate consistency
+5. Swap read path to new target
+6. Stop writes to old, drain, decommission
+
+---
+
 *Next: [07 - Scaling Vector Databases](./07-scaling-vector-databases.md)*

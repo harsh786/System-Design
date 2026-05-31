@@ -279,4 +279,38 @@ graph TD
 
 ---
 
+## Golden Dataset Maintenance Lifecycle
+
+Golden datasets are not "set and forget." They require ongoing maintenance:
+
+| Phase | Frequency | Activities |
+|-------|-----------|------------|
+| **Creation** | Once | Initial curation, expert annotation, quality validation |
+| **Active use** | Continuous | Run evaluations, compare model versions |
+| **Refresh** | Quarterly | Add new examples reflecting product/domain changes |
+| **Audit** | Bi-annually | Re-verify existing annotations (do they still hold?) |
+| **Retirement** | As needed | Archive examples that no longer reflect current system behavior |
+
+## Versioning Strategy
+
+- Use semantic versioning: `golden-dataset-v2.3.1`
+  - Major: Significant additions or annotation schema changes
+  - Minor: New examples added, no schema change
+  - Patch: Corrections to existing annotations
+- Store in version control alongside evaluation code
+- Tag each model release with the golden dataset version used to evaluate it
+- Never mutate a released version — create a new version instead
+
+## Quality Degradation Signals
+
+Watch for these signs that your golden dataset needs attention:
+
+1. **Annotation drift**: Domain experts disagree with old annotations (the "correct" answer changed)
+2. **Coverage gaps**: New product features have zero representation in the golden set
+3. **Ceiling effect**: All models score >95% — the dataset is too easy, add harder examples
+4. **Stale references**: Golden answers reference outdated products, policies, or facts
+5. **Distribution mismatch**: Real user queries have shifted but golden set hasn't followed
+
+---
+
 *Next: [02-building-golden-datasets.md](./02-building-golden-datasets.md) — Step-by-step methodology for creating golden datasets*

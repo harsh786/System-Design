@@ -254,3 +254,50 @@ Place a specific fact ("needle") at various positions in a long context ("haysta
 - **Context-aware pricing**: Pay only for tokens the model actually attends to
 
 The trend is clear: context windows will keep growing and getting cheaper. But retrieval will always be needed for corpora that exceed the window, for real-time freshness, and for cost-sensitive high-QPS workloads.
+
+---
+
+## Context Window Sizing Methodology
+
+How to decide how much context your application actually needs:
+
+1. **Measure your corpus**: What's the total token count of relevant information?
+2. **Identify access patterns**: Do users need the full corpus or subsets?
+3. **Calculate per-request needs**: Average query touches how many documents?
+4. **Add overhead**: System prompt + conversation history + output tokens
+5. **Apply safety margin**: 20% buffer for edge cases
+
+| Use Case | Typical Context Needed | Recommended Window |
+|----------|----------------------|-------------------|
+| Single document Q&A | 5-30K tokens | 32K sufficient |
+| Multi-document synthesis | 50-200K tokens | 128K-200K |
+| Full codebase analysis | 200K-1M tokens | 1M (Gemini/Claude) |
+| Legal contract review | 100-500K tokens | 200K-1M |
+| Book summarization | 300K-800K tokens | 1M |
+
+## Cost Implications at 1M Tokens
+
+| Model | Input Cost (1M tokens) | Output Cost (1M tokens) | Cached Input |
+|-------|----------------------|------------------------|--------------|
+| GPT-4o | $2.50 | $10.00 | $1.25 |
+| Claude 3.5 Sonnet | $3.00 | $15.00 | $0.30 (prompt caching) |
+| Gemini 1.5 Pro | $1.25 | $5.00 | $0.315 (context caching) |
+| GPT-4o-mini | $0.15 | $0.60 | $0.075 |
+
+**Cost optimization strategies:**
+- **Prompt caching**: Reuse static context across requests (60-90% savings on repeated prefixes)
+- **Tiered approach**: Use cheap model for initial filtering, expensive model only for final answer
+- **Context pruning**: Remove demonstrably irrelevant sections before sending to model
+- **Batch processing**: Amortize long context across multiple questions about same document
+
+## Model Comparison for Long Context
+
+| Model | Max Context | Long-Context Quality | Best For |
+|-------|-------------|---------------------|----------|
+| Gemini 1.5 Pro | 2M tokens | Excellent recall across full window | Largest corpora, video/audio |
+| Claude 3.5 Sonnet | 200K tokens | Very good; strong at "needle in haystack" | Code analysis, detailed reasoning |
+| GPT-4o | 128K tokens | Good up to ~80K, degrades after | General purpose, structured output |
+| Llama 3.1 405B | 128K tokens | Moderate; struggles past 64K | Self-hosted, cost-sensitive |
+| Mistral Large | 128K tokens | Good up to ~100K | European data residency needs |
+
+**Key finding**: Advertised context length ≠ usable context length. Most models degrade in quality in the last 20-30% of their window. Design for 70% of advertised maximum as your practical ceiling.

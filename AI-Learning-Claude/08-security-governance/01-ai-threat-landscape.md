@@ -182,3 +182,124 @@ graph TB
 ## Key Takeaway
 
 AI security isn't just "traditional security + AI." It requires new mental models, new tools, and acceptance that some attacks (like prompt injection) cannot be 100% prevented — only mitigated through defense-in-depth. The goal shifts from "prevent all attacks" to "limit blast radius and detect quickly."
+
+---
+
+## Staff-Level: Anti-Patterns, Trade-offs, and Real-World Attacks
+
+### Anti-Patterns in AI Security Thinking
+
+**1. "We're Not a Target"**
+Every AI system is a target. If your AI has access to data, tools, or can influence decisions, it's valuable to attackers. The 2023 Samsung data leak happened because employees thought ChatGPT was "just a tool" — they pasted proprietary source code, and it became part of OpenAI's training data. Small startups with AI chatbots have been used as stepping stones into customer databases. The question isn't "will we be attacked?" — it's "when, and are we ready?"
+
+**2. Security as an Afterthought**
+Teams ship AI features first, then bolt on security. This fails because AI security is architectural — you can't retrofit privilege separation after the agent already has broad access. By the time you add guardrails, the system prompt is leaked, the RAG pipeline has no access controls, and logs are full of PII. Security must be a Day 0 concern, not a "we'll harden it later" ticket.
+
+**3. Single Layer of Defense**
+Relying on one mechanism (e.g., "we hardened the system prompt") is insufficient. Prompt injection alone has dozens of bypass techniques. Defense-in-depth means: input validation AND output scanning AND permission-aware retrieval AND monitoring AND rate limiting. Any single layer will be bypassed; the question is whether the next layer catches it.
+
+**4. No AI-Specific Threat Modeling**
+Teams apply traditional threat models (STRIDE, DREAD) without adapting for AI. Traditional models don't cover: prompt injection, training data poisoning, model extraction, hallucination-driven attacks, or the confused deputy problem. You need AI-specific threat modeling that considers the probabilistic nature of LLMs and the instruction-data conflation problem.
+
+### Trade-offs Senior Engineers Must Navigate
+
+| Trade-off | Left Extreme | Right Extreme | Staff Guidance |
+|-----------|-------------|---------------|----------------|
+| Security vs Speed | Fort Knox (ship nothing) | YOLO (ship everything) | Risk-tier: fast-track low-risk, gate high-risk |
+| Usability vs Safety | "I can't help with that" to everything | No guardrails at all | Calibrate false positive rate to <2%, invest in graceful degradation |
+| Investment vs Threat | $0 security budget | Security team larger than product team | Spend proportional to data sensitivity and blast radius |
+| Detection vs Prevention | Only prevent (miss novel attacks) | Only detect (damage already done) | Prevent known patterns, detect unknown ones, respond fast |
+
+### Documented Attacks on Production AI Systems (2023-2024)
+
+**Indirect Prompt Injection via Bing Chat (Feb 2023):** Researchers showed that hidden text on web pages could instruct Bing Chat to exfiltrate conversation data. The AI browsed a page containing invisible instructions and followed them, attempting to send user data to attacker-controlled URLs.
+
+**ChatGPT Plugin Exploits (Mar-Jun 2023):** Multiple plugins were found to have SSRF vulnerabilities, path traversal, and privilege escalation — all triggered through natural language requests. The AI became an unwitting proxy for traditional web attacks.
+
+**Training Data Extraction from GPT-3.5 (Nov 2023):** Google DeepMind researchers extracted verbatim training data (including PII) from ChatGPT by asking it to repeat a word forever — causing it to diverge from RLHF alignment and emit raw training data.
+
+**LangChain/LlamaIndex RCE (2023-2024):** Multiple remote code execution vulnerabilities in AI orchestration frameworks. Attackers crafted inputs that, when processed by agents with code execution tools, achieved arbitrary command execution on host systems.
+
+**Corporate Data Exfiltration via AI Assistants (2024):** Multiple reported incidents of internal AI assistants (Copilot-style tools) being tricked into revealing source code, internal documentation, and credentials through carefully crafted prompts that exploited the tools' broad access to organizational data.
+
+### Staff Interview Insight
+
+When asked "How would you secure an AI system?" in a staff-level interview, the key differentiator is **systems thinking**: don't list technologies — describe how you'd identify the highest-risk attack vectors for the specific system, how you'd layer defenses with independent failure modes, how you'd detect bypass, and how you'd limit blast radius assuming breach. The answer should show you understand that AI security is fundamentally about managing uncertainty, not eliminating it.
+
+---
+
+## Threat Modeling Methodology: STRIDE Adapted for AI
+
+Traditional STRIDE maps cleanly to AI-specific threats:
+
+| STRIDE Category | Traditional Meaning | AI-Specific Manifestation |
+|---|---|---|
+| **S**poofing | Impersonate another entity | Prompt injection impersonating system instructions; adversarial examples fooling classifiers |
+| **T**ampering | Modify data/code | Training data poisoning; model weight manipulation; RAG corpus corruption |
+| **R**epudiation | Deny actions | AI-generated content with no attribution; untraceable prompt chains in multi-agent systems |
+| **I**nformation Disclosure | Expose private data | Training data extraction; membership inference; model inversion; embedding leakage |
+| **D**enial of Service | Make system unavailable | Token-exhaustion attacks (craft prompts that maximize output); model loading attacks |
+| **E**levation of Privilege | Gain unauthorized access | Prompt injection escaping sandbox; agent tool-use escalation; jailbreaking safety filters |
+
+**AI-STRIDE Threat Modeling Process:**
+1. Decompose the AI system into trust boundaries (user → gateway → orchestrator → model → tools → data)
+2. For each boundary crossing, enumerate S/T/R/I/D/E threats
+3. Rate each: Likelihood (1-5) × Impact (1-5) = Risk Score
+4. For risk scores > 12: mandatory mitigation before launch
+5. For risk scores 6-12: accept with monitoring, or mitigate
+6. Document accepted risks with business owner sign-off
+
+---
+
+## MITRE ATLAS: AI Threat Matrix Overview
+
+MITRE ATLAS (Adversarial Threat Landscape for AI Systems) extends the ATT&CK framework for ML:
+
+**Reconnaissance** → Discover model APIs, documentation, training data sources
+**Resource Development** → Build adversarial datasets, acquire compute for attacks
+**Initial Access** → API access, prompt injection, supply chain (poisoned models on HuggingFace)
+**ML Attack Staging** → Craft adversarial inputs, develop evasion techniques
+**ML Model Access** → Black-box querying, model theft via distillation
+**Exfiltration** → Extract training data, steal model weights via side-channels
+**Impact** → Denial of ML service, model degradation, unsafe outputs at scale
+
+**Key ATLAS techniques to defend against first:**
+- AML.T0043 — Craft Adversarial Data (adversarial examples)
+- AML.T0051 — LLM Prompt Injection
+- AML.T0025 — Exfiltration via ML Inference API
+- AML.T0019 — Publish Poisoned Datasets
+- AML.T0048 — Supply Chain Compromise of ML Artifacts
+
+---
+
+## Threat Evolution Timeline 2020-2025
+
+| Year | Major Shift | Implication |
+|---|---|---|
+| 2020 | Adversarial examples on CV models | Primarily academic; robustness research accelerates |
+| 2021 | Model extraction attacks become practical | APIs become attack surface; rate limiting becomes security control |
+| 2022 | ChatGPT launches; prompt injection discovered | NLP joins adversarial ML; entirely new attack category |
+| 2023 | Agent frameworks (LangChain, AutoGPT) | Tool-use escalation; indirect prompt injection via documents |
+| 2024 | Multi-modal attacks; AI-powered phishing at scale | Attack surface expands to images/audio; AI vs AI becomes normal |
+| 2025 | Autonomous agents with persistent state | Long-running compromise; sleeper attacks in agent memory; trust chain attacks |
+
+**Trend:** Attack sophistication grows linearly; attack *surface* grows exponentially (more modalities, more autonomy, more integration points).
+
+---
+
+## Security Team Structure for AI
+
+| Org Size | AI Security Staffing | Focus Areas |
+|---|---|---|
+| Startup (< 50 eng) | 0 dedicated; AppSec covers AI | Input validation, basic prompt injection defense, API auth |
+| Growth (50-200 eng) | 1-2 AI security specialists | Threat modeling, red-teaming, security review for AI launches |
+| Scale (200-1000 eng) | AI Security team (4-8) | Dedicated red team, automated scanning, governance integration |
+| Enterprise (1000+ eng) | AI Security org (10+) | Research function, bug bounty for AI, regulatory compliance, ML supply chain |
+
+**Key Roles:**
+- **AI Red Team Engineer** — Conducts adversarial testing of AI systems (prompt injection, jailbreaking, data extraction). Requires both security and ML background.
+- **ML Security Engineer** — Builds defensive tooling: input scanners, output filters, anomaly detection on model behavior.
+- **AI Security Architect** — Designs trust boundaries, reviews system architectures, defines security requirements for AI features.
+- **AI Incident Responder** — Handles AI-specific incidents: jailbreak reports, data leakage, model misbehavior at scale.
+
+**Organizational placement:** AI security should report to the CISO but maintain a dotted line to the AI/ML platform team. Pure security teams lack ML context; pure ML teams lack adversarial mindset. The bridge function is critical.

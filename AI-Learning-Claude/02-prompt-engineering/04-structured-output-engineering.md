@@ -262,3 +262,127 @@ The LLM service guarantees its callers a typed contract — just like any other 
 - Keep schemas shallow (≤3 levels of nesting)
 - Version schemas and maintain backward compatibility
 - Log parse failures for monitoring and improvement
+
+---
+
+## Staff Architect: Anti-Patterns
+
+| Anti-Pattern | Why It's Harmful | Fix |
+|-------------|-----------------|-----|
+| **No schema validation** | Trusting raw LLM output leads to runtime crashes when fields are missing/wrong type; downstream systems break unpredictably | Always validate with Pydantic/Zod before passing output to any consumer |
+| **Allowing model to hallucinate field names** | Model returns `"full_name"` when you expected `"name"`; partial matches cause silent data loss | Use function calling with explicit schemas; list exact field names in prompt AND enforce via API |
+| **Not handling parsing failures** | A single malformed response crashes the entire pipeline; no fallback, no retry | Implement parse → retry → fallback → dead-letter pattern for every structured output call |
+| **Overly complex schemas** | Schemas with 5+ levels of nesting, 30+ fields, or polymorphic types — models fail at a much higher rate | Keep schemas flat (≤3 levels), split complex extractions into multiple calls, max 10-15 fields per call |
+| **Mixing structured output with free-text** | Asking for JSON AND conversational explanation in the same response creates parsing nightmares | Separate structured extraction from explanation; use two calls or tool_use which cleanly separates them |
+| **No schema in the prompt** | Using JSON mode without telling the model what fields you expect — guarantees valid JSON but random structure | Always include schema definition or example in the prompt even when using JSON mode |
+
+## Staff Architect: Trade-offs — Structured Output Approaches
+
+| Approach | Reliability | Flexibility | Latency | Cost | Best For |
+|----------|------------|-------------|---------|------|----------|
+| **Prompt-based ("return JSON")** | 70-90% | High — any structure | Lowest | Lowest | Prototyping, non-critical paths |
+| **JSON mode** | 95%+ valid JSON | Medium — valid JSON but schema not enforced | Low | Low | When you need valid JSON but can validate schema yourself |
+| **Function calling / tool_use** | 99%+ schema-compliant | Schema-bound | Medium | Medium | Production APIs, typed interfaces |
+| **Structured Outputs (OpenAI)** | 100% schema-compliant | Strict schema-bound | Medium | Medium | When schema compliance is non-negotiable |
+| **Constrained generation (Outlines/Guidance)** | 100% guaranteed | Schema-bound | Varies (local models) | Low (self-hosted) | Self-hosted models where you control decoding |
+| **Instructor library** | 99%+ with auto-retry | Pydantic-native | Medium-High (retries) | Higher (retry cost) | Python backends wanting Pydantic-first DX |
+
+### Decision Framework
+```
+IF prototyping → prompt-based JSON
+IF production + OpenAI → Structured Outputs mode (response_format with schema)
+IF production + Anthropic → tool_use with single tool (schema-enforced extraction)
+IF production + self-hosted → Outlines/vLLM constrained generation
+IF need retries + validation → Instructor library wrapping any of the above
+```
+
+## Staff Architect: Real-World Implementation Patterns
+
+### OpenAI Structured Outputs (2024+)
+
+```python
+from openai import OpenAI
+from pydantic import BaseModel
+
+class ExtractedEntity(BaseModel):
+    name: str
+    entity_type: str  # "person", "org", "location"
+    confidence: float
+
+class ExtractionResult(BaseModel):
+    entities: list[ExtractedEntity]
+    raw_text_used: str
+
+client = OpenAI()
+completion = client.beta.chat.completions.parse(
+    model="gpt-4o-2024-08-06",
+    messages=[{"role": "user", "content": f"Extract entities: {text}"}],
+    response_format=ExtractionResult,  # Schema-enforced at API level
+)
+result: ExtractionResult = completion.choices[0].message.parsed
+# Guaranteed to be valid ExtractionResult — no parsing needed
+```
+
+### Anthropic tool_use for Structured Output
+
+```python
+import anthropic
+
+client = anthropic.Anthropic()
+response = client.messages.create(
+    model="claude-sonnet-4-20250514",
+    max_tokens=1024,
+    tools=[{
+        "name": "extract_entities",
+        "description": "Extract named entities from text",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "entities": {
+                    "type": "array",
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "name": {"type": "string"},
+                            "entity_type": {"type": "string", "enum": ["person", "org", "location"]},
+                            "confidence": {"type": "number"}
+                        },
+                        "required": ["name", "entity_type", "confidence"]
+                    }
+                }
+            },
+            "required": ["entities"]
+        }
+    }],
+    tool_choice={"type": "tool", "name": "extract_entities"},  # Force tool use
+    messages=[{"role": "user", "content": f"Extract entities from: {text}"}]
+)
+# Response will always contain tool_use block with valid schema
+```
+
+### Instructor Library (Provider-Agnostic)
+
+```python
+import instructor
+from openai import OpenAI
+from pydantic import BaseModel, Field
+
+client = instructor.from_openai(OpenAI())
+
+class UserIntent(BaseModel):
+    intent: str = Field(description="The classified intent")
+    confidence: float = Field(ge=0, le=1)
+    requires_escalation: bool
+
+# Automatic retry on validation failure, structured output guaranteed
+result = client.chat.completions.create(
+    model="gpt-4o",
+    response_model=UserIntent,
+    max_retries=3,  # Auto-retries with error feedback to model
+    messages=[{"role": "user", "content": f"Classify: {message}"}]
+)
+# result is a validated UserIntent instance
+```
+
+### Architectural Recommendation
+For new production systems in 2025: use **provider-native structured output** (OpenAI Structured Outputs or Anthropic tool_use with forced tool choice) as your primary path. Wrap with **Instructor** if you want provider-agnostic code with automatic retry logic. Reserve prompt-based JSON only for quick prototypes you'll replace before production.

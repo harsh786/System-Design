@@ -276,4 +276,109 @@ graph TD
 
 ---
 
+## Staff-Level: Anti-Patterns, Trade-offs & Production Confidence Systems
+
+### Anti-Patterns in Confidence Scoring
+
+#### 1. Using Raw Logprobs as Confidence (Uncalibrated)
+Token-level logprobs from LLMs are NOT confidence scores. They measure:
+- How likely the model thinks this TOKEN follows the previous tokens
+- NOT how likely the ANSWER is correct
+
+A model can generate "The capital of France is Paris" with high token probabilities (common sequence) AND "The treatment for condition X is drug Y" with equally high probabilities (confident-sounding but potentially wrong). Raw logprobs are systematically overconfident for factual claims and unreliable across domains.
+
+#### 2. Single Threshold for All Domains
+Using confidence > 0.7 = "answer directly" across all query types is dangerous:
+- Medical queries need higher thresholds (wrong answers cause harm)
+- Casual chitchat can tolerate lower thresholds (low stakes)
+- Legal queries need extremely high thresholds (liability)
+- Creative tasks shouldn't use confidence at all (no "correct" answer)
+
+A single threshold either over-escalates easy queries (bad UX) or under-escalates dangerous ones (risk).
+
+#### 3. No Calibration Monitoring Over Time
+You calibrated your confidence scores in January. By June:
+- Query distribution has shifted
+- Knowledge base has been updated 
+- Model provider has made silent changes
+- New user segments have different question patterns
+
+Calibration drifts. A score of 0.85 that meant "correct 85% of the time" in January might mean "correct 70% of the time" by June. Without monitoring, you don't know.
+
+#### 4. Treating Confidence as Binary (High/Low)
+Confidence is a continuous signal. Teams that bucket it into just "confident" vs "not confident" lose:
+- The ability to prioritize human review (review 0.4 scores before 0.6 scores)
+- Nuanced UX (caveats vs abstention vs clarification)
+- Cost optimization (only run expensive verification on borderline cases)
+
+### Trade-offs: Conservative vs Aggressive Thresholds
+
+| Approach | Behavior | Good For | Bad For |
+|---|---|---|---|
+| Conservative (high threshold) | Escalates/abstains frequently | Healthcare, legal, finance | Consumer apps (frustrating UX) |
+| Aggressive (low threshold) | Answers almost everything | Casual Q&A, search | High-stakes domains (risk) |
+| Adaptive (domain-aware) | Different thresholds per category | Production systems at scale | Small teams (complexity cost) |
+
+**The economic calculus**:
+```
+Cost of wrong answer = P(wrong) × Impact(wrong)
+Cost of escalation = P(escalate) × Cost(human_review)
+
+Optimal threshold: minimize total cost
+= min(wrong_answer_cost + escalation_cost)
+```
+
+For a medical chatbot: Impact(wrong) = very high → set conservative threshold
+For a recipe suggestion bot: Impact(wrong) = low → set aggressive threshold
+
+### How Confidence Drives Escalation in Production
+
+**Real-world pattern from a financial services AI assistant**:
+
+```
+┌─────────────────────────────────────────────────────────────┐
+│  Confidence-Driven Routing (Production System)               │
+├─────────────────────────────────────────────────────────────┤
+│                                                              │
+│  Query arrives → Classify domain → Look up domain threshold  │
+│                                                              │
+│  Domain Thresholds:                                          │
+│  ├── Account balance queries: 0.70 (low risk, factual)       │
+│  ├── Transaction disputes: 0.90 (high risk, nuanced)         │
+│  ├── Investment advice: 0.95 (regulated, liability)          │
+│  └── General FAQ: 0.60 (low stakes)                          │
+│                                                              │
+│  Routing Logic:                                              │
+│  ├── Above threshold → Answer directly (75% of queries)      │
+│  ├── Within 0.10 of threshold → Answer + caveat (15%)        │
+│  ├── Below threshold by 0.10-0.25 → Suggest human (8%)       │
+│  └── Below threshold by >0.25 → Direct to human (2%)         │
+│                                                              │
+│  Result: 75% automation rate with <0.5% complaint rate       │
+│  Previous (no confidence): 90% automation, 4% complaint rate │
+└─────────────────────────────────────────────────────────────┘
+```
+
+### Calibration Monitoring in Production
+
+Track weekly:
+1. **Calibration curve**: Plot confidence vs actual accuracy (should be diagonal)
+2. **Expected Calibration Error (ECE)**: Single number summarizing miscalibration
+3. **Per-domain calibration**: Confidence means different things in different domains
+4. **Threshold performance**: At your chosen threshold, what's the actual precision/recall?
+
+When ECE drifts above 0.05, trigger recalibration:
+- Pull last 2 weeks of production data with human feedback
+- Refit calibration parameters (Platt scaling or isotonic regression)
+- A/B test new calibration before full rollout
+
+### The Confidence Paradox
+
+The queries where confidence scoring matters most (ambiguous, novel, edge cases) are exactly the queries where confidence signals are least reliable. Mitigation:
+- Use self-consistency (multiple generations) for borderline cases — it's expensive but the most reliable signal precisely when you need it most
+- Track "confidence about confidence" — if signals disagree with each other, that disagreement IS the signal (route to human)
+- Never trust a single signal in isolation for any decision that matters
+
+---
+
 *Next: [05-llm-as-judge.md](./05-llm-as-judge.md) — Using LLMs to evaluate LLM outputs*

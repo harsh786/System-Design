@@ -189,3 +189,115 @@ Production systems should use **multiple models** — this is a key architectura
 - Always start with prompting, graduate to fine-tuning only with evidence
 - Use tiered model strategies: expensive models for hard tasks, cheap models for easy ones
 - Build model-agnostic: today's best model is tomorrow's second-best
+
+---
+## Anti-Patterns
+1. **Treating LLMs as deterministic** - Same input doesn't guarantee same output
+2. **Ignoring token limits** - Not planning for context overflow
+3. **Temperature = 0 means exact** - It's MORE deterministic, not perfectly deterministic
+4. **One model for everything** - Using GPT-4 for tasks a 7B model handles fine
+5. **No fallback plan** - What happens when OpenAI is down?
+6. **Ignoring model updates** - GPT-4 behavior changes between versions silently
+
+## Trade-Offs
+| Decision | Tradeoff | Staff Guidance |
+|----------|----------|---------------|
+| Model size | Quality vs cost/latency | Start with smallest model that meets quality bar |
+| Temperature | Creativity vs consistency | 0 for classification, 0.7 for creative, test your sweet spot |
+| Max tokens | Completeness vs cost | Set to expected output + 20% buffer, never unlimited |
+| Streaming | UX vs complexity | Always stream for user-facing, batch for backend |
+
+## Real-World Examples
+- **GitHub Copilot** uses specialized smaller models for code completion (latency-critical) and larger models for chat
+- **ChatGPT** uses different model sizes for different subscription tiers
+- **Perplexity** chains a fast model for query understanding with a powerful model for synthesis
+
+---
+
+## Model Selection Decision Framework
+
+Choosing the right model is one of the highest-impact architectural decisions. Use this framework:
+
+```mermaid
+graph TD
+    A[Define Requirements] --> B{Data Privacy?}
+    B -->|Must stay on-prem| C[Open Source: Llama 4 / Mistral]
+    B -->|Cloud OK| D{Quality Requirements?}
+    D -->|Frontier needed| E{Budget?}
+    D -->|Good enough is fine| F[GPT-4o-mini / Gemini Flash / Haiku]
+    E -->|High budget| G[Claude Sonnet / GPT-4o / Gemini 2.5 Pro]
+    E -->|Cost-sensitive| H[DeepSeek-V3 / Llama 4 70B]
+    G --> I{Primary Task?}
+    I -->|Coding| J[Claude Sonnet 4 > GPT-4o]
+    I -->|Analysis/Long docs| K[Gemini 2.5 Pro > Claude Sonnet]
+    I -->|General reasoning| L[GPT-4o ≈ Claude Sonnet]
+    I -->|Multimodal| M[Gemini 2.5 Pro > GPT-4o]
+```
+
+### Model Capability Comparison (Mid-2025)
+
+| Capability | GPT-4o | Claude Sonnet 4 | Gemini 2.5 Pro | Llama 4 405B | DeepSeek-V3 |
+|-----------|--------|-----------------|----------------|--------------|-------------|
+| **Code generation** | ★★★★☆ | ★★★★★ | ★★★★☆ | ★★★★☆ | ★★★★☆ |
+| **Reasoning** | ★★★★★ | ★★★★★ | ★★★★★ | ★★★★☆ | ★★★★☆ |
+| **Long document analysis** | ★★★★☆ | ★★★★★ | ★★★★★ | ★★★☆☆ | ★★★★☆ |
+| **Instruction following** | ★★★★★ | ★★★★★ | ★★★★☆ | ★★★★☆ | ★★★★☆ |
+| **Multilingual** | ★★★★☆ | ★★★★☆ | ★★★★★ | ★★★☆☆ | ★★★★★ |
+| **Safety/Refusals** | Medium | High | Medium | Low | Low |
+| **Multimodal (vision)** | ★★★★★ | ★★★★☆ | ★★★★★ | ★★★☆☆ | ★★★☆☆ |
+| **Structured output** | ★★★★★ | ★★★★☆ | ★★★★☆ | ★★★☆☆ | ★★★★☆ |
+| **Max context** | 128K | 200K | 1M | 128K | 128K |
+| **Latency (TTFT)** | Fast | Medium | Medium | Self-host dependent | Fast |
+
+### Cost-Per-Token Economics (Mid-2025)
+
+| Model | Input $/1M | Output $/1M | Cost for 1K req/day (avg 5K in + 1K out) | Monthly Cost |
+|-------|-----------|------------|------------------------------------------|-------------|
+| GPT-4o | $2.50 | $10.00 | $22.50/day | **$675** |
+| Claude Sonnet 4 | $3.00 | $15.00 | $30.00/day | **$900** |
+| Gemini 2.5 Pro | $1.25 | $10.00 | $16.25/day | **$488** |
+| GPT-4o-mini | $0.15 | $0.60 | $1.35/day | **$41** |
+| Gemini 2.0 Flash | $0.10 | $0.40 | $0.90/day | **$27** |
+| Claude Haiku 3.5 | $0.80 | $4.00 | $8.00/day | **$240** |
+| Llama 4 70B (self-hosted) | ~$0.10 | ~$0.10 | ~$0.60/day | **$18** + infra |
+| DeepSeek-V3 (API) | $0.27 | $1.10 | $2.45/day | **$74** |
+
+### When to Use Which Model Family
+
+| Scenario | Recommended Model | Why |
+|----------|------------------|-----|
+| High-volume customer support chatbot | GPT-4o-mini or Gemini Flash | Cost-effective, good enough quality |
+| Legal document analysis | Claude Sonnet 4 | Best at long-form analysis, careful reasoning |
+| Code assistant (IDE integration) | Claude Sonnet 4 or GPT-4o | Top-tier code quality, fast |
+| Processing 500-page documents | Gemini 2.5 Pro | 1M context window handles full documents |
+| Regulated industry (healthcare, finance) | Llama 4 self-hosted | Data stays on-prem, full audit trail |
+| Multilingual customer-facing product | Gemini 2.5 Pro or DeepSeek-V3 | Best multilingual capabilities |
+| Content generation (marketing) | GPT-4o | Creative, good style control |
+| Simple classification/routing | GPT-4o-mini | Cheapest capable model, <100ms |
+| Research prototype/experimentation | DeepSeek-V3 | Near-frontier quality at budget price |
+
+### Staff Decision: When to Switch Models
+
+Trigger a model evaluation when:
+1. **Cost exceeds budget by 30%+** — time to evaluate cheaper alternatives
+2. **New model release** — always benchmark against your eval suite within 2 weeks
+3. **Quality metrics dropping** — provider may have silently updated the model
+4. **New capability needed** — e.g., vision, longer context, better structured output
+5. **Latency SLA violations** — may need a faster/smaller model
+
+**Never switch models without running your eval suite.** "The new model seems better" is not evidence.
+
+### Model Evaluation Template
+
+When evaluating a new model for your use case, test across these dimensions:
+
+| Dimension | How to Test | Minimum Sample |
+|-----------|------------|:--------------:|
+| Accuracy on your task | Run eval dataset | 100+ examples |
+| Output format compliance | Parse success rate | 200+ outputs |
+| Latency (p50, p95, p99) | Load test | 1,000+ requests |
+| Cost at projected volume | Calculate from pricing | Spreadsheet |
+| Edge case handling | Adversarial test set | 50+ examples |
+| Regression vs current model | Side-by-side comparison | 100+ examples |
+
+**Staff habit:** Maintain a model evaluation scorecard that lets you compare any new model against your current production model in under 4 hours. The teams that do this ship model upgrades confidently; the teams that don't are stuck on old models out of fear.

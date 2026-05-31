@@ -276,3 +276,120 @@ flowchart TB
 4. **Fallbacks are your safety net** — test them regularly
 5. **On-call needs AI context** — traditional SRE training isn't enough
 6. **Post-mortems must cover quality impact** — not just availability
+
+---
+
+## Staff-Level: Anti-Patterns
+
+### 1. Using Traditional SLIs for AI (Uptime Alone Is Insufficient)
+A model endpoint can be "up" (200 OK, low latency) while producing complete garbage. Traditional SLIs (availability, latency, error rate) miss the most common AI failure mode: **quality degradation without infrastructure symptoms**.
+
+A production AI system needs SLIs across three dimensions:
+- **Infrastructure SLIs:** Availability, latency, error rate (traditional)
+- **Quality SLIs:** Faithfulness, relevance, coherence, hallucination rate
+- **Business SLIs:** Task completion rate, user satisfaction, cost efficiency
+
+### 2. No Quality-Based SLOs
+"Our SLO is 99.9% availability and P95 latency < 5s." This SLO allows a system that's always up, always fast, and always wrong. Without quality SLOs, you have no error budget mechanism for quality regressions — no trigger to freeze deployments when the model starts hallucinating.
+
+**Example quality SLO:** "95% of responses score > 0.8 on faithfulness eval, measured on a 10% sample, rolling 1-hour window."
+
+### 3. On-Call Team Doesn't Understand AI-Specific Failures
+Traditional SREs know how to handle: server down, disk full, network partition. AI-specific failures require different skills:
+- "Model is hallucinating" — Is the retrieval broken? Did the prompt change? Did the model version update?
+- "Responses are slow" — Is it the model? The vector DB? Token generation length increased?
+- "Costs spiked" — Prompt injection causing long outputs? New feature shipping without budget approval?
+
+**Fix:** AI-specific on-call training, AI failure mode catalog, and runbooks that go beyond "restart the service."
+
+### 4. Runbooks That Say "Restart the Model"
+Restarting an LLM inference server takes 5-30 minutes (model reload into GPU memory). During that time you have zero capacity. Traditional runbook advice ("restart the service") is actively harmful for AI systems.
+
+**Better runbook entries:**
+- "If quality degraded: route to backup model, investigate root cause, DO NOT restart primary"
+- "If latency spiked: check batch size, check GPU memory pressure, reduce max concurrent requests"
+- "If costs spiked: check per-request token counts, look for prompt injection, enable strict max_tokens"
+
+---
+
+## Staff-Level: Trade-offs
+
+### SLO Strictness vs Engineering Cost
+| SLO Level | Quality SLO | Engineering Required | Team Size |
+|-----------|-------------|---------------------|-----------|
+| Basic | None (just uptime) | Standard infra monitoring | 1-2 SREs |
+| Intermediate | Weekly quality eval batch | Eval pipeline + alerting | 2-3 SREs + ML eng |
+| Advanced | Real-time quality scoring on 10% sample | Streaming eval, judge models, quality DB | 4-6 SREs + ML team |
+| Elite | Per-request quality scoring | Dedicated eval infrastructure, custom judge models | Full platform team |
+
+Each level is 2-3x more expensive than the previous. Most teams should target Intermediate and move to Advanced only when AI is core to revenue.
+
+### Error Budget: Quality vs Availability
+You need **separate error budgets** for quality and availability:
+
+```
+Availability budget: 99.9% = 43 min downtime/month
+Quality budget:      95% of responses above threshold = 5% allowed to be low-quality
+
+These are INDEPENDENT:
+- System can be "up" but burning quality budget (hallucinating)
+- System can be "down" briefly but have perfect quality when up
+
+Policy:
+- Availability budget exhausted → freeze infra changes
+- Quality budget exhausted → freeze model/prompt changes
+- Both exhausted → full deployment freeze, all hands on reliability
+```
+
+### Human Review vs Automated Recovery
+| Failure Type | Automated Recovery | Human Review |
+|-------------|-------------------|--------------|
+| Latency spike (transient) | Auto-scale, reduce batch size | Not needed |
+| Single model endpoint down | Circuit breaker → fallback | Not needed |
+| Quality score drops 10% | Route to backup model | Required before resuming primary |
+| Hallucination spike | Enable strict guardrails | Required (investigate root cause) |
+| Cost runaway | Auto-throttle to cheap model | Required (find source) |
+| Data breach/prompt injection | Block user, enable filters | Required (assess damage) |
+
+**Principle:** Automate recovery from **infrastructure** failures. Require human judgment for **quality** and **safety** failures.
+
+---
+
+## Staff-Level: AI-Specific SLIs
+
+### The Complete AI SLI Framework
+
+| SLI | How to Measure | Target | Alert Threshold |
+|-----|---------------|--------|-----------------|
+| **Quality Score** | LLM-as-judge on 10% sample | > 0.85 | < 0.75 for 15 min |
+| **Hallucination Rate** | Faithfulness eval (claim vs source) | < 3% | > 8% for 10 min |
+| **Latency P95** | Per-request timing | < 5s | > 10s for 5 min |
+| **Latency P99** | Per-request timing | < 15s | > 30s for 5 min |
+| **Retrieval Relevance** | NDCG@10 on sampled queries | > 0.7 | < 0.5 for 30 min |
+| **Cost per Request** | Token count × price | < $0.10 | > $0.25 avg over 1hr |
+| **Task Completion Rate** | User completes intended action | > 70% | < 50% for 1 hr |
+| **Safety Violation Rate** | Content filter triggers | < 0.1% | > 0.5% for 5 min |
+
+### Measuring Hallucination Rate in Production
+
+```python
+# Sample 10% of responses for quality eval
+async def quality_monitor(request, response):
+    if random.random() > 0.1:
+        return  # Skip 90%
+    
+    # Run faithfulness check (is response supported by retrieved context?)
+    score = await eval_faithfulness(
+        question=request.query,
+        context=request.retrieved_chunks,
+        answer=response.text
+    )
+    
+    metrics.record("hallucination_rate", 1.0 if score < 0.5 else 0.0)
+    metrics.record("quality_score", score)
+    
+    if score < 0.3:  # Severe hallucination
+        alert("SEVERE_HALLUCINATION", request_id=request.id)
+```
+
+**Key insight:** You cannot measure quality on every request (too expensive — eval itself requires LLM calls). 10% sampling with statistical alerting is the standard approach. At 1000 req/s, that's 100 evals/s — still expensive, budget $3-5K/month for quality monitoring alone.

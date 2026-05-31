@@ -236,3 +236,89 @@ graph TD
 4. **Use RAGAS** for standardized evaluation
 5. **Automate with LLM-as-judge** but calibrate with human review
 6. **Track metrics over time** — regressions happen silently
+
+---
+
+## Staff-Level Anti-Patterns
+
+### Anti-Pattern 1: Evaluating Only the Final Answer
+Teams measure "is the answer correct?" without isolating WHERE failures occur. If the answer is wrong, is it because retrieval failed (wrong docs) or generation failed (LLM hallucinated despite good docs)? You MUST measure retrieval and generation independently.
+
+### Anti-Pattern 2: Manual Evaluation That Doesn't Scale
+Having a human review every query works at 100 queries/day. At 10K queries/day, you're reviewing 0.1% and missing systematic failures. Manual evaluation is for calibration, not monitoring.
+
+### Anti-Pattern 3: Using LLM-as-Judge Without Calibration
+GPT-4 as evaluator agrees with itself ~95% of the time, creating false confidence. You must calibrate your LLM judge against human ratings on 200+ examples, measure inter-annotator agreement, and track judge drift over time.
+
+### Anti-Pattern 4: No Regression Testing
+You improve chunking strategy, recall goes up 10%, you celebrate. But you didn't check if faithfulness dropped because larger chunks now include contradictory information. Every change needs full evaluation across ALL metrics, not just the one you optimized.
+
+---
+
+## Trade-offs: Human Eval vs LLM Eval vs Automated Metrics
+
+| Dimension | Human Evaluation | LLM-as-Judge | Automated Metrics (BLEU, ROUGE, etc.) |
+|-----------|-----------------|--------------|--------------------------------------|
+| **Accuracy** | Gold standard | 80-90% agreement with humans | 50-70% correlation with quality |
+| **Cost** | $0.50-2.00/query | $0.01-0.05/query | Free |
+| **Speed** | Days (batch) | Minutes | Seconds |
+| **Scalability** | 100s/day max | 100K+/day | Unlimited |
+| **Nuance** | Catches subtle errors | Good for clear cases | Misses semantic correctness |
+| **Consistency** | Varies by annotator | Highly consistent (sometimes wrong consistently) | Perfectly consistent |
+| **Best for** | Golden dataset creation, calibration, edge cases | Daily monitoring, regression detection | Sanity checks, format validation |
+
+### The Three-Tier Evaluation Architecture
+
+```
+Tier 1 (Every query):    Automated checks — format, length, citation presence, latency
+Tier 2 (1% sample):      LLM-as-judge — faithfulness, relevance, completeness
+Tier 3 (Weekly):          Human review — calibrate Tier 2, update golden dataset
+```
+
+---
+
+## Real Eval Pipeline: Evaluating at 10K+ Queries/Day Automatically
+
+### Architecture
+
+```mermaid
+graph TD
+    PROD[Production Traffic<br>10K queries/day] --> LOG[Log: query + retrieved_chunks + answer]
+    LOG --> SAMPLE[Stratified Sample<br>1% = 100 queries/day]
+    SAMPLE --> JUDGE[LLM-as-Judge<br>Score faithfulness, relevance]
+    JUDGE --> DB[(Metrics DB)]
+    DB --> DASH[Dashboard + Alerts]
+    
+    GOLDEN[Golden Dataset<br>200 queries] --> WEEKLY[Weekly Full Eval]
+    WEEKLY --> DB
+    
+    DASH --> ALERT{Score < threshold?}
+    ALERT -->|Yes| PAGE[Page on-call + <br>auto-disable if critical]
+    ALERT -->|No| OK[Continue]
+```
+
+### Implementation Details
+
+1. **Stratified sampling**: Don't sample randomly. Sample proportionally across query categories (factual, comparative, temporal, multi-hop) to catch category-specific failures.
+
+2. **LLM judge prompt** (calibrated):
+```
+Rate the following answer on faithfulness (1-5):
+- 5: Every claim is directly supported by the context
+- 4: Minor unsupported details that don't affect correctness
+- 3: Some claims lack support but core answer is grounded
+- 2: Significant unsupported claims
+- 1: Answer contradicts or fabricates beyond context
+```
+
+3. **Alert thresholds** (tuned to your baseline):
+   - Faithfulness 7-day average drops >0.1 → Warning
+   - Faithfulness 7-day average drops >0.2 → Critical (page on-call)
+   - Empty retrieval rate >10% → Warning (possible index issue)
+   - P95 latency >5s → Warning (infra issue)
+
+4. **Weekly golden dataset eval**: Run all 200+ golden queries, compare to baseline, generate a report showing per-category accuracy trends.
+
+5. **Monthly recalibration**: Have humans rate 50 queries that the LLM judge scored. Compute agreement. If agreement drops below 85%, retune the judge prompt or switch models.
+
+**Cost at scale**: 100 LLM-judge evaluations/day × $0.03/eval = $3/day. Golden dataset weekly: 200 × $0.03 = $6/week. Total eval cost: ~$100/month — trivial compared to the cost of shipping wrong answers.

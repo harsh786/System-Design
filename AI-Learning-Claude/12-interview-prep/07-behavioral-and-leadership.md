@@ -261,3 +261,86 @@ For your specific case, I'd ask: how often does the knowledge change?"
 4. Explain what would change your recommendation
 
 This shows you can make decisions AND understand their contingencies.
+
+---
+
+## Anti-Patterns in Behavioral Answers
+
+### What Makes Answers Sound Senior (Not Staff)
+
+**1. No Specific Numbers**
+
+Bad: "We improved the system significantly."  
+Good: "We reduced hallucination rate from 12% to 2.3% and cut P99 latency from 8s to 1.4s."
+
+Numbers prove you measured, tracked, and cared about outcomes. Without numbers, you're telling a story. With numbers, you're reporting results.
+
+**2. "We" Instead of "I"**
+
+Bad: "We decided to migrate to a new architecture."  
+Good: "I proposed the migration after identifying that our monolithic prompt was causing 40% of quality issues. I designed the multi-step architecture, got buy-in from the team lead, and led implementation across 3 sprints."
+
+Staff-level means you DROVE it. Saying "we" constantly makes interviewers wonder: were you leading or along for the ride?
+
+**3. No Clear Outcome**
+
+Bad: "I redesigned the evaluation pipeline and the team was happy with it."  
+Good: "I redesigned the evaluation pipeline. Result: we caught a critical regression before production that would have affected 50K users. The pipeline now runs in CI/CD and has blocked 7 bad deployments in Q4."
+
+Every STAR answer must end with a measurable outcome. "The team liked it" is not an outcome.
+
+**4. Answers That Sound Senior Not Staff**
+
+| Senior signal | Staff signal |
+|--------------|-------------|
+| "I implemented X" | "I identified the need for X, convinced leadership, designed the approach, and led implementation" |
+| "I fixed the bug" | "I traced the systemic issue, fixed the immediate problem, AND changed the process to prevent recurrence" |
+| "I built the feature" | "I built the feature AND established the pattern that 4 other teams now follow" |
+| "It worked well" | "It reduced costs by $X and became the standard approach for Y" |
+
+---
+
+## The STAR-at-Staff-Level Framework
+
+Staff behavioral answers have three upgrades over standard STAR:
+
+### 1. Expanded Situation → Show Organizational Context
+
+Don't just set the scene. Explain why this mattered at the org level.
+
+**Senior Situation:** "Our RAG system had quality issues."  
+**Staff Situation:** "Our RAG system was the primary customer-facing AI product, serving 200K queries/day. Quality issues were driving a 15% increase in escalations to human agents, costing $400K/quarter in additional support headcount. Three teams had attempted fixes without sustained improvement."
+
+### 2. Expanded Action → Show Leadership Behaviors
+
+Don't just describe what you built. Describe how you influenced, aligned, and multiplied.
+
+**Staff-level action components:**
+- How you diagnosed the root cause (not just the symptom)
+- Who you aligned and how (cross-team, up to leadership)
+- What frameworks/processes you established (not just code)
+- How you enabled others (documentation, training, patterns)
+- What you said NO to (scope control, prioritization)
+
+### 3. Expanded Result → Show Ripple Effects
+
+Don't just report the immediate outcome. Show how it changed things beyond your immediate scope.
+
+**Senior Result:** "Hallucination rate dropped to 2%."  
+**Staff Result:** "Hallucination rate dropped from 12% to 2%, saving $400K/quarter in escalation costs. The evaluation framework I built was adopted by 3 other product teams. It became part of our deployment standard — no AI feature ships without passing the eval gate. I presented the approach at our engineering all-hands and it's now in our architecture guidelines."
+
+### Template for Staff Behavioral Answers
+
+```
+SITUATION: [Business context + scale + why it mattered organizationally]
+TASK: [Your specific accountability, not the team's]
+ACTION: 
+  - Diagnosed: [How you found the root cause]
+  - Aligned: [Who you brought together, how you got buy-in]
+  - Executed: [What you personally drove]  
+  - Multiplied: [How you made it reusable/standard]
+RESULT:
+  - Immediate: [Quantified improvement]
+  - Broader: [Organizational change, team enablement, process improvement]
+  - Learning: [What you'd do differently, what principle you extracted]
+```

@@ -285,3 +285,93 @@ All linked by document_id for reconstruction
 
 - Multimodal pipelines build on the RAG foundations from earlier chapters
 - Consider combining with [Knowledge Graphs](./02-knowledge-graphs-for-ai.md) for structured multimodal reasoning
+
+---
+
+## Anti-Patterns
+
+### 1. Treating Images as Text-Only (OCR Everything)
+
+**What goes wrong:** Team converts every image to text via OCR, losing spatial relationships, visual context, charts, diagrams, and layout meaning. A network diagram OCR'd becomes a meaningless list of labels with no topology.
+
+**What you lose with OCR-only:**
+- Spatial relationships (what's next to what, what's connected)
+- Visual emphasis (color, size, bold)
+- Chart/graph data (trends, proportions)
+- UI context (button positions, layout hierarchy)
+
+**Fix:** Use vision models directly for content where spatial/visual meaning matters. Reserve OCR for pure text extraction (typed documents, receipts with numbers).
+
+### 2. Same Architecture for All Modalities
+
+**What goes wrong:** Team builds one pipeline and forces all content through it. Audio gets the same chunking as text. Images get the same embedding as documents. Result: poor retrieval quality across all modalities.
+
+**Fix:** Modality-specific pipelines that converge at the retrieval/generation layer:
+- Text: chunk → embed → vector store
+- Images: caption + CLIP embed → vector store
+- Audio: transcribe → chunk → embed → vector store (plus keep timestamps)
+- Each modality needs its own preprocessing, embedding model, and retrieval strategy
+
+### 3. Ignoring Latency of Vision Models
+
+**What goes wrong:** Architecture assumes vision model calls are as fast as text. In reality, image processing adds 2-5x latency. System feels sluggish, timeouts occur, user experience degrades.
+
+**Reality:**
+- Text generation: 500ms-2s
+- Image understanding: 2-8s (depends on resolution, detail level)
+- Video frame analysis: 2-8s PER FRAME
+
+**Fix:**
+- Async processing for non-real-time image analysis
+- Pre-process and cache image descriptions during ingestion (not query time)
+- Use low-detail mode when full resolution isn't needed (4x faster, 10x cheaper)
+- Show progressive loading UX while vision model processes
+
+### 4. No Fallback When Vision Model Fails
+
+**What goes wrong:** Vision model returns low-confidence result, hallucinated description, or timeout — and system treats it as ground truth. Downstream decisions based on bad visual understanding.
+
+**Fix:**
+- Confidence thresholds: reject vision output below threshold
+- Fallback chain: vision model → OCR fallback → "unable to process" with human escalation
+- Never make irreversible decisions based solely on vision model output
+- Log all vision model outputs for quality auditing
+
+---
+
+## Key Trade-offs
+
+### Unified Multi-Modal Model (GPT-4V) vs Pipeline (Separate OCR + LLM)
+
+| Factor | Unified Model (GPT-4V, Gemini) | Pipeline (OCR → LLM) |
+|--------|-------------------------------|----------------------|
+| Spatial understanding | Excellent | Poor (loses layout) |
+| Cost per image | $0.003-0.03 | $0.001-0.005 (OCR cheaper) |
+| Latency | 2-8s | 1-3s (OCR is fast) |
+| Accuracy on text extraction | Good but not perfect | Better for pure text (specialized) |
+| Flexibility | One API call | Swap components independently |
+| Failure modes | Single point of failure | Can fail at each step but debug easier |
+
+**Decision:**
+- Pure text documents (invoices, forms) → Pipeline (OCR + LLM) — cheaper, faster, more accurate for text
+- Visually complex content (diagrams, screenshots, charts) → Unified vision model
+- Mixed content → Hybrid: OCR for text regions, vision model for visual regions
+
+### Cost Per Modality at Scale
+
+```
+Processing 100,000 items/month:
+  Text (1K tokens each): ~$1,000/month
+  Images (low detail):   ~$300/month  
+  Images (high detail):  ~$3,000/month
+  Audio (1 min each):    ~$200/month (Whisper) + text processing
+  Video (1 min each):    ~$180,000/month (1fps frame analysis)
+```
+
+**Key insight:** Video is 60-180x more expensive than text. Never process video frame-by-frame unless absolutely necessary. Use keyframe extraction, scene detection, or transcription-first approaches.
+
+**Cost optimization strategies:**
+- Process images at lowest acceptable resolution
+- Extract keyframes from video (1 per scene change, not 1 per second)
+- Cache image descriptions — same image doesn't need re-analysis
+- Use text-only pipeline when visual content is incidental

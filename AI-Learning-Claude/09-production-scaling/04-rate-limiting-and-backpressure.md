@@ -310,3 +310,63 @@ flowchart TB
 4. **Backpressure protects the system** — better to reject some than crash for all
 5. **Always communicate limits** — clear headers and error messages
 6. **Priority queues are essential** — not all users/requests are equal
+
+---
+
+## Staff-Level: Anti-Patterns
+
+### 1. Same Rate Limit for All Users
+A free user on a trial and an enterprise customer paying $50K/month get the same 60 req/min? This creates two problems: power users are frustrated (they'll leave), and free users can still overwhelm the system. Rate limits must be tiered by customer value, plan, and contract terms.
+
+### 2. No Priority Lanes
+When the system is at capacity, every request competes equally. Result: a batch job from an internal tool blocks a real-time request from a paying customer. Without priority lanes, you can't protect revenue-generating traffic during overload.
+
+### 3. Rejecting Requests Without Queue Option
+Returning 429 immediately forces clients to implement their own retry logic (most do it badly — no jitter, aggressive retries). Better: offer a queue option. "Your request is #47 in queue, estimated wait: 15 seconds." This is especially important for AI where requests are expensive and users expect some latency.
+
+### 4. Rate Limiting at the Wrong Layer
+Rate limiting at the API gateway only catches request count. But the real cost driver in AI is **tokens**, not requests. A single request with a 100K token context costs 100x more than a simple classification. You need rate limiting at multiple layers:
+- Gateway: request count (DDoS protection)
+- Application: token budget (cost protection)
+- Model: concurrent inference slots (capacity protection)
+
+### 5. No Feedback to Client About Retry Timing
+Returning `429 Too Many Requests` without `Retry-After` header forces clients to guess. They either retry too aggressively (making the problem worse) or too conservatively (wasting available capacity). Always include `Retry-After` and `X-RateLimit-Reset`.
+
+---
+
+## Staff-Level: Trade-offs
+
+### Strict Limits vs Adaptive Limits
+| Dimension | Strict (Fixed) | Adaptive (Dynamic) |
+|-----------|---------------|-------------------|
+| Predictability | High (clients know exactly) | Low (limits change) |
+| Cost control | Excellent | Good (but can spike) |
+| Utilization | Low (limits set for worst case) | High (expands during low load) |
+| Implementation | Simple | Complex (needs load signals) |
+| Risk | May reject good traffic | May allow overload |
+
+**Decision:** Use strict limits as the outer boundary (never exceed), adaptive within that boundary (expand/contract based on system health). Publish the strict limits in docs; adaptive behavior is transparent to clients.
+
+### Algorithm Comparison for AI Workloads
+
+| Algorithm | Burst Handling | Smoothing | Memory | Best For |
+|-----------|---------------|-----------|--------|----------|
+| Token Bucket | Excellent (allows bursts up to bucket size) | Good | O(1) per user | Interactive AI users (bursty by nature) |
+| Sliding Window | Good | Excellent | O(n) per user | Per-model capacity protection |
+| Leaky Bucket | None (constant rate) | Perfect | O(1) | Feeding requests to GPU inference (steady throughput) |
+| Fixed Window | Poor (boundary burst) | Poor | O(1) | Simple per-minute accounting |
+
+**Recommendation for AI systems:**
+- **User-facing:** Token bucket (users send bursts of messages in a conversation, then pause)
+- **GPU feeding:** Leaky bucket (GPUs work best with steady input, not bursts)
+- **Cost accounting:** Sliding window (accurate spend tracking over time periods)
+
+### Token-Based vs Request-Based Limiting
+Request-based limiting treats all requests equally. But in AI:
+```
+Request A: "hi" → 5 tokens, costs $0.0001, takes 50ms
+Request B: "Analyze this 50-page document" → 50K tokens, costs $1.50, takes 30s
+```
+
+Both count as "1 request" under request-based limiting. Token-based limiting (or cost-weighted) correctly accounts for the 15,000x difference in resource consumption. At scale, always limit on **tokens/cost**, not request count.

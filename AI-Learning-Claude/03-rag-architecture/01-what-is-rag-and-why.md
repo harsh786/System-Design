@@ -245,3 +245,59 @@ Now that you understand *what* RAG is and *why* it exists, the next sections cov
 - [03 - Chunking Strategies](./03-chunking-strategies.md): Splitting documents intelligently
 - [04 - Retrieval Techniques](./04-retrieval-techniques.md): Finding the right information
 - [05 - RAG Patterns](./05-rag-patterns-taxonomy.md): All the ways to architect RAG
+
+---
+
+## Staff-Level Anti-Patterns
+
+### Anti-Pattern 1: RAG for Everything
+Not every LLM task needs retrieval. Creative writing, summarization of a provided document, code generation from a spec — these don't benefit from RAG. Adding retrieval adds latency, cost, and failure modes for zero gain.
+
+### Anti-Pattern 2: No Evaluation of Retrieval Quality
+Teams build RAG, test with 5 queries, declare success. Without systematic retrieval evaluation (recall@K, precision@K), you have no idea if your system actually works across the query distribution.
+
+### Anti-Pattern 3: Ignoring When Long-Context Makes RAG Unnecessary
+With 200K+ token context windows (Claude, Gemini), if your entire corpus fits in context, RAG adds unnecessary complexity. A 500-page employee handbook (~150K tokens) might just go directly into the prompt.
+
+### Anti-Pattern 4: Building RAG Before Validating the Use Case
+Teams spend months building RAG infrastructure only to discover users don't actually need it, or the questions require aggregation/computation that RAG can't provide.
+
+---
+
+## Trade-offs: RAG vs Fine-Tuning vs Long-Context (Decision Matrix)
+
+| Decision Factor | Choose RAG | Choose Fine-Tuning | Choose Long-Context |
+|----------------|-----------|-------------------|-------------------|
+| Data changes weekly+ | ✅ | ❌ (retrain each time) | ✅ (if fits) |
+| Need citations | ✅ | ❌ (no source tracking) | ⚠️ (manual) |
+| Corpus > 200K tokens | ✅ | ❌ | ❌ (won't fit) |
+| Need behavior/style change | ❌ | ✅ | ❌ |
+| Minimize latency | ❌ (retrieval adds 200ms+) | ✅ (single call) | ✅ (single call) |
+| Minimize per-query cost | ⚠️ (retrieval + generation) | ✅ (no retrieval) | ❌ (massive token cost) |
+| Data is sensitive/private | ✅ (stays in your infra) | ⚠️ (training data exposure) | ✅ (prompt-only) |
+| Need 99%+ accuracy | ⚠️ (retrieval can fail) | ❌ (hallucination risk) | ✅ (if doc fits) |
+
+### The Hybrid Reality
+Production systems often combine approaches:
+- **Fine-tune** for domain-specific reasoning style + **RAG** for factual grounding
+- **Long-context** for single-document tasks + **RAG** for cross-document queries
+- **RAG** as default + **direct LLM** when classifier determines no retrieval needed
+
+---
+
+## Staff Insight
+
+> "RAG is not dead, but the decision of WHEN to use it requires architectural judgment. The worst RAG systems are the ones built because someone read a blog post, not because they analyzed their actual information retrieval needs. The best RAG systems are the ones where the team can articulate exactly which problem RAG solves that a simpler approach cannot."
+
+**The senior engineer's checklist before building RAG:**
+1. Can the entire corpus fit in a long-context window? If yes, benchmark that first.
+2. Does the data actually change? If it's static, consider fine-tuning or prompt injection.
+3. Do users need citations? If not, maybe fine-tuning is sufficient.
+4. Is the query pattern "look up facts" or "reason over everything"? RAG excels at the former, struggles with the latter.
+5. What's the latency budget? RAG adds 200-2000ms minimum.
+
+---
+
+## Conclusion and Learning Path
+
+You now understand the *why* behind RAG — the problems it solves, when to use it vs alternatives, and its limitations. The remainder of this module covers the *how*: building each component of a production RAG system from ingestion to evaluation. Each subsequent section builds on this foundation, so ensure you're comfortable with the trade-off framework above before proceeding.

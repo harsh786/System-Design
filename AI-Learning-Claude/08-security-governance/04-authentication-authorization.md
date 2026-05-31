@@ -243,3 +243,68 @@ token = issue_token(
 3. **Use short-lived, narrowly-scoped tokens** for all AI service interactions
 4. **Audit everything** — who asked what, what was retrieved, what was returned
 5. **Treat the AI agent as an untrusted intermediary** between user and data
+
+---
+
+## Staff-Level: Anti-Patterns, Trade-offs, and AI-Specific Auth Challenges
+
+### Anti-Patterns in AI Authentication/Authorization
+
+**1. Shared API Keys Across Users**
+A single API key for all users means: no per-user audit trail, no per-user rate limiting, no way to revoke one user's access without affecting all, and if leaked, everyone is compromised. In AI systems this is worse because conversation history may be shared across the key's scope. Every user must have their own identity flowing through the entire AI pipeline — from API gateway through to vector DB queries.
+
+**2. No Per-User Rate Limits**
+Without per-user rate limiting, one abusive user can exhaust your entire LLM budget. More critically, automated attacks (model extraction, data exfiltration via repeated queries) look like normal traffic in aggregate but are obvious per-user. Rate limits should be: per-user, per-endpoint, per-time-window, AND per-cost-unit (tokens consumed, not just requests).
+
+**3. Storing Conversation History Without Access Control**
+Teams store all conversations in a shared database. Problems: support agents can read customer conversations, other users' context bleeds into responses if session isolation fails, and regulatory requirements (GDPR deletion) become impossible. Conversation history needs the same access control rigor as any sensitive data store — encrypted, access-controlled, with retention policies.
+
+**4. Over-Privileged AI Agents**
+The agent needs to call 3 APIs, so the team gives it admin access to everything "to avoid permission errors." Now a prompt injection attack has admin-level blast radius. AI agents should have the MINIMUM permissions needed for their current task, ideally scoped per-request, not per-deployment. If an agent needs database access for analytics queries, it gets SELECT on specific tables — not a DBA role.
+
+### Trade-offs in AI Auth Architecture
+
+| Trade-off | Option A | Option B | Staff Guidance |
+|-----------|----------|----------|----------------|
+| Token-based vs Session-based | JWT tokens (stateless, scalable, can't revoke instantly) | Server-side sessions (revocable, requires session store) | JWTs for short-lived operations (<5min). Session tokens for long-running agent tasks that may need emergency revocation. |
+| Per-request vs Per-session auth | Authorize every tool call individually (secure, high latency) | Authorize at session start, cache decision (fast, stale permissions) | Hybrid: authorize at session start, re-authorize for high-risk tool calls. Cache low-risk decisions for 60s. |
+| User impersonation vs Delegation | Agent uses user's actual credentials (simple, dangerous) | Agent has own identity + delegated scopes (complex, safer) | Always delegation. Agent identity + user context. Never let agents hold user credentials. Use OAuth2 token exchange (RFC 8693). |
+| Coarse vs Fine-grained permissions | Role-based (admin/user/viewer — simple, over-permissive) | Attribute-based (field-level, context-aware — precise, complex) | Start RBAC, add ABAC for sensitive resources. Field-level access control for RAG (some users see redacted fields). |
+
+### AI-Specific Auth Challenges
+
+**The Agent Acting on Behalf of User Problem:**
+Traditional OAuth2 has the "on-behalf-of" flow, but AI agents create new challenges:
+- The agent may need to chain multiple services (user → agent → service A → service B)
+- Each hop needs to carry the original user's authorization context
+- The agent shouldn't accumulate permissions across multiple users it serves
+- Long-running agent tasks may outlive the user's session/token
+
+**Solution pattern — Token Exchange Chain:**
+```
+User token (broad) → Exchange for agent-scoped token (narrow) → 
+Each tool call gets a purpose-specific token (narrowest)
+```
+
+**The Multi-Tenant Agent Problem:**
+A single agent deployment serves multiple organizations. It must:
+- Never mix context between tenants (tenant A's docs never appear for tenant B)
+- Enforce tenant-specific policies (tenant A allows external search, tenant B doesn't)
+- Maintain separate rate limits and budgets per tenant
+- Support tenant-specific model configurations and guardrails
+
+**The Autonomous Agent Auth Problem:**
+When agents operate autonomously (scheduled tasks, background processing), who is the "user"?
+- Service accounts with explicit scope documentation
+- Time-bounded permissions that auto-expire
+- Mandatory human approval for actions above a risk threshold
+- Full audit trail attributing every action to the originating authorization grant
+
+### Staff Interview Insight
+
+A staff-level answer to "How would you design auth for an AI agent system?" demonstrates:
+1. Understanding that the agent is an untrusted intermediary (confused deputy awareness)
+2. Token scoping strategy (narrow, short-lived, purpose-bound)
+3. Separation of agent identity from user identity
+4. Data-layer enforcement (permissions at the DB/vector store level, not just application logic)
+5. Monitoring strategy (detect permission escalation attempts, anomalous access patterns)

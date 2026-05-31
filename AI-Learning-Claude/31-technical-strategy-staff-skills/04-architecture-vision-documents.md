@@ -247,3 +247,81 @@ Each product was built by a different team with completely independent infrastru
 ---
 
 *"A vision without a transition plan is a fantasy. A transition plan without a vision is busywork. The Staff architect's job is to hold both simultaneously - the inspiring destination AND the pragmatic path."*
+
+---
+
+## Vision Document Template
+
+```markdown
+# Architecture Vision: [System/Domain Name]
+**Author**: [Name] | **Date**: YYYY-MM-DD | **Status**: Draft/Review/Approved
+
+## Executive Summary (1 paragraph)
+[What we're doing, why, and what success looks like — readable by a VP in 30 seconds]
+
+## Current State
+- Architecture diagram (as-is)
+- Key pain points (with data)
+- Business constraints driving change
+
+## Target State (12-18 month horizon)
+- Architecture diagram (to-be)
+- Key properties of the target (scalability, cost, reliability targets)
+- What we're explicitly NOT building
+
+## Fitness Functions
+[Measurable criteria that tell us we're on track]
+- Metric 1: [current value] → [target value]
+- Metric 2: [current value] → [target value]
+
+## Transition Plan
+### Phase 1: [Name] (Months 1-3)
+- Deliverables, teams involved, dependencies, value delivered
+
+### Phase 2: [Name] (Months 4-8)
+- Deliverables, teams involved, dependencies, value delivered
+
+### Phase 3: [Name] (Months 9-14)
+- Deliverables, teams involved, dependencies, value delivered
+
+## Risks and Mitigations
+| Risk | Likelihood | Impact | Mitigation |
+|------|-----------|--------|------------|
+
+## Resource Requirements
+- Teams, headcount, budget, external dependencies
+
+## Decision Log
+| Date | Decision | Rationale |
+|------|----------|-----------|
+```
+
+## Review Process
+
+| Stage | Duration | Participants | Goal |
+|-------|----------|--------------|------|
+| **Draft** | 1-2 weeks | Author + 1 trusted peer | Get structure and logic right |
+| **Technical review** | 1 week | Staff+ engineers, tech leads | Validate feasibility, catch gaps |
+| **Stakeholder review** | 1 week | Product, Eng leadership | Align on priorities and resources |
+| **Approval** | 1 meeting | Decision makers (VP/Director) | Get explicit go/no-go |
+| **Socialization** | Ongoing | All engineering | Build understanding and buy-in |
+
+**Review best practices:**
+- Share the document async first; use meetings for discussion, not reading
+- Explicitly ask reviewers what feedback you need (feasibility? priority? risk?)
+- Track and respond to every piece of feedback, even if you disagree
+
+## Communication Strategies for Different Audiences
+
+| Audience | Format | Length | Focus |
+|----------|--------|--------|-------|
+| **Executive/VP** | 1-page summary + verbal walkthrough | 5 min read | Business impact, cost, timeline, risks |
+| **Engineering leadership** | Full vision doc | 20 min read | Feasibility, resource needs, team impact |
+| **Individual teams** | Team-specific excerpt + Q&A session | 30 min meeting | "What changes for YOUR team and when" |
+| **New hires** | Simplified overview in onboarding | 10 min read | Context on where we're going and why |
+
+**Communication anti-patterns:**
+- Sending a 15-page doc to executives (they won't read it)
+- Presenting only the target state without the transition plan (creates anxiety)
+- Using different terminology in different forums (creates confusion)
+- Not revisiting the vision after 6 months (people assume it's abandoned)

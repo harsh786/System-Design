@@ -230,3 +230,81 @@ graph TD
 - Program-of-Thought is superior for calculations
 - Don't use CoT for simple tasks — it adds latency without benefit
 - Log reasoning chains for debugging and observability
+
+---
+
+## Staff Architect: Anti-Patterns
+
+| Anti-Pattern | Why It's Harmful | Fix |
+|-------------|-----------------|-----|
+| **Forcing CoT on simple tasks** | Adds 2-5x output tokens (latency + cost) for tasks where the model already achieves >95% accuracy without reasoning | Profile task complexity; only enable CoT when zero-shot accuracy is below threshold |
+| **Not extracting the final answer** | Reasoning output mixed with the answer makes downstream parsing unreliable; systems that expect a clean answer break | Always use a delimiter: "Therefore, the final answer is: X" or structured output after reasoning |
+| **CoT on models too small to benefit** | Models <7B parameters often produce incoherent reasoning that degrades rather than improves accuracy | Test CoT benefit empirically per model; smaller models may do better with direct few-shot |
+| **Unbounded reasoning length** | Without length guidance, models can produce pages of circular reasoning, burning tokens | Add "Reason in 3-5 concise steps" or set max_tokens for the reasoning portion |
+| **Using CoT as a crutch for bad prompts** | If the base instruction is ambiguous, CoT amplifies confusion — the model reasons its way to wrong answers confidently | Fix the instruction clarity first, then add CoT only if multi-step reasoning is genuinely needed |
+| **No observability on reasoning quality** | Logging only the final answer means you can't diagnose *why* the model failed | Log full reasoning chains; build dashboards that flag reasoning patterns preceding failures |
+
+## Staff Architect: Trade-offs
+
+| Dimension | Without CoT | With CoT | Decision Point |
+|-----------|------------|----------|---------------|
+| **Latency** | 100-300ms (short output) | 500ms-3s (long reasoning) | Real-time UX (<500ms) → skip CoT |
+| **Cost** | 1x output tokens | 3-10x output tokens | High-volume tasks (>100K/day) → cost-prohibitive for CoT |
+| **Accuracy (complex)** | 40-70% on multi-step problems | 80-95% on same problems | If accuracy gain justifies the cost, use CoT |
+| **Accuracy (simple)** | 95%+ on classification | 94-96% (no gain, sometimes noise) | Simple binary/multi-class → skip CoT |
+| **Debuggability** | Black box — wrong answer, no explanation | Full audit trail of reasoning | Regulated industries / high-stakes → always use CoT for auditability |
+| **Streaming UX** | Fast first token | Shows "thinking" process to users | User-facing apps can stream reasoning for perceived responsiveness |
+
+### When CoT Actively Hurts
+
+1. **Very simple classification** — "Is this email spam?" Adding reasoning introduces false uncertainty
+2. **Pattern matching tasks** — Translation, formatting, simple extraction — model just needs to apply a learned pattern
+3. **High-temperature creative tasks** — Reasoning constrains creative output into a logical box
+4. **Time-critical systems** — Fraud detection, real-time bidding where latency = money
+
+## Staff Architect: o1/o3 and Built-In Reasoning Models
+
+### The Paradigm Shift
+
+OpenAI's o1 and o3 models have **chain-of-thought built into the model architecture**. The model reasons internally before responding — you don't need to prompt for it.
+
+```python
+# OLD approach (GPT-4): You add CoT to the prompt
+response = client.chat.completions.create(
+    model="gpt-4o",
+    messages=[{"role": "user", "content": f"Think step by step.\n\n{problem}"}]
+)
+
+# NEW approach (o1/o3): Reasoning is automatic — DON'T add CoT prompts
+response = client.chat.completions.create(
+    model="o3",
+    messages=[{"role": "user", "content": problem}]  # No "think step by step" needed
+)
+```
+
+### Implications for Prompt Design with Reasoning Models
+
+| Aspect | Traditional Models (GPT-4, Claude) | Reasoning Models (o1, o3) |
+|--------|-----------------------------------|---------------------------|
+| CoT trigger | Must be prompted explicitly | Built-in; prompting it is redundant/wasteful |
+| System prompt | Supports full system prompts | Limited/no system prompt support (o1) |
+| Temperature | Adjustable | Fixed at 1 (o1) |
+| Streaming | Full streaming support | May not stream reasoning tokens |
+| Cost model | Pay for visible reasoning tokens | Pay for hidden "thinking" tokens (often more expensive) |
+| Best for | Tasks where you control reasoning depth | Hard problems where exhaustive internal reasoning wins |
+
+### Architectural Decision: When to Use Which
+
+```mermaid
+graph TD
+    A[Task] --> B{Requires deep reasoning?<br/>Math, code, complex logic}
+    B -->|Yes| C{Budget allows o1/o3 pricing?}
+    C -->|Yes| D[Use o1/o3 — let model reason internally]
+    C -->|No| E[Use GPT-4/Claude + explicit CoT prompt]
+    B -->|No| F{Needs any reasoning?}
+    F -->|Yes| G[Use standard model + lightweight CoT]
+    F -->|No| H[Use standard model, zero-shot, no CoT]
+```
+
+### Key Lesson
+The trend is toward models handling reasoning internally. **Your job as an architect shifts from "how to make models reason" to "when to pay for reasoning and when to skip it."** CoT becomes a cost/quality knob, not a universal best practice.

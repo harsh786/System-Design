@@ -229,3 +229,87 @@ This contract helps architects:
 - Apply least-privilege: only give tools the agent actually needs
 - Parallel tool calls improve efficiency for independent operations
 - Every production tool needs a contract: schema + side effects + permissions
+
+---
+
+## Staff-Level: Anti-Patterns
+
+| Anti-Pattern | Why It Fails | Fix |
+|-------------|-------------|-----|
+| Too many tools (>20) | Model gets confused, selection accuracy drops sharply | Group into categories, use a "tool selector" layer, or give role-specific subsets |
+| Tools without error handling | Agent gets raw exceptions, hallucinates recovery | Wrap every tool in try/catch, return structured error objects |
+| No tool execution timeout | Single hung API call blocks the entire agent indefinitely | Set timeouts (5-30s typical), kill and return timeout error to LLM |
+| Ambiguous tool descriptions | Model picks wrong tool or invents wrong arguments | Be extremely specific: state WHEN to use, WHEN NOT to, WHAT it returns, with EXAMPLES |
+| Tools that return too much data | Floods context window, agent can't find relevant info | Paginate, summarize, or return only top-K results with a "more available" flag |
+| No idempotency on write tools | Retries cause double-sends, double-charges | Make write tools idempotent or add deduplication keys |
+
+---
+
+## Staff-Level: Trade-offs
+
+### Many Specific Tools vs Few General Tools
+
+| Many Specific (30+ tools) | Few General (5-8 tools) |
+|--------------------------|------------------------|
+| Higher precision per tool | Model selects more accurately |
+| Easier to audit/permission individually | Simpler to maintain and test |
+| Selection accuracy degrades | May need complex argument parsing |
+| Better for narrow domains | Better for broad assistants |
+
+**The sweet spot**: 8-15 well-described tools for most production agents.
+
+### Parallel vs Sequential Execution
+
+| Parallel | Sequential |
+|---------|-----------|
+| Faster (wall-clock time) | Simpler error handling |
+| Independent operations only | Can use results of previous calls |
+| Harder to debug ordering issues | Predictable execution trace |
+| Better for data gathering | Better for stateful workflows |
+
+---
+
+## Staff-Level: Real Numbers
+
+**Tool selection accuracy by tool count** (empirical observations across GPT-4, Claude, Gemini):
+
+```
+Tools    Accuracy    Notes
+1-5      ~98%        Almost never picks wrong tool
+6-10     ~95%        Occasional confusion with similar tools
+11-15    ~90%        Needs excellent descriptions to maintain
+16-20    ~82%        Noticeable degradation begins
+21-30    ~70%        Frequent mis-selection, needs mitigation
+30+      ~55%        Effectively random for similar tools
+```
+
+**Mitigation strategies when you MUST have many tools**:
+1. **Two-stage selection**: First LLM call picks category, second call picks specific tool from subset
+2. **Dynamic tool loading**: Only expose tools relevant to current task phase
+3. **Tool descriptions as the primary lever**: Spending 30 min on descriptions > spending days on framework code
+4. **Few-shot examples in system prompt**: Show the model correct tool selection for ambiguous cases
+
+**Production benchmarks**:
+- Tool execution p50 latency target: <2s
+- Tool execution p99 latency target: <10s
+- Timeout: 30s hard kill
+- Budget: max 10 tool calls per agent turn (configurable per use case)
+
+---
+
+## Tool Reliability Monitoring
+
+Track per tool:
+- **Success rate**: target >99% (alert at <97%)
+- **Latency percentiles**: p50, p95, p99 — detect degradation before users notice
+- **Error classification**: transient (retry-worthy) vs. permanent (don't retry)
+- **Invocation frequency**: detect if model stops using a tool (possible description regression)
+- **Cost per call**: especially for paid APIs — set per-tool budget caps
+
+## Tool Deprecation Strategies
+
+When retiring a tool:
+1. **Shadow period**: Keep old tool available but log warnings when invoked
+2. **Redirect**: Map old tool name to new tool internally (backward compat for cached prompts)
+3. **Graceful removal**: Remove from tool list, but if model hallucinates old tool name, return helpful error ("this tool was replaced by X")
+4. **Version in tool names** for breaking changes: `search_v2` alongside `search_v1` during transition

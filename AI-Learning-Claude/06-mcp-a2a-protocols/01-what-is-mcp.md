@@ -186,3 +186,156 @@ MCP turns the M×N integration problem into an M+N problem. Instead of every AI 
 Before MCP: 10 AI apps × 10 tools = 100 integrations
 After MCP:  10 AI apps + 10 tools = 20 implementations
 ```
+
+---
+
+## Staff-Level Considerations
+
+### Anti-Patterns
+
+**1. MCP for Everything**
+Not every tool needs protocol overhead. A simple utility function called once in a pipeline doesn't benefit from MCP's discovery, schema negotiation, and transport layers. MCP shines when tools are reused across multiple AI applications or teams — not for internal helper functions within a single agent.
+
+**2. No Authentication on MCP Servers**
+Running HTTP/SSE MCP servers without auth is equivalent to exposing an unauthenticated API to your network. Even "internal" servers get accessed by unintended clients. Always authenticate remote MCP servers — stdio gets a pass because it runs as a subprocess of the trusted host.
+
+**3. Exposing Internal Tools Publicly**
+An MCP server built for your team's internal use (e.g., database admin tools) should never be discoverable in a public registry. Internal tools often skip validation because they trust the caller — exposure turns convenience into a vulnerability.
+
+**4. Treating MCP as RPC Instead of Context Protocol**
+MCP is designed for providing *context* to language models — not as a general-purpose RPC framework. If you're using MCP to call microservices that have nothing to do with AI context, you're adding protocol overhead without benefit. Use gRPC/REST for service-to-service calls.
+
+### Trade-offs
+
+| Decision | MCP | Direct API Calls |
+|----------|-----|-----------------|
+| **Discovery** | Automatic via protocol | Manual documentation |
+| **Schema** | Self-describing | OpenAPI/separate docs |
+| **Multi-client** | Any MCP host works | Custom per client |
+| **Overhead** | Protocol negotiation, JSON-RPC | Direct HTTP, lower latency |
+| **Flexibility** | Constrained to MCP primitives | Any API design |
+| **When to choose** | Tool reused by many AI apps | Single integration, performance-critical |
+
+### Standardization vs Flexibility
+
+MCP forces you into three primitives: tools, resources, prompts. This constraint is a feature — it makes servers interoperable. But it means you can't express capabilities that don't fit these abstractions (e.g., bidirectional streaming, pub/sub patterns). If your use case needs richer interaction patterns, MCP may be the wrong layer.
+
+### Real-World Decision Framework
+
+Choose MCP when:
+- Multiple AI applications need the same tool
+- You want tool portability across Claude, Copilot, Cursor, etc.
+- You're building a platform team providing capabilities to AI app developers
+
+Skip MCP when:
+- Single-use integration within one application
+- Sub-millisecond latency requirements
+- The "tool" is really just a function call within your own codebase
+- You need bidirectional streaming or complex interaction patterns
+
+---
+
+## MCP Ecosystem Overview (2025)
+
+### Adoption Landscape
+
+| Host/Client | MCP Support | Status |
+|-------------|-------------|--------|
+| Claude Desktop | Full (native) | Production |
+| Cursor | Full | Production |
+| VS Code (Copilot) | Tools, prompts | Production |
+| Windsurf | Full | Production |
+| Continue.dev | Full | Production |
+| OpenAI ChatGPT | Not yet (as of mid-2025) | N/A |
+| Custom apps | Via SDK | Varies |
+
+### Server Ecosystem
+
+```
+Categories of available MCP servers (2025):
+
+Developer tools:     GitHub, GitLab, Linear, Jira, Sentry
+Databases:           PostgreSQL, SQLite, MongoDB, Supabase
+Cloud:               AWS, GCP, Azure (community-maintained)
+Communication:       Slack, Email, Discord
+File systems:        Local FS, Google Drive, S3
+Knowledge:           Notion, Confluence, web search
+Specialized:         Playwright (browser), Docker, Kubernetes
+```
+
+### Transport Evolution
+
+```
+Original (2024):  stdio only (local process communication)
+Current (2025):   stdio + Streamable HTTP (SSE for server→client)
+Upcoming:         WebSocket transport for full-duplex scenarios
+
+Streamable HTTP enables:
+- Remote MCP servers (hosted as services)
+- Multi-tenant server deployments  
+- Load balancing and scaling
+- Auth via standard HTTP headers (OAuth 2.1)
+```
+
+## Comparison with Alternatives
+
+| Approach | Standardization | Portability | Complexity | Best For |
+|----------|----------------|-------------|------------|----------|
+| **MCP** | Protocol spec | Any MCP host | Medium | Multi-host tool sharing |
+| **OpenAPI + function calling** | Per-provider | Vendor-specific | Low | Single-app integrations |
+| **Native function calling** | None (custom) | None | Lowest | Internal tools, tight coupling |
+| **A2A** | Protocol spec | Any A2A agent | High | Agent-to-agent delegation |
+
+### MCP vs. Direct Function Calling
+
+```
+Choose MCP when:
+  - Tool will be used by multiple AI applications
+  - You want to swap AI providers without rewriting integrations
+  - Tool discovery at runtime matters (dynamic capabilities)
+  - You need resource exposure (not just actions)
+
+Choose direct function calling when:
+  - Single application, single model provider
+  - Maximum performance (no protocol overhead)
+  - Simple tools (< 5 tools, stable interface)
+  - You control both the AI app and the tools
+```
+
+### MCP vs. OpenAPI
+
+```
+OpenAPI:
+  - Designed for human developers consuming APIs
+  - Client generation, documentation-first
+  - No concept of "resources" or "prompts"
+  - Well-understood, massive ecosystem
+
+MCP:
+  - Designed for AI models consuming capabilities
+  - Includes resources (context), prompts (templates), tools (actions)
+  - Stateful sessions with capability negotiation
+  - Newer, growing ecosystem
+
+Overlap: Both describe callable endpoints
+Difference: MCP adds AI-specific primitives (sampling, resources, prompt templates)
+```
+
+## Adoption Timeline and Maturity
+
+```
+2024 Q1: MCP announced by Anthropic (stdio transport only)
+2024 Q2-Q3: Early adopters, community servers proliferate
+2024 Q4: Cursor, VS Code adopt; critical mass of developer tool servers
+2025 Q1: Streamable HTTP transport; remote servers become viable
+2025 Q2: Auth spec (OAuth 2.1); enterprise adoption begins
+2025 H2: Expected — registry/discovery, server composition, versioning
+
+Maturity assessment (mid-2025):
+  Protocol stability:    High (core spec stable)
+  Server ecosystem:      Medium-High (hundreds of servers, quality varies)
+  Enterprise readiness:  Medium (auth landing, but governance tooling early)
+  Production hardening:  Medium (error handling, reconnection improving)
+```
+
+**Staff insight**: MCP's value proposition is strongest when you have 3+ AI-powered applications that need the same integrations. Below that threshold, the protocol overhead may not justify itself over direct function calling. The bet is that multi-host AI becomes the norm — which seems increasingly likely given the IDE/assistant proliferation.

@@ -276,3 +276,107 @@ class CircuitBreakerConfig:
 4. **Use exponential backoff + jitter** — be gentle when recovering
 5. **Test your breakers** — chaos engineering for AI (kill a model, see what happens)
 6. **Monitor state transitions** — every open/close is worth investigating
+
+---
+
+## Staff-Level: Anti-Patterns
+
+### 1. No Circuit Breaker on LLM Provider Calls
+"OpenAI has 99.9% uptime, we don't need a breaker." But LLM providers have:
+- Regional outages (your region might be down while global status shows green)
+- Degraded performance modes (200 responses but 30s latency)
+- Quality degradation (model returns garbage but HTTP 200)
+- Rate limit storms (one bad client triggers org-wide throttling)
+
+Without a breaker, your entire application hangs waiting for 30s timeouts × retry count × concurrent requests = thread pool exhaustion = cascading failure.
+
+### 2. Fallback to Worse Model Without Telling User
+Silently switching from GPT-4 to GPT-3.5 during an outage might seem seamless, but:
+- Users notice quality drops and blame your product (not the outage)
+- Compliance/audit requirements may mandate specific model versions
+- Users making critical decisions deserve to know they're getting degraded answers
+
+**Fix:** Always indicate degraded mode. "⚡ Currently using a faster model for quick responses. Complex questions may have reduced accuracy."
+
+### 3. Circuit Breaker Threshold Too Sensitive (Flapping)
+Setting `failure_threshold=2` means two consecutive timeouts (which happen routinely with AI) will open the circuit. The circuit opens, one test request succeeds (half-open → closed), then two more timeouts → open again. This flapping between states is worse than no breaker at all — inconsistent user experience.
+
+**Fix:** Use a failure **rate** over a window, not a raw count. "Open if >30% of requests fail within 60 seconds" is more stable than "open after 5 failures."
+
+### 4. No Recovery Testing
+You built a fallback chain but never tested it end-to-end. When the primary model actually fails:
+- The secondary model's API key expired 3 months ago
+- The cached response store was migrated and the connection string is stale
+- The rule-based fallback references a product catalog that no longer exists
+
+**Fix:** Monthly "circuit breaker fire drills" — force the breaker open in staging and verify the full fallback chain works.
+
+---
+
+## Staff-Level: Trade-offs
+
+### Automatic Recovery vs Manual Recovery
+| Dimension | Automatic | Manual |
+|-----------|-----------|--------|
+| Recovery time | Seconds (half-open test) | Minutes-hours (human decides) |
+| Risk | May close too early (problem not fixed) | Guaranteed fix before resuming |
+| Operational load | Low (self-healing) | High (requires human) |
+| Best for | Transient failures (network blips) | Persistent issues (model degradation) |
+
+**Recommendation:** Automatic for infrastructure failures (timeouts, 5xx). Manual for quality failures (hallucination spikes) — you need a human to verify the model is producing good outputs before resuming.
+
+### Aggressive Breaking vs Tolerant Breaking
+- **Aggressive** (low threshold, quick to open): Protects downstream systems and costs, but causes more downtime. Good for expensive models where a single bad request costs dollars.
+- **Tolerant** (high threshold, slow to open): Maximizes availability, but risks cascading failures during real outages. Good for cheap, fast models where a few failures are acceptable.
+
+```
+Aggressive: Open after 3 failures in 30s → More fallback usage, safer costs
+Tolerant:   Open after 20 failures in 60s → More availability, higher risk
+
+Match to model cost:
+  GPT-4 ($0.03/req): Aggressive (each failed call wastes money)
+  Local Llama-8B ($0.001/req): Tolerant (failures are cheap, try harder)
+```
+
+---
+
+## Staff-Level: Fallback Chain Design
+
+### The Complete Fallback Architecture
+
+```mermaid
+flowchart TD
+    Request[Request] --> Primary{Primary Model<br/>GPT-4 / Claude}
+    
+    Primary -->|Success| Respond[Return Response]
+    Primary -->|Breaker Open| F1{Secondary Model<br/>GPT-4o-mini / Llama-70B}
+    
+    F1 -->|Success| Respond
+    F1 -->|Breaker Open| F2{Cached Response<br/>Semantic match > 0.90}
+    
+    F2 -->|Cache Hit| RespondCached[Return Cached<br/>+ staleness indicator]
+    F2 -->|Cache Miss| F3{Graceful Error<br/>with context}
+    
+    F3 --> ErrorResponse["I can't fully answer right now.<br/>Here's what I know: [cached partial]<br/>Try again in: [retry_after]"]
+    
+    style Primary fill:#90EE90
+    style F1 fill:#FFD93D
+    style F2 fill:#FFA500
+    style F3 fill:#FF6B6B
+```
+
+### Design Principles for Fallback Chains
+
+1. **Each level should be strictly more available than the previous.** If your secondary model shares infrastructure with your primary, it'll fail at the same time.
+
+2. **Latency budget decreases at each level.** If primary has 10s timeout and secondary has 10s timeout, total worst-case is 20s — unacceptable. Use: primary 5s → secondary 3s → cache 100ms → error instant.
+
+3. **Quality disclosure at each level.** Users must know what tier they're getting:
+   - Primary: Full quality (no indicator)
+   - Secondary: "Using fast model" badge
+   - Cached: "Based on a previous answer" + timestamp
+   - Error: Clear messaging with retry guidance
+
+4. **Independent failure domains.** Primary on OpenAI? Secondary should be Anthropic or self-hosted, not another OpenAI model. Cache should be local Redis, not a cloud service that might also be down.
+
+5. **Cost caps per level.** Don't let fallback attempts accumulate unbounded cost. If primary times out after spending $0.05 on partial generation, the total request cost (primary attempt + fallback) should still be bounded.

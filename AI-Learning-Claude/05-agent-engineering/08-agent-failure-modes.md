@@ -219,3 +219,97 @@ What to log for every agent run:
 - Observability is not optional — you can't fix what you can't see
 - Test failure modes deliberately (chaos engineering for agents)
 - The most common production issue: cost runaway from loops
+
+---
+
+## Staff-Level: Anti-Patterns
+
+| Anti-Pattern | Why It Fails | Fix |
+|-------------|-------------|-----|
+| No monitoring for agent failures | You find out agents are failing from angry users, not from dashboards | Track: success rate, failure categories, cost per run, latency p50/p95/p99 — alert on anomalies |
+| Treating all failures equally | Retrying a permissions error is pointless; retrying a timeout makes sense | Classify failures: transient (retry), permanent (escalate), logical (re-plan), unknown (log + degrade) |
+| No fallback to simpler behavior | Agent fails → user gets nothing; total failure is worse than partial answer | Graceful degradation: agent fails → try simpler prompt → try cached answer → return "I can't do X but here's Y" |
+| Not tracking failure categories | You know "15% of tasks fail" but not WHY, so you can't prioritize fixes | Tag every failure: tool_timeout, context_overflow, loop_detected, hallucination, budget_exceeded |
+| Assuming failures are bugs to fix | Some failures are inherent to the task (ambiguous query, impossible request) | Distinguish: system failures (fix them) vs task failures (handle gracefully) vs user failures (guide the user) |
+| No post-mortem process | Same failure mode hits production repeatedly because nobody analyzed the pattern | Weekly review of top failure categories; convert patterns into prevention rules |
+
+---
+
+## Staff-Level: Trade-offs
+
+### Recovery Strategies Compared
+
+| Strategy | Retry | Escalate to Human | Graceful Degradation |
+|----------|-------|-------------------|---------------------|
+| **Speed** | Fast (seconds) | Slow (minutes-hours) | Fast (seconds) |
+| **Quality** | Same quality if transient | Best quality (human decides) | Lower quality but useful |
+| **Cost** | Low (one more LLM call) | High (human time) | Low |
+| **Risk** | May repeat same error | None (human in control) | Partial/wrong answer possible |
+| **Best for** | Timeouts, rate limits | Ambiguous decisions, high-stakes | Non-critical tasks, UX priority |
+
+**Decision matrix**:
+```
+Is the failure transient (timeout, rate limit, network)?
+  YES → Retry with exponential backoff (max 3 attempts)
+  NO  → Continue...
+
+Is the task high-stakes (money, data, external communication)?
+  YES → Escalate to human with full context
+  NO  → Continue...
+
+Can you provide a partial/degraded answer?
+  YES → Degrade gracefully (explain what worked and what didn't)
+  NO  → Return clear error with actionable guidance for user
+```
+
+---
+
+## Staff-Level: Real-World Failure Rates
+
+> **Production agents fail 5-15% of tasks. Design for this. Don't pretend it won't happen.**
+
+**Observed failure rates across production systems** (industry ranges):
+
+| System Type | Success Rate | Common Failures |
+|------------|-------------|-----------------|
+| Customer support agents | 85-92% | Policy edge cases, multi-issue tickets, system lookup failures |
+| Coding agents | 70-85% | Complex refactors, unfamiliar frameworks, test environment issues |
+| Research/RAG agents | 80-90% | Insufficient sources, contradictory information, hallucinated synthesis |
+| Data analysis agents | 75-88% | Schema misunderstanding, query errors, misinterpreted results |
+
+**What the top teams do differently**:
+1. **Budget for failure in SLAs** — Promise 85% automation rate, not 100%. Human fallback handles the rest.
+2. **Track failure cost, not just failure rate** — A 5% failure rate that costs $50K/month in human escalation is different from 5% that costs $500.
+3. **Build failure into the UX** — "I completed 4 of 5 steps. Step 3 needs your input: [specific question]" is better than silent failure.
+4. **Canary deployments for agents** — Route 5% of traffic to new agent version, compare failure rates before full rollout.
+5. **Failure budgets** — Like error budgets in SRE: if failure rate exceeds threshold, pause deployments and investigate.
+
+**The maturity model**:
+- **Level 1**: Agent fails → user gets error → support ticket
+- **Level 2**: Agent fails → automatic retry → escalate if still failing
+- **Level 3**: Agent fails → classifies failure → picks optimal recovery strategy → logs for analysis
+- **Level 4**: System detects failure patterns → auto-adjusts behavior → prevents repeat failures
+
+---
+
+## Failure Mode Detection Checklist
+
+Before deploying, verify you can detect each failure type:
+
+- [ ] **Infinite loops**: Max iteration counter + repetition detection (same action twice = abort)
+- [ ] **Silent failures**: Validate output schema AND semantic quality (not just "did it return something")
+- [ ] **Cost runaway**: Per-request token budget with hard cutoff
+- [ ] **Hallucinated tools**: Strict tool name validation; reject unknown tool calls
+- [ ] **Stale context**: Detect when agent operates on outdated information (timestamp checks)
+- [ ] **Partial execution**: Track which side effects completed; enable rollback or compensating actions
+
+## Monitoring Recommendations
+
+| Metric | Alert Threshold | Action |
+|--------|----------------|--------|
+| Avg iterations per task | >2x baseline | Investigate prompt/tool regression |
+| Failure rate | >5% (or 2x baseline) | Pause rollout, inspect failure logs |
+| Cost per completion | >3x median | Check for loop/retry storms |
+| Tool error rate (per tool) | >3% | Tool service degradation; consider disabling |
+| User intervention rate | Trending up | Agent capability regression |
+| Time to completion p95 | >2x SLA | Latency issue in tools or model |

@@ -288,3 +288,25 @@ Notice: very little "I wrote code that shipped feature X."
 ---
 
 *"The best architects I've known didn't hoard their knowledge - they radiated it. They left behind systems, documents, and people who could carry on without them. Their legacy wasn't code - it was capability."*
+
+---
+
+## Mentoring Anti-Patterns
+
+| Anti-Pattern | What It Looks Like | Fix |
+|--------------|-------------------|-----|
+| **The Rescuer** | Solving problems for mentees instead of guiding them | Ask questions: "What have you tried? What would happen if...?" |
+| **The Clone** | Pushing mentees toward your exact career path | Help them find THEIR strengths and interests |
+| **The Ghost** | Agreeing to mentor then being unavailable | Block recurring time; if you can't commit, say no |
+| **The Lecturer** | Monologuing about your experience without listening | Spend 70% of mentoring time listening and asking |
+| **The Gatekeeper** | Only mentoring people who remind you of yourself | Actively seek mentees with different backgrounds and styles |
+
+## Scaling Mentoring Programs
+
+When you can't mentor everyone 1:1:
+
+- **Office hours**: Weekly open slot anyone can book (15-min slots)
+- **Design review as teaching**: Use real reviews to teach principles to a group
+- **Written artifacts**: ADRs, tech talks, and docs that teach asynchronously at scale
+- **Mentoring chains**: Your mentees mentor others; you coach the mentors
+- **Cohort programs**: Group 3-4 mentees working on similar growth areas; meet together monthly

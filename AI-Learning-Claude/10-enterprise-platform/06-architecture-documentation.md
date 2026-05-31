@@ -217,3 +217,105 @@ flowchart LR
 4. **Auto-generate what you can** — reduce manual maintenance burden
 5. **Stale docs are worse than no docs** — actively maintain or delete
 6. **Diagrams as code** (Mermaid) stay current because they're easy to update
+
+---
+
+## Staff+ Deep Dive: Anti-Patterns, Trade-offs, and What to Document
+
+### Anti-Patterns to Avoid
+
+**1. Documentation as Afterthought**
+"We'll document it after we ship." You won't. The context, reasoning, and alternatives considered evaporate from memory within weeks. The only documentation that gets written is documentation written at decision time.
+
+Fix: Make ADR creation part of the design review process. No design approval without a written record of the decision and its rationale.
+
+**2. Docs That Are Immediately Stale**
+A 50-page architecture document created once and never updated. Within 3 months it actively misleads new team members. Stale documentation is worse than no documentation — at least with no docs, people ask questions instead of trusting lies.
+
+Fix: Either commit to maintaining it (with ownership and review cadence) or don't write it. Prefer small, scoped documents that are cheap to update over comprehensive documents that are expensive to maintain.
+
+**3. No Architecture Decision Records**
+Teams make dozens of significant decisions (which vector DB, what chunking strategy, sync vs async, which provider) but record none of them. Six months later, someone asks "why did we choose Pinecone over Weaviate?" and nobody remembers the evaluation criteria.
+
+Fix: Lightweight ADR template — context, decision, consequences, status. Takes 15 minutes to write. Saves hours of re-evaluation.
+
+**4. Documenting "What" Without "Why"**
+"We use Kafka for event streaming" — great, but WHY? What alternatives were considered? What constraints drove this choice? Without "why," future engineers can't evaluate whether the decision still holds when constraints change.
+
+### Critical Trade-offs
+
+**Living Docs (Wiki) vs. Formal Docs (Versioned)**
+
+| Dimension | Living Docs (Wiki/Notion) | Formal Docs (Git-versioned) |
+|-----------|---------------------------|----------------------------|
+| Currency | Always up-to-date (ideally) | Point-in-time snapshots |
+| Review process | None or informal | PR review, approval |
+| Discoverability | Search, linking | File structure, README |
+| Accountability | "Anyone can edit" = nobody owns | Clear ownership via CODEOWNERS |
+| Best for | Runbooks, how-tos, onboarding | ADRs, contracts, SLAs |
+
+Most effective approach: ADRs and architecture contracts in git (immutable history matters), operational docs in wiki (easy to update when procedures change).
+
+**Lightweight ADRs vs. Heavy Design Docs**
+- Lightweight ADR (1-2 pages): title, context, decision, consequences. Written in 15-30 minutes. Low friction = high adoption.
+- Heavy design doc (5-20 pages): problem statement, requirements, alternatives analysis, detailed design, rollout plan. Written in days. Thorough but high friction.
+- When to use which: ADR for most decisions. Full design doc only for decisions with >$100K cost impact, cross-team dependencies, or irreversible infrastructure choices.
+
+### What to Document: Decisions, Not Just Diagrams
+
+**The Documentation Priority Stack** (in order of value per minute spent):
+
+1. **Architecture Decision Records** — Why did we choose X over Y? Highest ROI documentation.
+2. **System context diagram** — What talks to what? One diagram, kept current.
+3. **Runbooks** — How to operate, debug, recover. Written during incidents, refined after.
+4. **Data flow diagrams** — Where does data go? Critical for compliance and debugging.
+5. **Component diagrams** — Internal structure. Useful but changes frequently.
+6. **Detailed design docs** — Full specifications. Only for the most complex systems.
+
+**AI-Specific Documentation Needs**:
+- Model card per deployed model (capabilities, limitations, eval results, bias analysis)
+- Prompt registry (all production prompts with version history and performance data)
+- Data lineage documentation (where does training/retrieval data come from?)
+- Eval suite documentation (what are we measuring, what are the thresholds?)
+- Incident playbooks specific to AI failures (hallucination spikes, quality degradation, cost runaway)
+
+**The "Decision Journal" Practice**: Senior engineers maintain a running decision journal — not just big architectural decisions, but the smaller ones too. "We chose to chunk at 512 tokens because..." This builds institutional knowledge that survives team changes.
+
+---
+
+## Documentation Templates List
+
+| Template | Purpose | Update Frequency | Owner |
+|---|---|---|---|
+| **Architecture Decision Record (ADR)** | Capture context, decision, consequences for significant choices | At decision time (immutable once written) | Tech Lead |
+| **Model Card** | Document model capabilities, limitations, eval results, bias analysis | Per model version | ML Engineer |
+| **System Context Diagram** | Show system boundaries, external dependencies, data flows | Quarterly or on significant change | Platform Architect |
+| **Runbook / Playbook** | Step-by-step operational procedures for incidents and maintenance | After each incident (update) | On-call Engineer |
+| **API Contract** | OpenAPI/protobuf spec for all service interfaces | Per release | Service Owner |
+| **Data Flow Diagram** | Map data from ingestion through processing to storage/serving | Per feature launch | Data Engineer |
+| **Eval Suite Spec** | Document what's measured, thresholds, failure actions | Per eval change | ML Engineer |
+| **Cost Model** | Document expected cost per request/user/feature with scaling projections | Monthly review | Platform Lead |
+
+---
+
+## Documentation Review Cadence
+
+| Review Type | Frequency | Participants | Output |
+|---|---|---|---|
+| ADR backlog check | Biweekly | Tech leads | New ADRs drafted for undocumented decisions |
+| Architecture diagram refresh | Quarterly | Platform team + product leads | Updated diagrams, deprecated components marked |
+| Runbook drill | Monthly | On-call rotation | Runbook gaps identified and fixed |
+| Model card audit | Per model deployment | ML eng + ethics review | Updated cards, stale cards archived |
+| Full documentation health check | Semi-annually | Architecture team | Documentation debt backlog prioritized |
+
+---
+
+## Documentation Tooling Comparison
+
+| Tool | Strengths | Weaknesses | Best For |
+|---|---|---|---|
+| **Markdown in repo (docs/)** | Version-controlled, lives with code, PR reviews | Poor discoverability, no rich rendering | ADRs, technical specs |
+| **Confluence/Notion** | Searchable, rich media, collaboration | Drifts from code, no version control | Runbooks, onboarding, broad audience |
+| **Backstage (Spotify)** | Service catalog + docs, TechDocs plugin | Setup overhead, maintenance cost | Large orgs with many services |
+| **Structurizr** | Architecture-as-code (C4 model), versioned diagrams | Learning curve, narrow focus | Architecture diagrams specifically |
+| **Swimm** | Auto-validates docs against code changes | Newer tool, smaller ecosystem | Keeping docs in sync with code |

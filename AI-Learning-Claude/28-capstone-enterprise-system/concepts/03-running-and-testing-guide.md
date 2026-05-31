@@ -295,3 +295,9 @@ uvicorn main:app --port 8001
 
 **Slow responses**: If using real OpenAI API, latency depends on their servers.
 Simulated mode is instant.
+
+**"Module not found"**: Ensure you're running from the project root and have activated your virtual environment (`source .venv/bin/activate`).
+
+**"Permission denied" on scripts**: Run `chmod +x scripts/*.sh` to make shell scripts executable.
+
+**Tests pass locally but fail in CI**: Check Python version mismatch; this project requires Python 3.10+.

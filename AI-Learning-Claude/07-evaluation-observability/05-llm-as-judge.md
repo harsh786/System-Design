@@ -233,4 +233,124 @@ graph TD
 
 ---
 
+## Staff-Level: Anti-Patterns, Trade-offs & Judge Prompts That Work
+
+### Anti-Patterns in LLM-as-Judge
+
+#### 1. Single Judge Model (Biased and Fragile)
+Using one model (e.g., only GPT-4) as your judge creates:
+- **Systematic blind spots**: Every model has failure modes it can't detect in others
+- **Self-preference bias**: If you judge GPT-4 outputs with GPT-4, scores inflate ~10-15%
+- **Single point of failure**: Model API outage = no evaluation
+- **Version drift**: Model updates silently change judge behavior
+
+Fix: Use a panel of 2-3 judges (different model families), take majority vote or average.
+
+#### 2. No Judge Calibration Against Human Labels
+You built a judge prompt, it gives scores. But are those scores meaningful? Without calibration:
+- A score of "4/5" from your judge might correspond to "2/5" from a human expert
+- The judge might have compressed range (everything scores 3-4, never 1 or 5)
+- Systematic biases go undetected until they cause real harm
+
+Minimum viable calibration: 50 examples scored by both humans and judge. Compute Cohen's Kappa. If < 0.6, your judge is unreliable.
+
+#### 3. Judging Own Outputs (Self-Evaluation Bias)
+Asking GPT-4 to evaluate GPT-4's outputs is like asking a student to grade their own exam. Research shows:
+- Models rate their own outputs 10-20% higher than equivalent outputs from other models
+- They're less likely to identify hallucinations in their own text
+- They share reasoning patterns, so "logical-sounding but wrong" fools them
+
+Always use a different model family as judge than the model being evaluated.
+
+#### 4. No Rubric (Vibes-Based Judging)
+"Rate this answer 1-5" without criteria = random noise. The judge invents its own criteria each time, leading to:
+- Inconsistent scores across runs
+- Uninterpretable results (what does "3" mean?)
+- Inability to improve (you don't know what dimension scored poorly)
+
+### Trade-offs in LLM Judge Design
+
+| Trade-off | Cheaper Option | Better Option | When to Upgrade |
+|---|---|---|---|
+| Judge model | GPT-4o-mini ($0.002/eval) | GPT-4o ($0.02/eval) | When mini disagrees with humans >25% of time |
+| Single vs panel | 1 judge (fast, cheap) | 3 judges, majority vote (3x cost) | High-stakes decisions, deployment gates |
+| Point-wise vs pairwise | Score individually (simple) | Compare pairs (more reliable) | A/B testing, model selection |
+| Generic vs task-specific rubric | One rubric for all (easy) | Custom rubric per task type (maintenance) | When generic rubric misses domain failures |
+
+**LLM judge agreement with humans (~80% typical)**:
+- This means 1 in 5 judgments will disagree with expert humans
+- For individual items, this is noisy. For aggregate scores over 100+ items, it's reliable
+- Don't use LLM judges for individual high-stakes decisions. Use them for trend detection and regression monitoring.
+
+### When to Use a Panel of Judges
+
+Use a single judge when:
+- Running in CI (cost-sensitive, high volume)
+- Monitoring trends (aggregate accuracy compensates for individual noise)
+- Evaluating clear-cut dimensions (format compliance, length)
+
+Use a panel (2-3 judges) when:
+- Making deployment go/no-go decisions
+- Evaluating subjective dimensions (helpfulness, tone)
+- Disagreement rate with humans exceeds 20% for single judge
+- Results will be shared with stakeholders (higher credibility)
+
+### Judge Prompts That Work Well in Practice
+
+**Faithfulness Judge (Claim-Decomposition Approach)**:
+```
+You are a fact-checker. Your job is to verify if an answer is supported by the given context.
+
+STEP 1: Break the answer into individual factual claims.
+STEP 2: For each claim, determine:
+  - SUPPORTED: The context explicitly states or directly implies this
+  - NOT SUPPORTED: The context does not contain this information
+  - CONTRADICTED: The context states the opposite
+
+Context: {context}
+Answer: {answer}
+
+Output as JSON:
+{"claims": [{"text": "...", "verdict": "SUPPORTED|NOT_SUPPORTED|CONTRADICTED", "evidence": "quote from context or 'none'"}],
+ "faithfulness_score": <supported_count / total_count>}
+```
+
+**Relevance Judge (Question Reconstruction)**:
+```
+Given ONLY the answer below (not the question), generate 3 questions that this answer could be responding to. Then assess: does the answer address the actual question asked?
+
+Actual question: {question}
+Answer: {answer}
+
+Score 1-5:
+5 = Directly and completely answers the question
+4 = Answers the question with minor tangents
+3 = Partially answers but misses key aspects
+2 = Mostly off-topic with some relevant info
+1 = Does not address the question at all
+```
+
+**Comparative Judge (For A/B testing)**:
+```
+You are comparing two AI assistant responses. Focus ONLY on factual accuracy and completeness. Ignore style, formatting, and verbosity.
+
+Question: {question}
+Reference context: {context}
+
+Response A: {response_a}
+Response B: {response_b}
+
+Which response is more accurate and complete? 
+Output: {"winner": "A"|"B"|"TIE", "reason": "one sentence explanation"}
+```
+
+### The 80% Agreement Ceiling — And What To Do About It
+
+Human inter-annotator agreement on subjective tasks is typically 80-85%. LLM judges hitting 80% agreement with humans is essentially AT the human ceiling. This means:
+- Don't optimize for >85% agreement (you're fitting to annotator noise)
+- Disagreements aren't always judge errors — sometimes the judge is right and the human is wrong
+- Focus optimization on reducing SYSTEMATIC biases (position, verbosity) rather than increasing raw agreement
+
+---
+
 *Next: [06-observability-for-ai.md](./06-observability-for-ai.md) — Monitoring AI systems in production*

@@ -226,4 +226,114 @@ graph TD
 
 ---
 
+## Staff-Level: Anti-Patterns, Trade-offs & Tooling Deep Dive
+
+### Anti-Patterns in AI Observability
+
+#### 1. Logging Only Inputs/Outputs (Missing Intermediate Steps)
+You log the user question and the final answer. When something goes wrong, you can see WHAT failed but not WHY. Missing:
+- Which documents were retrieved (and their scores)
+- What the LLM's reasoning chain was
+- Which tools were called (and what they returned)
+- Where in the pipeline latency accumulated
+- What confidence signals indicated before the response shipped
+
+Without intermediate step logging, debugging becomes guesswork. "The answer was wrong" gives you nothing. "The answer was wrong because retrieval returned docs about the wrong product, and the reranker failed to filter them" gives you an actionable fix.
+
+#### 2. No Trace IDs Across Components
+A typical AI request touches: API gateway → query preprocessor → embedding service → vector DB → reranker → LLM → post-processor → guardrails → response. Without a single trace ID propagated through ALL these components:
+- You can't correlate a bad answer to a specific retrieval failure
+- You can't measure end-to-end latency breakdown
+- When the vector DB is slow, you can't tell which user requests were affected
+- Debugging requires manual timestamp correlation (hours of work per incident)
+
+#### 3. Too Much Logging (Cost and Noise)
+The opposite extreme: logging every token probability, every embedding vector, every intermediate computation. Problems:
+- Storage costs exceed the AI compute costs themselves
+- Signal-to-noise ratio drops (can't find real issues in the flood)
+- PII exposure increases (more data = more risk)
+- Query performance of observability tools degrades
+
+**Right-sizing**: Log full details for a 5-10% sample. Log metadata (latency, token count, confidence, error codes) for 100%. Log full details for ALL errors and low-confidence responses.
+
+#### 4. No Alerting on Quality Degradation
+Teams monitor uptime and latency religiously but have zero alerts on:
+- Faithfulness score trending downward
+- Confidence distribution shifting (more low-confidence responses)
+- Retrieval hit rate dropping
+- User feedback (thumbs down) increasing
+
+Quality can degrade 20% over a month with no alert firing. By the time users complain loudly enough to trigger investigation, trust is already damaged.
+
+### Trade-offs in Observability Design
+
+| Trade-off | Lightweight | Comprehensive | Guidance |
+|---|---|---|---|
+| Detail vs cost | Metadata only ($50/mo) | Full prompt/response logging ($2000/mo) | Full logging for 10% sample + all errors |
+| Real-time vs batch | Batch daily analysis (cheap, delayed) | Real-time dashboards (expensive, instant) | Real-time for latency/errors, batch for quality |
+| Self-hosted vs SaaS | Full control, maintenance burden | Easy setup, data leaves your infra | SaaS unless you have PII/compliance constraints |
+| Custom vs standard | Fits your exact needs | Interoperable, community support | Use OTel standard, customize at dashboard layer |
+
+### Tools Comparison: When to Use What
+
+**LangSmith** (by LangChain):
+- Best if: You're using LangChain/LangGraph
+- Strengths: Deep framework integration, prompt playground, dataset management
+- Weakness: Vendor lock-in to LangChain ecosystem, SaaS only
+- Cost: Free tier (5k traces/mo), paid starts ~$400/mo
+
+**Braintrust**:
+- Best if: You want eval + observability unified
+- Strengths: Eval-first design, good scoring UI, experiment tracking
+- Weakness: Newer, smaller community
+- Cost: Free tier available, usage-based pricing
+
+**Phoenix (Arize)**:
+- Best if: You want open-source, self-hosted
+- Strengths: OSS, great trace visualization, OpenTelemetry native, supports evals
+- Weakness: Self-hosting operational burden
+- Cost: Free (self-hosted), Arize cloud for managed
+
+**Langfuse**:
+- Best if: Privacy matters (self-hostable), framework-agnostic
+- Strengths: Simple API, self-hostable, good traces, prompt management
+- Weakness: Less mature eval features
+- Cost: Free (self-hosted), cloud starts ~$50/mo
+
+**OpenTelemetry for AI (OpenLIT, Traceloop)**:
+- Best if: You already have an OTel stack (Grafana, Datadog, etc.)
+- Strengths: Vendor-neutral, integrates with existing infra, no new tools
+- Weakness: Requires more setup, no AI-specific UI out of the box
+- Cost: Depends on backend (Grafana Cloud, Datadog, etc.)
+
+### The Observability Stack Decision Framework
+
+```
+Do you use LangChain? → LangSmith (path of least resistance)
+                   ↓ No
+Need self-hosting? → Langfuse or Phoenix
+                   ↓ No
+Already have OTel? → OpenLIT + your existing backend
+                   ↓ No
+Want eval + obs unified? → Braintrust
+                   ↓ No
+Start with → Langfuse Cloud (simple, cheap, framework-agnostic)
+```
+
+### Production Observability Checklist
+
+Every AI system in production should have:
+- [ ] Trace IDs propagated through all components
+- [ ] Latency breakdown by pipeline stage
+- [ ] Token usage and cost per request
+- [ ] Quality score sampling (daily, 5-10% of traffic)
+- [ ] Error categorization (retrieval miss, LLM error, guardrail block, timeout)
+- [ ] Confidence score distribution monitoring
+- [ ] User feedback correlation (thumbs up/down → quality metrics)
+- [ ] Alerting on quality degradation (not just uptime)
+- [ ] PII handling policy for logged prompts/responses
+- [ ] Retention policy (how long to keep traces — 30 days typical)
+
+---
+
 *Next: [07-eval-in-ci-cd.md](./07-eval-in-ci-cd.md) — Integrating evaluation into your deployment pipeline*

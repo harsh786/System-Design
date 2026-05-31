@@ -159,3 +159,170 @@ This isn't always the case — some frameworks (LangGraph, PydanticAI) are desig
 - Evaluate: lock-in risk, debugging experience, community, production-readiness
 - Don't be afraid to build from scratch — an agent loop is just a while loop
 - The OpenAI API itself IS a framework for simple agents
+
+---
+
+## Staff-Level: Anti-Patterns
+
+| Anti-Pattern | Why It Fails | Fix |
+|-------------|-------------|-----|
+| Choosing framework by hype not requirements | LangChain has 80K stars but you need a simple 50-line loop — now you have 200 dependencies | List your actual requirements first, THEN evaluate which tool (or no tool) fits |
+| Deep framework coupling (can't swap) | Your business logic is tangled with LangChain chains → migrating to anything else is a rewrite | Keep framework at the edges; core logic should be framework-agnostic functions |
+| Using framework for simple cases | 3 files, 500 lines of framework config for something achievable in 40 lines of raw API calls | If your agent is: single model, <5 tools, linear flow → raw SDK is better |
+| Updating framework without testing | LangChain 0.1→0.2 broke half the APIs; CrewAI changes patterns between minors | Pin versions, have integration tests, update deliberately |
+| Using multiple frameworks together | LangChain for memory + LlamaIndex for RAG + CrewAI for agents = dependency hell | Pick ONE primary framework; supplement with raw code for gaps |
+
+---
+
+## Staff-Level: Trade-offs Table
+
+| Dimension | LangGraph | LlamaIndex | Semantic Kernel | PydanticAI | Raw SDK |
+|-----------|-----------|-----------|----------------|-----------|---------|
+| **Batteries included** | High | High (data) | High (.NET) | Medium | None |
+| **Weight/Dependencies** | Heavy | Heavy | Medium | Light | Minimal |
+| **Learning curve** | Steep | Medium | Medium | Low | Lowest |
+| **Production hardening** | Good | Good | Enterprise | Good | You build it |
+| **Flexibility** | High (graphs) | Medium | Medium | High | Total |
+| **Lock-in risk** | Medium | Medium | Low (MS backing) | Low | None |
+| **Best ecosystem** | Python | Python | .NET/Python/Java | Python | Any |
+| **Multi-model support** | Yes | Yes | Yes | Yes | Manual |
+
+---
+
+## Staff-Level: When to Use a Framework vs Build Custom
+
+### Use a Framework When:
+1. **Prototyping** — You need a working demo in hours, not days
+2. **Standard patterns** — Your use case matches the framework's happy path exactly
+3. **Team velocity** — Junior devs can be productive faster with framework abstractions
+4. **Built-in observability** — LangSmith, Arize, etc. integration saves weeks of build
+
+### Build Custom When:
+1. **Production at scale** — You need control over every retry, timeout, and token
+2. **Performance-critical** — Framework serialization/deserialization adds 50-200ms per step
+3. **Simple agent** — Your agent is a while loop + 5 tools; a framework adds complexity, not value
+4. **Long-term maintenance** — You'll maintain this for years; frameworks break between versions
+5. **Unique patterns** — Your agent flow doesn't map to any framework's model
+
+### The Staff Decision Framework:
+```
+Is your agent loop simple (linear, <5 tools, single model)?
+  YES → Raw SDK (OpenAI, Anthropic, etc.)
+  NO  → Continue...
+
+Are you prototyping or going to production?
+  PROTOTYPE → Framework (fastest to demo)
+  PRODUCTION → Continue...
+
+Does a framework match your exact pattern?
+  YES → Use it, but isolate business logic from framework code
+  NO  → Build custom; fighting a framework costs more than building from scratch
+
+Will this run at scale (>10K requests/day)?
+  YES → Build custom or use minimal framework (PydanticAI)
+  NO  → Framework is fine; maintenance cost is manageable
+```
+
+**The uncomfortable truth**: Most teams start with a framework, hit its limits at month 3-6, and either live with the constraints or rewrite. Knowing this upfront lets you make an informed bet.
+
+---
+
+## 2024-2025 Framework Landscape Update
+
+### New/Evolved Entrants
+
+| Framework | Focus | Maturity | Key Differentiator |
+|-----------|-------|----------|-------------------|
+| **OpenAI Agents SDK** | OpenAI-native agents | Production | Handoffs, guardrails, tracing built-in; vendor lock-in |
+| **PydanticAI** | Type-safe agents | Growing | Pydantic-native, dependency injection, model-agnostic |
+| **LangGraph** | Stateful workflows | Mature | Graph-based control flow, persistence, human-in-loop |
+| **CrewAI** | Multi-agent teams | Popular | Role-based agents, easy multi-agent; less flexible |
+| **Mastra** | TypeScript agents | Early | TS-first, framework for AI features in apps |
+| **Agno (ex-PhiData)** | Fast multi-modal agents | Growing | Speed-focused, multi-modal, built-in memory |
+| **Google ADK** | Google ecosystem | New (2025) | Multi-agent, A2A protocol support |
+| **Smolagents** (HF) | Minimal, code agents | Niche | Code-writing agents, lightweight |
+
+### What Changed Since 2023
+
+```
+Then: LangChain dominated, everything was chains
+Now:  Graph-based (LangGraph), code-first (PydanticAI), vendor-native (OpenAI SDK)
+
+Key shifts:
+1. Chains → Graphs: Non-linear control flow won (cycles, conditionals, branches)
+2. Magic → Explicit: Developers rejected hidden abstractions; prefer seeing what's happening
+3. Monolithic → Composable: Pick a framework for orchestration, bring your own everything else
+4. Python-only → Multi-language: TypeScript frameworks maturing (Mastra, Vercel AI SDK)
+5. Single-agent → Multi-agent primitives: Handoffs, delegation, shared state becoming first-class
+```
+
+## Framework Selection Decision Tree (2025)
+
+```
+What's your primary language?
+├── TypeScript → Vercel AI SDK (simple) or Mastra (complex)
+├── Python ↓
+│
+What's your agent complexity?
+├── Single agent, 1-3 tools → Raw SDK calls (OpenAI/Anthropic) or PydanticAI
+├── Single agent, complex tool orchestration → PydanticAI or OpenAI Agents SDK
+├── Multi-step workflow with state → LangGraph
+├── Multi-agent with roles → CrewAI (simple) or LangGraph (complex)
+├── Need vendor portability → PydanticAI (model-agnostic by design)
+│
+Are you locked to one provider?
+├── OpenAI only → OpenAI Agents SDK (best DX for that ecosystem)
+├── Anthropic only → Raw Claude SDK + tool_use (framework adds little value)
+├── Multi-provider → PydanticAI or LangGraph
+│
+What's your team's experience?
+├── New to agents → CrewAI or OpenAI Agents SDK (lowest learning curve)
+├── Experienced, want control → PydanticAI or custom
+├── Already on LangChain → Migrate to LangGraph (incremental path)
+```
+
+## Migration Strategies Between Frameworks
+
+### Common Migration Paths
+
+**LangChain → LangGraph**:
+- Incremental: Replace chain-by-chain with graph nodes
+- Keep LangChain's document loaders/retrievers, replace orchestration layer
+- Timeline: 2-4 weeks for medium complexity
+
+**LangChain → PydanticAI/Custom**:
+- Rewrite (not incremental): Abstractions too different
+- Extract your tool implementations (these are portable)
+- Rewrite orchestration from scratch
+- Timeline: 1-2 weeks for simple agents, 4-8 weeks for complex
+
+**Any framework → OpenAI Agents SDK**:
+- Only viable if you're OpenAI-exclusive
+- Concept mapping: tools → tools, chains → handoffs, memory → context
+- Warning: You lose multi-provider flexibility
+
+### Migration Checklist
+
+1. **Inventory**: List all tools, prompts, state management, and integrations
+2. **Portable vs. coupled**: Identify what's framework-specific vs. reusable
+3. **Test suite first**: Write integration tests against current behavior BEFORE migrating
+4. **Parallel run**: Run old and new side-by-side, compare outputs
+5. **Incremental rollout**: Migrate one agent/workflow at a time, not big-bang
+
+### What's Actually Portable Between Frameworks
+
+```
+Portable (keep these clean):
+  ✓ Tool implementations (pure functions with clear inputs/outputs)
+  ✓ Prompt templates (text is text)
+  ✓ Evaluation datasets and metrics
+  ✓ External integrations (DB connections, API clients)
+
+NOT portable (will be rewritten):
+  ✗ Orchestration logic (framework-specific graph/chain definitions)
+  ✗ Memory/state management (each framework has its own approach)
+  ✗ Streaming/callback handlers
+  ✗ Framework-specific middleware/hooks
+```
+
+**Staff advice**: Treat your framework as a replaceable orchestration layer. Keep tool logic, prompts, and evaluation suites independent. The teams that survive framework churn are those who kept their business logic decoupled.

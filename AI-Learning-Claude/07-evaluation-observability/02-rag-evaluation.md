@@ -243,4 +243,109 @@ Starting points (adjust based on your domain):
 
 ---
 
+## Staff-Level: Anti-Patterns, Trade-offs & Production Eval Pipelines
+
+### Anti-Patterns in RAG Evaluation
+
+#### 1. Evaluating Only the Final Answer
+The most common mistake: you check "is the answer correct?" without diagnosing WHERE failures happen. When the answer is wrong, was it because:
+- Retrieval missed the right document? (retrieval failure)
+- Retrieval found it but ranked it low? (ranking failure)
+- The right context was there but the LLM ignored it? (generation failure)
+- The LLM hallucinated beyond the context? (faithfulness failure)
+
+Without stage-level metrics, you're debugging blind. A team that only measures end-to-end correctness will spend weeks on prompt engineering when the real problem is their chunking strategy.
+
+#### 2. Not Measuring Recall Separate from Precision
+Teams obsess over precision ("are retrieved docs relevant?") but ignore recall ("did we miss important docs?"). This creates a dangerous blind spot:
+- High precision, low recall = confident but incomplete answers
+- The system sounds authoritative while missing critical information
+- Users trust it because it's "always right" — until the missing info causes harm
+
+Recall is harder to measure (you need to know what SHOULD have been retrieved), but it's where the silent failures hide.
+
+#### 3. Using Generic Benchmarks Instead of Domain-Specific
+RAGAS scores on public datasets tell you nothing about YOUR system. A legal RAG system needs evaluation on legal reasoning. A medical RAG needs evaluation on clinical accuracy. Generic benchmarks:
+- Don't cover your domain's terminology or reasoning patterns
+- Miss domain-specific failure modes (e.g., confusing similar drug names)
+- Give false confidence ("we score 0.92 on the benchmark!")
+
+#### 4. No Regression Suite
+Every time you change chunking, embeddings, prompts, or retrieval parameters, you need to know what broke. Without a regression suite:
+- "Improved" retrieval silently breaks 15% of previously-working queries
+- Prompt tweaks fix one category and break three others
+- You're playing whack-a-mole instead of making monotonic progress
+
+### Trade-offs: Human vs LLM vs Automated Evaluation
+
+| Method | Cost (1000 items) | Latency | Accuracy | Best For |
+|---|---|---|---|---|
+| Human expert eval | $3,000-8,000 | 1-2 weeks | Gold standard | Calibration, edge cases, initial dataset |
+| LLM-as-judge | $15-50 | 30 min | ~80-85% human agreement | Daily regression, CI/CD gates |
+| Automated metrics (BLEU, F1) | ~$0 | Seconds | Low for generative tasks | Fast smoke tests, extractive QA |
+| Hybrid (LLM + spot-check) | $200-500 | 1-2 hours | ~90% effective | Production monitoring sweet spot |
+
+**When to use each**:
+- Building golden dataset → Human experts (no shortcut)
+- PR-level regression check → LLM-as-judge (fast, good enough)
+- Nightly quality monitoring → LLM-as-judge + automated metrics
+- Quarterly calibration → Human experts re-evaluate LLM judge accuracy
+
+### Production RAG Eval Pipeline (Real Example)
+
+```
+┌─────────────────────────────────────────────────────────────────┐
+│  Production RAG Eval Pipeline (runs nightly on 200 samples)     │
+├─────────────────────────────────────────────────────────────────┤
+│                                                                  │
+│  1. SAMPLE: Pull 200 random production queries from last 24h    │
+│     - Stratified by category, difficulty, confidence level       │
+│     - Include 50 from golden dataset (regression anchor)         │
+│                                                                  │
+│  2. REPLAY: Run queries through current system, capture:         │
+│     - Retrieved docs + scores (retrieval stage)                  │
+│     - Generated answer + confidence (generation stage)           │
+│                                                                  │
+│  3. EVALUATE (parallel):                                         │
+│     ├── Retrieval: precision@5, recall (vs golden), MRR          │
+│     ├── Faithfulness: LLM judge (claim-level verification)       │
+│     ├── Relevance: LLM judge (question-answer alignment)         │
+│     └── Correctness: compare to golden answers (where available) │
+│                                                                  │
+│  4. COMPARE: Today's scores vs 7-day rolling average             │
+│     - Flag any metric with >2% drop                              │
+│     - Flag any category with >5% drop                            │
+│                                                                  │
+│  5. ALERT: Quality degradation → Slack + PagerDuty               │
+│     - Include worst 10 examples with full traces                 │
+│     - Auto-generated hypothesis ("retrieval scores dropped for   │
+│       category X, possible index issue")                         │
+│                                                                  │
+│  6. REPORT: Dashboard update + weekly trend email                │
+└─────────────────────────────────────────────────────────────────┘
+```
+
+### The Recall Problem: How to Measure What You're Missing
+
+Measuring recall requires knowing what SHOULD have been retrieved. Three approaches:
+
+1. **Golden context annotations**: For your golden dataset, annotate which docs should be retrieved. Expensive to build, perfect for regression testing.
+
+2. **Exhaustive search comparison**: Run BM25 + vector search + reranker on a sample, have humans verify the full candidate set. Use this to estimate recall of your production retriever.
+
+3. **User feedback signals**: Track when users say "that's not what I meant" or rephrase — these are recall failures in disguise. Build a "known misses" dataset from these signals.
+
+### Key Staff-Level Insight
+
+The teams that ship reliable RAG systems evaluate at every seam:
+- Chunking quality (are chunks semantically coherent?)
+- Embedding quality (do similar queries get similar vectors?)
+- Retrieval ranking (right docs in top positions?)
+- Context utilization (does the LLM actually use what's retrieved?)
+- Answer faithfulness (no hallucination beyond context?)
+
+Each seam is a potential failure point. Measure each one independently.
+
+---
+
 *Next: [03-agent-evaluation.md](./03-agent-evaluation.md) — Evaluating AI agents*

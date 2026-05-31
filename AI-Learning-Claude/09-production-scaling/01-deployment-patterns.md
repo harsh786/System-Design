@@ -299,3 +299,67 @@ flowchart TB
 4. **Canary everything** — new models can fail in unexpected ways
 5. **GPU scheduling is hard** — use Kubernetes with GPU operators
 6. **Model loading is slow** — keep warm instances ready
+
+---
+
+## Staff-Level: Anti-Patterns
+
+### 1. Big-Bang Deployment for AI Models
+Deploying a new model version to 100% of traffic simultaneously. Unlike traditional code deployments, AI models have **non-deterministic behavior** — a model that passes evals can still fail catastrophically on production traffic patterns you didn't test.
+
+### 2. No Rollback Plan
+"We'll just deploy the old version if something goes wrong." But model rollbacks require:
+- The old model weights still loaded (or reload time of 5-30 minutes)
+- The old vector DB index if embeddings changed
+- The old prompt templates if they were co-deployed
+- State reconciliation for in-flight requests
+
+### 3. Deploying Without Shadow Testing
+Pushing a new model without first running it in shadow mode (receiving real traffic, generating responses, but not serving them to users). Shadow testing catches issues that synthetic evals miss — production queries are weirder than test suites.
+
+### 4. Same Deployment Strategy for All Model Types
+Using canary deployment for a fine-tuned classifier (where A/B comparison is easy) AND for a generative model (where quality is subjective and takes days to measure). Different model types need different deployment strategies:
+- **Classifiers:** Fast A/B test, statistical significance in hours
+- **Generative models:** Slow canary, human eval required, days to validate
+- **Embedding models:** Must deploy atomically with re-indexed vector DB
+
+---
+
+## Staff-Level: Trade-offs
+
+### Deployment Speed vs Safety
+| Strategy | Speed | Safety | Best For |
+|----------|-------|--------|----------|
+| Blue-Green | Instant switch | High (full env ready) | Critical production models |
+| Canary | Slow (days for AI) | Highest (gradual) | Generative models |
+| Shadow | No user impact | Highest (no risk) | Major model changes |
+| Rolling | Medium | Medium | Stateless classifiers |
+
+### Blue-Green: Expensive but Safe
+- **Cost:** 2x infrastructure during transition (2 full GPU clusters)
+- **Benefit:** Instant rollback (just flip the load balancer)
+- **Hidden cost:** Vector DB must also be duplicated if embeddings changed
+- **When worth it:** Revenue-critical models, regulated industries
+
+### Canary: Cheaper but Slower
+- **Cost:** Only 5-10% extra capacity needed
+- **Benefit:** Real production validation before full rollout
+- **Hidden cost:** AI quality metrics take days to converge (unlike error rates which converge in minutes)
+- **When worth it:** Most generative AI deployments
+
+### Zero-Downtime vs Simplicity
+Zero-downtime for AI models requires pre-loading model weights (minutes), warm GPU pools, and request draining. Sometimes a 30-second maintenance window at 3 AM is simpler and cheaper than the engineering required for true zero-downtime.
+
+---
+
+## Staff-Level: Real-World — How OpenAI Deploys Model Updates
+
+OpenAI's deployment strategy (inferred from observed behavior and public statements):
+1. **Internal dogfooding:** New model versions used internally for weeks
+2. **Staged rollout by endpoint:** `/v1/chat/completions` gets updates before fine-tuning endpoints
+3. **Date-stamped model versions:** `gpt-4-0613` vs `gpt-4-1106` — users pin to versions
+4. **Parallel availability:** Old and new versions coexist for months (deprecation timeline)
+5. **Shadow evaluation:** New models scored against production queries before public release
+6. **Gradual default migration:** The `gpt-4` alias points to newer versions only after extended validation
+
+**Key lesson:** Even OpenAI — with the best eval infrastructure — takes weeks to months for major model transitions. If they need that long, your team certainly does too. Plan deployment timelines in weeks, not hours.

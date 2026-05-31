@@ -64,17 +64,24 @@ You are a software engineer who wants to become a **Senior/Principal AI Architec
 | 29 | **Long-Context Architecture** | RAG vs context-stuffing, context budgeting, prompt caching, hybrid architectures | 2-3 weeks |
 | 30 | **AI Infrastructure** | GPU clusters, K8s for AI, distributed inference, networking, cost engineering | 3-4 weeks |
 | 31 | **Technical Strategy & Staff Skills** | RFC writing, tech strategy docs, architecture vision, driving org change, mentoring | 2-3 weeks |
+| 32 | **Data Architecture for AI** | Feature stores, data contracts, data mesh, quality pipelines, lineage | 2-3 weeks |
+| 33 | **Human-in-the-Loop Systems** | Escalation patterns, annotation at scale, active learning, confidence calibration | 2 weeks |
+| 34 | **Vendor Strategy & Build-vs-Buy** | Multi-model vendor management, lock-in avoidance, open-source vs proprietary | 1-2 weeks |
+| 35 | **AI Product Architecture** | Working with PMs, AI SLAs, feature flags, UX for non-deterministic systems | 2 weeks |
+| 36 | **Migration & Modernization** | Strangler fig for AI, legacy ML → LLM, backward compatibility, versioning | 2 weeks |
+| 37 | **Frontier Model Internals** | Transformers, attention, MoE, scaling laws, architecture trends 2025 | 2-3 weeks |
+| 38 | **Compliance Deep-Dive** | EU AI Act, FDA for AI, financial services, SOC 2, sector-specific regulation | 2 weeks |
 
-### Phase 4: Mastery & Certification (Months 12-14)
+### Phase 4: Mastery & Certification (Months 12-15)
 
 | # | Category | What You Will Learn | Time |
 |---|----------|-------------------|------|
 | 11 | **Advanced Topics** | Streaming AI, knowledge graphs, edge AI, multi-modal RAG, event-driven AI | 3-4 weeks |
-| 12 | **Interview Prep** | 100+ questions, case studies, system design walkthroughs | 2-3 weeks |
-| 28 | **Capstone Enterprise System** | Full production system integrating all categories into one runnable platform | 2-3 weeks |
+| 12 | **Interview Prep** | 100+ questions, case studies, system design walkthroughs, mock simulators | 2-3 weeks |
+| 28 | **Capstone Enterprise System** | Full production system with scaling roadmap, readiness checklist, architecture walkthrough | 2-3 weeks |
 
-**Total: 31 categories, 206 concept files, 123 runnable programs, 641 total files**
-**Estimated time: 12-14 months** (studying 1-2 hours/day)
+**Total: 38 categories, 246 concept files, 145 runnable programs, 703 total files**
+**Estimated time: 14-16 months** (studying 1-2 hours/day)
 
 ---
 

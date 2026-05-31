@@ -260,3 +260,72 @@ Include: pattern name, when to use, architecture diagram, approved parameters, k
 
 ### Annual Review Checklist
 Include: systems still in use, quality metrics vs baseline, incidents since approval, changes since approval
+
+---
+
+## ARB Meeting Template
+
+**Duration**: 60 minutes max
+
+| Time | Section | Owner |
+|------|---------|-------|
+| 0-5 min | Context setting: what system, why now | Presenter |
+| 5-15 min | Architecture overview + diagrams | Presenter |
+| 15-25 min | Risk assessment + mitigations | Presenter |
+| 25-45 min | Board questions + discussion | Board |
+| 45-55 min | Decision + conditions | Board chair |
+| 55-60 min | Action items + next steps | Scribe |
+
+**Pre-meeting requirements:**
+- Architecture document shared 3+ business days before
+- All board members must review async; come with questions prepared
+- Presenter provides a 1-page summary for time-constrained reviewers
+
+## Decision Documentation Format
+
+```markdown
+# ARB Decision: [System Name]
+**Date**: YYYY-MM-DD
+**Decision**: APPROVED / APPROVED WITH CONDITIONS / DEFERRED / REJECTED
+**Board members present**: [names]
+
+## Summary
+[2-3 sentence summary of what was proposed]
+
+## Decision rationale
+[Why the board decided what it decided]
+
+## Conditions (if any)
+- [ ] Condition 1 — due by [date]
+- [ ] Condition 2 — due by [date]
+
+## Review date
+[When this decision should be revisited — typically 6-12 months]
+
+## Dissenting opinions
+[If any board member disagreed, capture their reasoning]
+```
+
+## Escalation Criteria
+
+When should something go to the ARB vs. be decided by the team?
+
+| Escalate to ARB | Team can decide |
+|-----------------|-----------------|
+| New model provider or AI framework adoption | Which version of an approved model to use |
+| Cross-team data pipeline changes | Internal service optimizations |
+| New PII/sensitive data handling patterns | Performance tuning of existing patterns |
+| Cost impact >$10K/month incremental | Cost changes within approved budget |
+| New external API dependencies | Internal API changes within team boundary |
+| Changes to approved architecture patterns | Implementation details within a pattern |
+
+## ARB Anti-Patterns
+
+| Anti-Pattern | Symptom | Fix |
+|--------------|---------|-----|
+| **Rubber stamp board** | Everything approved in <5 min, no real discussion | Require written risk assessment; rotate devil's advocate role |
+| **Bottleneck board** | 4-week wait for review; teams bypass it | Add lightweight "fast track" for low-risk changes; increase meeting cadence |
+| **Ivory tower** | Board members disconnected from implementation reality | Require board members to have shipped code in last 6 months |
+| **Scope creep** | Board opining on UI colors and variable names | Publish clear criteria for what needs ARB review |
+| **No follow-through** | Conditions set but never verified | Assign a "condition owner"; block production deploy until conditions met |
+| **Consensus paralysis** | Board can't decide; defers repeatedly | Chair has tie-breaking authority; max 2 deferrals then must decide |

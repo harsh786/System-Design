@@ -353,3 +353,88 @@ flowchart TB
 
 - Apply these patterns across all previous programs in this learning path
 - Consider how [Multi-Cloud](./06-multi-cloud-ai-architecture.md) adds complexity to unified platforms
+
+---
+
+## Anti-Patterns
+
+### 1. Treating LLMOps Like MLOps (Different Lifecycle)
+
+**What goes wrong:** Team applies classical ML workflows to LLM systems. Sets up retraining pipelines for a model they'll never retrain. Builds feature stores for a system that uses prompts. Monitors data drift when the "data" is user queries that are inherently diverse.
+
+**Key differences that matter:**
+- MLOps retrains models → LLMOps changes prompts/configs
+- MLOps versions data + model weights → LLMOps versions prompts + model API version + RAG config
+- MLOps monitors feature drift → LLMOps monitors quality scores + cost + user satisfaction
+- MLOps has deterministic outputs → LLMOps has probabilistic outputs that need different eval
+
+**Fix:** Build LLMOps tooling around the actual iteration cycle: prompt version → eval → deploy → monitor → iterate.
+
+### 2. No Experiment Tracking for Prompts
+
+**What goes wrong:** Team iterates on prompts via Slack messages, local files, or "I'll just try this." No record of what was tested, what results looked like, what was deployed. When quality regresses, no way to identify what changed.
+
+**Fix:**
+- Treat prompts as code: version control (git)
+- Log every prompt variant with its eval results
+- A/B test prompt changes in production (don't just deploy and hope)
+- Maintain a prompt changelog: what changed, why, what improved
+
+### 3. CI/CD Without Eval Gates
+
+**What goes wrong:** Prompt changes or config updates deploy to production without automated quality checks. Someone pushes a "small tweak" that halves accuracy on edge cases. Discovered days later by user complaints.
+
+**Fix:**
+- Every PR that changes prompts/configs triggers eval suite
+- Eval suite runs against golden dataset (200+ examples)
+- Gate: deployment blocked if any metric regresses > N%
+- Fast eval (50 examples) on PR, full eval (500+ examples) before production deploy
+- Eval results posted to PR for reviewer visibility
+
+### 4. Manual Model Deployment
+
+**What goes wrong:** Deployments are manual runbook steps. Inconsistent between environments. No rollback automation. Friday evening deploy goes wrong, on-call scrambles to revert manually.
+
+**Fix:**
+- GitOps: merge to main = deploy to staging, tag = deploy to production
+- Automated canary: new version gets 5% traffic, auto-promotes or rolls back based on metrics
+- One-click rollback to any previous version
+- Deployment manifest captures full config: model version + prompt version + RAG config + guardrails
+
+---
+
+## Key Trade-offs
+
+### MLOps Tools for LLMs (Partial Fit) vs LLM-Specific Tools (Immature)
+
+| Factor | MLOps Tools (MLflow, Kubeflow, SageMaker) | LLM-Specific Tools (LangSmith, Braintrust, Promptfoo) |
+|--------|------------------------------------------|------------------------------------------------------|
+| Maturity | Battle-tested, enterprise-ready | Newer, evolving rapidly |
+| Experiment tracking | Strong for metrics/params | Better for prompts/conversations |
+| Eval support | Classification metrics | LLM-as-judge, human eval, conversation eval |
+| Model serving | Excellent | Limited (most use API providers anyway) |
+| Prompt versioning | Bolted on, awkward | First-class citizen |
+| Cost tracking | Compute-focused | Token-focused |
+| Best for | Hybrid teams (classical ML + LLM) | Pure LLM/GenAI teams |
+
+**Decision:** If you have existing MLOps infrastructure, extend it for LLMs (MLflow works reasonably well). If starting fresh for a pure LLM system, use LLM-native tools (faster time to value, better fit). Consider both: MLflow for shared infra + LangSmith for LLM-specific eval.
+
+### Fully Automated vs Human-in-the-Loop Deployment
+
+| Factor | Fully Automated | Human-in-the-Loop |
+|--------|----------------|-------------------|
+| Speed | Minutes (merge → production) | Hours-days (waiting for approval) |
+| Risk | Higher (bad change deploys fast) | Lower (human catches issues) |
+| Scale | Handles many changes/day | Bottleneck at 5+ changes/day |
+| Eval quality | Only as good as automated eval | Human judgment catches subtle issues |
+| Best for | Mature systems with strong eval suites | New systems, high-risk changes, regulated industries |
+
+**Practical approach — tiered automation:**
+- Low-risk changes (copy tweaks, temperature adjustment): Fully automated with eval gate
+- Medium-risk changes (prompt rewrite, new tool): Automated eval + human approval
+- High-risk changes (new model, architecture change): Full human review + staged rollout + manual monitoring
+
+**Maturity progression:**
+1. Start: All changes human-reviewed (build trust in eval)
+2. Grow: Low-risk auto-deploys, high-risk human-reviewed
+3. Mature: Everything auto-deploys with automated rollback (eval suite is comprehensive enough)

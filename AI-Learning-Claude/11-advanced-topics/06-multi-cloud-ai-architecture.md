@@ -281,3 +281,93 @@ flowchart TB
 
 - Multi-cloud patterns combine naturally with [MLOps Integration](./07-mlops-integration.md) for unified operations
 - Consider [Edge AI](./05-edge-and-on-device-ai.md) as another "cloud" in your topology
+
+---
+
+## Anti-Patterns
+
+### 1. Multi-Cloud for Its Own Sake
+
+**What goes wrong:** Team adopts multi-cloud because "it's best practice" without a specific driver. Result: 3x operational complexity, 3x the expertise needed, 2x the cost, slower delivery, more failure modes — all for theoretical resilience they've never needed.
+
+**Reality check questions:**
+- Has your primary cloud had an outage affecting you in the last 2 years?
+- Do you have the team to operate across multiple clouds? (Each cloud needs specialists)
+- Is the portability cost worth more than the single-cloud discount?
+
+**Fix:** Start single-cloud. Add a second cloud only when you have a specific, quantifiable reason (regulatory, specific service unavailable, proven reliability need).
+
+### 2. Different Patterns Per Cloud (Inconsistent)
+
+**What goes wrong:** AWS team uses one architecture pattern, Azure team uses another. No shared learnings, no portable skills, debugging requires cloud-specific expertise. Incident response is fragmented.
+
+**Fix:**
+- Define canonical patterns that work across clouds (e.g., "all services are containers, all use OpenTelemetry")
+- Cloud-specific implementations of shared interfaces
+- Shared runbooks with cloud-specific sections
+- Cross-cloud architecture reviews
+
+### 3. No Abstraction Layer
+
+**What goes wrong:** Business logic directly calls `boto3`, `azure-sdk`, or `google-cloud` clients. Switching providers means rewriting application code. Testing requires actual cloud resources.
+
+**Fix:**
+- Provider-specific code lives in adapter/infrastructure layer only
+- Business logic talks to interfaces, not implementations
+- Can swap providers by changing config, not code
+- Enables local testing with mock providers
+
+### 4. Vendor-Specific Features Everywhere
+
+**What goes wrong:** Team uses Azure Durable Functions orchestration, AWS Step Functions expressions, GCP-specific IAM patterns in core logic. Each feature creates a migration barrier. Switching cost grows exponentially over time.
+
+**When vendor-specific IS acceptable:**
+- Commodity infrastructure (compute, storage) — easy to replace
+- Non-differentiating features where the switching cost is truly low
+
+**When to avoid vendor-specific:**
+- Core business logic and orchestration
+- Data storage formats (use Parquet, not proprietary)
+- Observability (use OpenTelemetry, not cloud-native only)
+- Identity (consider cross-cloud identity federation)
+
+---
+
+## Key Trade-offs
+
+### Multi-Cloud (Resilient, Complex) vs Single-Cloud (Simple, Risk)
+
+| Factor | Multi-Cloud | Single-Cloud |
+|--------|-------------|--------------|
+| Resilience | High (survive provider outage) | Low (single point of failure) |
+| Operational complexity | 3x+ (three sets of everything) | Baseline |
+| Team expertise needed | Broad (specialists per cloud) | Deep (one cloud mastery) |
+| Cost | Higher (no volume discounts, data transfer) | Lower (committed use discounts) |
+| Vendor negotiation | Strong ("we can leave") | Weak (switching cost is leverage for them) |
+| Time to market | Slower (abstractions, compatibility) | Faster (use native features freely) |
+| Best for | Large enterprises, regulated industries | Startups, small-medium teams |
+
+**Decision:** Single-cloud until you hit one of these triggers:
+1. Regulatory requirement mandates geographic/provider diversity
+2. A specific service is only available on another cloud (e.g., Azure OpenAI)
+3. You've experienced outages with real business impact
+4. You're large enough to have dedicated platform teams per cloud
+
+### Portability Overhead vs Vendor Optimization
+
+```
+Spectrum:
+  Full portability ←————————————————→ Full vendor optimization
+  (everything abstracted,              (use every cloud-native feature,
+   runs anywhere,                       maximum performance,
+   slower to build,                     fastest to build,
+   may miss optimizations)              impossible to migrate)
+```
+
+**Practical middle ground:**
+- Abstract at the AI/LLM layer (use LiteLLM or similar) — high portability value, low cost
+- Go native for infrastructure (compute, networking) — low portability value, high optimization benefit
+- Abstract data formats (Parquet, ONNX) — moderate effort, high long-term value
+- Go native for managed services you'd never self-host — the time savings outweigh lock-in risk
+
+**Rule of thumb:** Abstract where switching is likely (model providers change fast). Go native where switching is unlikely (you won't move your entire database next year).

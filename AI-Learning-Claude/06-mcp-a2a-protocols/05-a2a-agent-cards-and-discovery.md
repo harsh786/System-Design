@@ -317,3 +317,49 @@ Agent Cards should be versioned so clients can handle changes:
 3. Host at `/.well-known/agent.json` for standard discovery
 4. Include **examples** in skills — they help other agents understand when to use you
 5. Version your Agent Cards to manage backward compatibility
+
+---
+
+## Staff-Level Considerations
+
+### Anti-Patterns
+
+**1. Stale Agent Cards**
+An Agent Card that advertises skills the agent no longer supports, or omits new capabilities, causes task routing failures and wasted cycles. Treat Agent Cards as code — they should be generated from the agent's actual registered handlers and deployed atomically with the agent.
+
+**2. Overpromising Capabilities**
+An agent card claiming "I can analyze any data format" when the agent only handles CSV will fail on Excel, Parquet, or JSON inputs. Other agents route based on your claims — overpromising leads to cascading failures and eroded trust. Be precise about what you actually support.
+
+**3. No Version in Agent Card**
+Without versioning, clients can't detect breaking changes. If you remove a skill or change input format, existing clients break silently. Always include `version` and ideally `minimumSupportedVersion` so clients can gracefully handle incompatibility.
+
+**4. No Skill Boundaries**
+An agent card with a single skill "do everything" gives clients no way to assess fit. Skills should be granular enough for meaningful routing but not so granular that they fragment simple capabilities. One skill per distinct task type is the right granularity.
+
+### Trade-offs
+
+| Decision | Static Discovery | Dynamic Discovery |
+|----------|-----------------|-------------------|
+| **Reliability** | Always available | Depends on registry uptime |
+| **Freshness** | May be stale | Always current |
+| **Latency** | Direct fetch | Registry lookup + fetch |
+| **Use case** | Known partners | Open ecosystems |
+| **Failure mode** | Stale card used | Discovery fails entirely |
+
+| Decision | Centralized Registry | Distributed (Well-Known URLs) |
+|----------|---------------------|-------------------------------|
+| **Control** | Single authority | Each agent self-publishes |
+| **Discovery** | Query one place | Must know agent URLs |
+| **Governance** | Easy to enforce standards | Hard to enforce consistency |
+| **Scalability** | Registry is bottleneck | Scales with agents |
+| **When to choose** | Enterprise, controlled environment | Open ecosystem, multi-org |
+
+### Design Guidance for Staff Engineers
+
+1. **Agent Cards are contracts** — treat changes with the same rigor as API versioning
+2. **Skills should have non-overlapping descriptions** — ambiguity causes mis-routing
+3. **Examples are not optional** — they're the primary signal for semantic matching
+4. **Tags enable filtering, descriptions enable selection** — both are needed
+5. **Authentication section must be accurate** — wrong auth info = hard-to-debug 401s
+6. **Test your agent card** — write integration tests that fetch and validate it
+7. **Monitor discovery** — track how often your agent is discovered vs actually used (conversion rate indicates card quality)

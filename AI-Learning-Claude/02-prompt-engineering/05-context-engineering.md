@@ -231,3 +231,101 @@ def build_memory_context(user_id: str, query: str) -> str:
 - Implement multi-layer memory (working, short-term, long-term)
 - Position critical information at the start and end of context
 - Monitor context utilization and optimize continuously
+
+---
+
+## Staff Architect: Anti-Patterns
+
+| Anti-Pattern | Why It's Harmful | Fix |
+|-------------|-----------------|-----|
+| **Static context (same for every query)** | Wastes tokens on irrelevant information; causes "lost in the middle" degradation when most context is noise | Dynamically assemble context per query based on intent classification and relevance scoring |
+| **No priority ordering** | Critical information buried in the middle gets less model attention (primacy/recency effect) | Always put highest-priority context first and last; use explicit priority labels |
+| **Context window overflow without graceful handling** | Hard truncation mid-document or mid-sentence; system crashes or silently drops critical information | Implement token budgets with graceful degradation: summarize → truncate least relevant → warn |
+| **Mixing instruction and data without delimiters** | Model can't distinguish what to follow vs what to process; enables indirect injection | Use XML tags, markdown headers, or structured delimiters between instructions, context, and user data |
+| **Stuffing raw documents without preprocessing** | PDFs with headers/footers, HTML with boilerplate, repeated content — noise that degrades quality | Preprocess: extract relevant sections, remove boilerplate, chunk intelligently, summarize long docs |
+| **No context utilization monitoring** | No visibility into how full context windows are, what percentage is instructions vs data vs history | Log token counts per component; alert when utilization >80%; track correlation between context composition and output quality |
+
+## Staff Architect: Trade-offs
+
+| Dimension | More Context | Less Context | Decision Point |
+|-----------|-------------|-------------|---------------|
+| **Accuracy** | Higher — model has more information to draw from | Lower — may miss relevant details | When recall matters more than precision, add context |
+| **Cost** | Higher — input tokens at $2-15/M tokens depending on model | Lower — minimal input cost | High-volume systems (>100K requests/day) must optimize aggressively |
+| **Latency** | Higher — time-to-first-token scales with input length | Lower — faster responses | Real-time applications (<1s) need lean context |
+| **Confusion risk** | Higher — irrelevant context can mislead the model (the "distractor" problem) | Lower — focused context = focused answers | When precision > recall, use less but more relevant context |
+| **Robustness** | Higher — model can cross-reference multiple sources | Lower — single point of failure if the one source is wrong | High-stakes decisions benefit from multiple corroborating documents |
+| **Injection surface** | Higher — more external content = more injection vectors | Lower — minimal untrusted content | Security-sensitive applications should minimize external context |
+
+### The Optimal Context Curve
+
+```
+Quality
+  ^
+  |        ╭────── plateau (diminishing returns)
+  |       /
+  |      / ← sweet spot
+  |     /
+  |    /
+  |   / ← rapid improvement
+  |  /
+  | /
+  |/____________________________________________> Context Size
+  0     25%      50%      75%     100% (window)
+```
+
+Most tasks hit diminishing returns at 20-40% context window utilization. Filling to 100% almost never helps and often hurts.
+
+## Staff Architect: Why "Context Engineering" is Replacing "Prompt Engineering" in 2025
+
+### The Shift
+
+In 2023-2024, the industry focused on **how to write better instructions** (prompt engineering). In 2025, the bottleneck shifted to **what information to provide** (context engineering). Why:
+
+1. **Models got better at following instructions.** GPT-4o, Claude 3.5, Gemini 2.0 follow well-written prompts reliably. The marginal return of prompt tricks decreased.
+2. **Context became the differentiator.** Two identical prompts with different context produce wildly different quality. The company with better retrieval wins.
+3. **Agentic systems need dynamic context.** Agents that plan, use tools, and operate over many turns require sophisticated context management — not just good prompts.
+4. **The "what to include" problem is harder than "how to ask."** Deciding what 10K tokens of context to assemble from 10M tokens of available knowledge is an engineering challenge, not a writing challenge.
+
+### Context Engineering as a Discipline
+
+| Aspect | Prompt Engineering (2023) | Context Engineering (2025) |
+|--------|--------------------------|---------------------------|
+| Focus | How to write instructions | What information to include and how to organize it |
+| Key skill | Wordsmithing, examples | Retrieval, ranking, compression, memory architecture |
+| Main tool | System prompt template | RAG pipeline, memory systems, context assembly engine |
+| Failure mode | Model misunderstands task | Model lacks information or drowns in noise |
+| Optimization | Rewrite prompt, test variants | Improve retrieval, adjust token budgets, add/remove context sources |
+| Team role | Prompt engineer | Context infrastructure engineer (systems thinking) |
+
+### What a Context Engineering Pipeline Looks Like
+
+```mermaid
+graph TD
+    Q[User Query] --> IC[Intent Classifier]
+    IC --> RS[Retrieval Strategy Selector]
+    RS --> |"knowledge question"| RAG[Vector Search + Reranker]
+    RS --> |"follow-up"| HIST[History Retriever]
+    RS --> |"tool task"| TOOLS[Tool Schema Selector]
+    
+    RAG --> CA[Context Assembler]
+    HIST --> CA
+    TOOLS --> CA
+    
+    CA --> TB[Token Budget Enforcer]
+    TB --> PO[Priority Orderer<br/>Critical first+last]
+    PO --> LLM[LLM Call]
+    
+    LLM --> MM[Memory Manager<br/>What to remember from this turn]
+    MM --> |update| HIST
+```
+
+### The Architect's Role
+
+Context engineering is fundamentally a **systems design problem**:
+- What data sources exist? How fresh are they? How are they indexed?
+- What retrieval strategy per query type? How to rank/rerank?
+- What's the token budget? How to allocate across competing needs?
+- How to handle overflow gracefully? What gets cut first?
+- How to monitor context quality and its correlation with output quality?
+
+This is why it sits squarely in the architect's domain — it's infrastructure, not copywriting.

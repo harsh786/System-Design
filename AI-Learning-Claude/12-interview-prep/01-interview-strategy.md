@@ -211,3 +211,106 @@ These phrases signal architectural maturity:
 - [ ] Know your numbers (latency of LLM calls, embedding dimensions, token costs)
 - [ ] Have opinions on: RAG vs fine-tuning, agents vs workflows, open vs closed models
 - [ ] Prepare questions FOR the interviewer about their AI platform maturity
+
+---
+
+## Anti-Patterns for Interviews
+
+### What Kills Your Candidacy
+
+**1. Jumping to Solution Before Requirements**
+
+Bad: "I'd use RAG with Pinecone and GPT-4..."  
+Good: "Before designing, let me understand: who are the users, what's the latency requirement, what's the data freshness need?"
+
+Spending 3-5 minutes on requirements signals Staff+ thinking. Jumping straight to tech signals IC-level execution mode.
+
+**2. Not Asking Clarifying Questions**
+
+The interviewer deliberately leaves the problem ambiguous. They're testing whether you can identify what's missing. If you design a system for 1M users when they meant 1K, you've wasted 40 minutes.
+
+**Must-ask questions:**
+- Scale (users, requests/sec, data volume)
+- Latency requirements (real-time vs batch acceptable?)
+- Accuracy requirements (what's the cost of a wrong answer?)
+- Constraints (budget, existing infrastructure, compliance)
+- Success metrics (what makes this system "working"?)
+
+**3. Memorized Answers That Don't Fit the Question**
+
+Interviewers recognize rehearsed designs. When your "RAG system design" answer includes components the question didn't need, it signals pattern-matching over genuine architectural reasoning.
+
+**Fix:** Listen to the actual question. Adapt your framework to the specific constraints given.
+
+**4. Ignoring Cost and Scale**
+
+Architecture without cost awareness isn't architecture — it's wishful thinking. Senior ICs design systems. Staff+ engineers design systems that the business can afford to run.
+
+Always include: "At this scale, that's approximately $X/month. Here's how we optimize..."
+
+---
+
+## The Staff vs Senior Answer Framework
+
+| Dimension | Senior Answer | Staff Answer |
+|-----------|--------------|--------------|
+| **Scope** | "Here's how I'd build it" | "Here's how I'd build it, why this approach over alternatives, and how it evolves" |
+| **Tradeoffs** | Mentions 1-2 tradeoffs | Structures entire answer around tradeoffs with clear decision criteria |
+| **Failure modes** | "We'd add monitoring" | "The failure mode I'm most concerned about is X because it's silent and costly. Here's how we detect and recover." |
+| **Organizational awareness** | Focuses on technical design | Addresses team skills, operational burden, hiring implications |
+| **Business impact** | Implicit | Explicit: "This saves $X/month" or "This unblocks Y revenue stream" |
+| **Evolution** | Static design | "Day 1 looks like this. At 10x scale, we'd evolve to..." |
+
+**How to upgrade any answer to Staff level:**
+1. State the decision + the alternatives you considered
+2. Quantify impact (cost, latency, user impact)
+3. Name the failure mode you're most worried about
+4. Acknowledge operational/team implications
+5. Show how the system evolves over time
+
+---
+
+## Interview Day Timeline
+
+| Time | Activity | Key Focus |
+|------|----------|-----------|
+| T-60 min | Arrive/settle, review notes | Calm nerves, recall key frameworks |
+| T-30 min | Quick whiteboard warm-up | Draw one system end-to-end from memory |
+| T-0 | Interview begins | Listen carefully, clarify requirements |
+| T+5 min | Requirements gathering | Ask 3-5 clarifying questions minimum |
+| T+10 min | High-level design | Draw boxes, arrows, data flow |
+| T+25 min | Deep dive | Pick the hardest component, go deep |
+| T+35 min | Tradeoffs and scaling | Show evolution, alternatives considered |
+| T+40 min | Questions for interviewer | Ask about team challenges, tech stack |
+
+## Common Pitfalls by Company Type
+
+### Startup Interviews
+- **Pitfall**: Over-engineering — proposing Kubernetes when they have 3 engineers
+- **Fix**: Start with the simplest thing that works, show scaling path
+- **Pitfall**: Ignoring cost — startups care about runway
+- **Fix**: Always mention managed services, serverless-first approaches
+
+### FAANG Interviews
+- **Pitfall**: Not going deep enough — surface-level design won't pass the bar
+- **Fix**: Pick one component and show you can design it down to the API contract level
+- **Pitfall**: Ignoring scale — they operate at billions of requests
+- **Fix**: Always state your QPS/storage estimates explicitly
+
+### Enterprise Interviews
+- **Pitfall**: Ignoring compliance and security — regulated industries need this
+- **Fix**: Mention data residency, audit logging, RBAC from the start
+- **Pitfall**: Assuming greenfield — most enterprise work is brownfield
+- **Fix**: Ask "what exists today?" and design for incremental migration
+
+## Post-Interview Reflection Framework
+
+After every interview, spend 15 minutes on this:
+
+1. **What went well?** — Which parts did you explain clearly? Where did the interviewer nod?
+2. **What stumbled?** — Where did you hesitate? What question caught you off-guard?
+3. **What would you change?** — If you could redo one section, which and how?
+4. **Knowledge gaps identified** — What topic do you need to study before next round?
+5. **Interviewer signals** — Did they push back? That's usually where you were weakest.
+
+Keep a running log. Patterns emerge after 3-4 interviews that tell you exactly what to focus on.

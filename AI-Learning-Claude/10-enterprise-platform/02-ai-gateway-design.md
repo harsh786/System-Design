@@ -219,3 +219,119 @@ sequenceDiagram
 3. Start simple (auth + logging + cost tracking) and add capabilities incrementally
 4. Make it **transparent** — applications should barely know it's there (OpenAI-compatible API)
 5. Observability from the gateway alone provides 80% of the visibility you need
+
+---
+
+## Staff+ Deep Dive: Anti-Patterns, Trade-offs, and Real-World Implementations
+
+### Anti-Patterns to Avoid
+
+**1. Gateway as Single Point of Failure Without HA**
+The most dangerous mistake: building a gateway that becomes the one thing that, when it goes down, takes ALL AI capabilities offline. If your gateway has no redundancy, you've created a system that's less available than having no gateway at all.
+
+Fix: Active-active deployment across availability zones, with circuit breakers that allow direct-to-provider fallback when the gateway is unhealthy.
+
+**2. The "Thick Gateway" Trap**
+Gateways that accumulate too many responsibilities — response transformation, caching, guardrails, PII detection, prompt rewriting. Each added capability increases latency, failure modes, and deployment complexity. Eventually the gateway itself needs its own team and becomes the slowest-moving component.
+
+Fix: Clear separation — the gateway handles routing, auth, rate limiting, and telemetry. Everything else belongs in sidecars or separate services.
+
+**3. No Request Routing Telemetry**
+Operating a gateway without tracking which requests go where, with what latency and success rate, is flying blind. Teams can't debug why their AI feature is slow because they can't see that the gateway is routing them to an overloaded region.
+
+**4. Hardcoded Routing Rules**
+Rules baked into config files that require a deployment to change. When a provider has an outage at 2 AM, you need to shift traffic in seconds — not wait for a PR review and deploy pipeline.
+
+### Critical Trade-offs
+
+| Dimension | Thin Gateway | Thick Gateway |
+|-----------|-------------|---------------|
+| Scope | Routing, auth, logging only | + Transform, cache, guardrails, PII |
+| Latency added | 5-15ms | 50-200ms |
+| Team needed | 1-2 engineers | 5-8 engineers |
+| Blast radius | Small (routing only) | Large (many failure modes) |
+| When to choose | Early stage, <10 services | Mature org, regulatory needs |
+
+**Centralized vs. Edge Gateway**
+- Centralized: single gateway cluster — easier to manage, single point of visibility, but adds latency for geographically distributed services
+- Edge: gateway instances at the edge (per-region) — lower latency, but harder to maintain consistency of policies and routing rules
+- Hybrid (what most mature orgs land on): edge for latency-sensitive, centralized for governance-heavy
+
+**Custom Build vs. Commercial**
+- Azure API Management: strong enterprise governance, built-in AI token tracking, but opinionated and can be slow to adopt new providers
+- Kong: flexible plugin architecture, good for multi-cloud, but AI-specific features are newer
+- Custom: maximum flexibility, but you're now maintaining infrastructure that isn't your core business
+- Rule of thumb: build custom only if AI is your product, not just a feature
+
+### Real-World Implementations
+
+**Uber's AI Gateway**
+Uber routes millions of AI requests daily across multiple providers. Their gateway implements: automatic provider failover (sub-second), per-team cost attribution with real-time dashboards, request deduplication for identical prompts within time windows, and graduated rate limiting that degrades gracefully (slower responses before outright rejection).
+
+**Stripe's Approach**
+Stripe treats their AI gateway as an internal product with SLAs. Key design: the gateway is stateless (all state in Redis/DynamoDB), allowing horizontal scaling. They separate the data plane (request routing) from the control plane (policy management), so policy updates don't require gateway restarts.
+
+**LinkedIn's Federated Gateway**
+LinkedIn uses a federated model where each major product area has a gateway instance, but all instances share a common configuration service. This gives teams autonomy over routing while maintaining org-wide policies for cost control and compliance. The shared config service pushes updates in real-time via gRPC streams.
+
+---
+
+## Gateway Technology Comparison
+
+| Solution | Type | Strengths | Weaknesses | Best For |
+|---|---|---|---|---|
+| **Kong + custom plugins** | Open-source + custom | Mature, extensible, large ecosystem | AI-specific features require custom dev | Teams with existing Kong infra |
+| **Envoy + WASM filters** | Open-source + custom | High performance, fine-grained control | Steep learning curve; WASM debugging painful | Performance-critical, K8s-native orgs |
+| **LiteLLM Proxy** | Open-source AI-native | Multi-provider routing, cost tracking built-in | Limited enterprise features (auth, audit) | Startups, quick PoCs |
+| **Portkey** | Commercial AI gateway | Purpose-built for AI; caching, fallbacks, observability | Vendor lock-in; cost at scale | Mid-market, fast time-to-value |
+| **Azure API Management + AI** | Cloud-native | Integrated with Azure OpenAI; enterprise auth | Azure-only ecosystem | Azure-first enterprises |
+| **Custom (Go/Rust)** | Build-your-own | Full control, exact fit | High dev cost, maintenance burden | Large orgs with unique requirements |
+
+---
+
+## Gateway Sizing Guidelines
+
+| Traffic Tier | Requests/sec | Recommended Setup | Compute | Notes |
+|---|---|---|---|---|
+| Small | < 50 RPS | Single instance + standby | 2 vCPU, 4GB RAM | Most startups |
+| Medium | 50-500 RPS | 3-node cluster, load-balanced | 4 vCPU, 8GB per node | Series B+ |
+| Large | 500-5000 RPS | Regional clusters, auto-scaling | 8+ vCPU, 16GB per node | Enterprise |
+| XL | 5000+ RPS | Multi-region, edge PoPs, dedicated pools per priority | Custom sizing | Hyperscale |
+
+**Key sizing considerations:**
+- Streaming responses hold connections open (10-60s) — size for concurrent connections, not just RPS
+- Token counting and policy evaluation add ~2-5ms latency per request
+- Semantic caching (embedding similarity) requires GPU or vector search co-located with gateway
+- Log/audit writes should be async (buffered) to avoid becoming the bottleneck
+
+---
+
+## Reference Architecture: Enterprise AI Gateway
+
+```
+                    ┌─────────────────┐
+                    │   Load Balancer  │
+                    └────────┬────────┘
+                             │
+              ┌──────────────┼──────────────┐
+              ▼              ▼              ▼
+        ┌──────────┐  ┌──────────┐  ┌──────────┐
+        │ Gateway  │  │ Gateway  │  │ Gateway  │  (stateless, auto-scaled)
+        │ Node 1   │  │ Node 2   │  │ Node 3   │
+        └────┬─────┘  └────┬─────┘  └────┬─────┘
+             │              │              │
+             └──────────────┼──────────────┘
+                            │
+          ┌─────────────────┼─────────────────┐
+          ▼                 ▼                 ▼
+   ┌────────────┐   ┌────────────┐   ┌────────────┐
+   │ OpenAI API │   │ Anthropic  │   │ Self-hosted│
+   │            │   │ API        │   │ (vLLM)    │
+   └────────────┘   └────────────┘   └────────────┘
+
+   Shared Services:
+   ┌──────────┐ ┌───────────┐ ┌──────────┐ ┌───────────┐
+   │  Redis   │ │ Policy DB │ │ Metrics  │ │ Audit Log │
+   │ (cache)  │ │ (config)  │ │ (TSDB)   │ │ (append)  │
+   └──────────┘ └───────────┘ └──────────┘ └───────────┘
+```

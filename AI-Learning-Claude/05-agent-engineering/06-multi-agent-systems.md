@@ -214,3 +214,107 @@ Multi-agent adds complexity. Use a single agent when:
 - Always handle agent failures — they WILL happen
 - Start simple (single agent) and only go multi-agent when you have a clear reason
 - The supervisor pattern is the most common starting point for production systems
+
+---
+
+## Staff-Level: Anti-Patterns
+
+| Anti-Pattern | Why It Fails | Fix |
+|-------------|-------------|-----|
+| Multi-agent when single agent suffices (90% of cases) | 3x cost, 3x latency, coordination bugs, harder to debug — all for no benefit | Prove single-agent fails FIRST. Document the specific failure before reaching for multi-agent |
+| No central coordinator | Agents work at cross-purposes, duplicate effort, or deadlock waiting for each other | Always have ONE entity (supervisor, orchestrator, or shared state machine) that owns task allocation |
+| Agents with overlapping responsibilities | Two agents both try to "research" or "write" → conflicts, duplicated work, inconsistent outputs | Define clear boundaries: each agent owns exactly one capability; no overlap in tool access |
+| No conflict resolution | Agent A says "yes", Agent B says "no" — system deadlocks or picks randomly | Explicit resolution: majority vote, supervisor decides, confidence-weighted, or escalate to human |
+| Agents communicating via natural language only | Information loss, misinterpretation, hallucination amplification across hops | Use structured data (JSON) for inter-agent communication; reserve NL for human-facing output |
+| No timeout on sub-agents | One stuck agent blocks the entire system indefinitely | Per-agent timeout + fallback: if agent doesn't respond in Xs, kill and use partial results or fallback |
+
+---
+
+## Staff-Level: Trade-offs
+
+### Multi-Agent vs Single-Agent
+
+| Multi-Agent | Single-Agent |
+|------------|-------------|
+| Specialized prompts per role (higher quality per task) | One prompt to maintain (simpler) |
+| Parallel execution possible | Sequential by default |
+| 2-5x more expensive (each agent = LLM calls) | Predictable cost |
+| Debugging requires tracing across agents | One trace to follow |
+| Inter-agent communication can lose information | All context in one window |
+| Scales to complex tasks | Context window limits complexity |
+
+**The math**: If a single agent handles a task in 4 LLM calls, a supervisor + 3 workers costs 4 + 3×2 = 10 LLM calls minimum (2.5x cost). Only worth it if single-agent quality is unacceptable.
+
+---
+
+## Staff-Level: The Decision Rule
+
+> **"Default to single agent. Use multi-agent ONLY when you can prove single agent fails AND the tasks are truly parallelizable."**
+
+**Proof of single-agent failure** (need at least one):
+1. Context window overflow — task genuinely requires more context than fits
+2. Conflicting personas — task needs both "creative writer" and "strict reviewer" that fight in one prompt
+3. Parallelism need — subtasks are independent AND wall-clock time matters
+4. Tool isolation — different subtasks need different permission levels (security boundary)
+
+**If you can't point to one of these four** → use a single agent with a good prompt.
+
+**Production reality**: Most "multi-agent" systems in production are actually single-agent with different system prompts selected via routing (pattern #2: Router-Specialist). True multi-agent orchestration (supervisor pattern) is rare because the coordination cost usually exceeds the benefit.
+
+**Cost model for decision-making**:
+```
+Single agent cost:  N calls × avg_tokens × price_per_token
+Multi-agent cost:   (N + coordination_overhead) × agents × avg_tokens × price_per_token
+Break-even:         Only when quality improvement justifies 2-5x cost increase
+```
+
+---
+
+## Coordination Patterns Comparison
+
+| Pattern | Communication | Failure Handling | Best For |
+|---------|--------------|-----------------|----------|
+| Sequential pipeline | A → B → C (linear) | Fail-stop or retry stage | Document processing, ETL |
+| Supervisor/worker | Central orchestrator dispatches | Supervisor retries/reassigns | Complex tasks with subtask decomposition |
+| Peer-to-peer | Agents message each other | Each agent handles own failures | Debate/critique patterns |
+| Blackboard | Shared state, agents read/write | Eventual consistency | Collaborative analysis |
+| Router-specialist | Router selects one specialist | Fallback to general agent | Customer support, classification-first |
+
+## Failure Propagation in Multi-Agent Systems
+
+```
+Failure modes unique to multi-agent:
+
+1. Cascade failure:
+   Agent A fails → passes garbage to Agent B → B produces nonsense → C acts on it
+   Mitigation: Validate outputs at EACH handoff point (schema + semantic checks)
+
+2. Deadlock:
+   Agent A waits for B's output, B waits for A's input
+   Mitigation: Timeouts on all inter-agent communication, unilateral fallback
+
+3. Amplification:
+   Supervisor retries failed worker → worker retries its tools → exponential calls
+   Mitigation: Global budget tracking across all agents in a request
+
+4. State corruption:
+   Two agents write to shared state simultaneously
+   Mitigation: Optimistic locking, or single-writer-per-field policy
+
+5. Partial completion:
+   3 of 5 subtasks complete, agent 4 fails. Do you retry? Roll back? Return partial?
+   Decision: Define upfront — is partial result valuable? If yes, return with metadata.
+```
+
+## When NOT to Use Multi-Agent
+
+**Don't use multi-agent when**:
+- A single well-prompted agent with good tools solves the task (most cases)
+- Latency matters — coordination adds 2-5x latency overhead minimum
+- You can't afford the cost — multi-agent is 2-5x more expensive
+- Debugging is critical — multi-agent traces are significantly harder to interpret
+- Task is inherently sequential — multi-agent adds complexity without parallelism benefit
+
+**The test**: Run your task with a single agent first. Measure quality. Only introduce multi-agent if single-agent quality is demonstrably insufficient AND you've exhausted prompt/tool improvements.
+
+**Staff reality check**: In 2024-2025, most production "multi-agent" systems that ship successfully are actually just routing + specialized prompts (Level 2 in the taxonomy). True autonomous multi-agent coordination remains largely a research pursuit.

@@ -283,3 +283,51 @@ graph LR
 ```
 
 **Design principle:** Use Resources for reading state, Tools for changing state, and Prompts for guiding complex workflows.
+
+---
+
+## Staff-Level Considerations
+
+### Anti-Patterns
+
+**1. Too Many Tools Per Server (>15 Confuses Models)**
+When a server exposes 30+ tools, the AI model's tool selection accuracy degrades significantly. Models have limited context for reasoning about which tool to pick — a server with `search_files`, `search_files_regex`, `search_files_fuzzy`, `search_files_by_date`, `search_files_by_size` is worse than one `search_files` with optional parameters. Aim for 5-12 well-designed tools per server.
+
+**2. Tools Without Descriptions**
+The `description` field is not documentation for humans — it's the primary mechanism by which AI models decide when to invoke a tool. A tool with no description or a vague one like "does stuff" will either never be called or be called incorrectly. Write descriptions as if instructing a capable junior engineer: what it does, when to use it, what to expect.
+
+**3. Resources Without Schema**
+Exposing a resource like `db://users` without specifying its schema (fields, types, relationships) forces the AI to guess what's inside. The model may hallucinate field names or misinterpret data. Always provide `mimeType` and ideally a description of the structure.
+
+**4. Mixing Concerns in One Server**
+A single MCP server that handles file operations, database queries, email sending, and Slack notifications is a maintenance nightmare and a security risk. Each concern has different permission requirements, failure modes, and rate limits. Split by domain — one server per bounded context.
+
+### Trade-offs
+
+| Decision | Granular Tools | Composite Tools |
+|----------|---------------|-----------------|
+| **Model accuracy** | Higher (clear purpose) | Lower (ambiguous intent) |
+| **Tool count** | Many (may overwhelm) | Few (easier selection) |
+| **Flexibility** | High (compose as needed) | Low (pre-composed) |
+| **Error isolation** | Fine-grained errors | Opaque failures |
+| **Example** | `create_file`, `write_file`, `delete_file` | `file_operation(action, ...)` |
+| **When to choose** | Actions are independently useful | Actions always happen together |
+
+### Static vs Dynamic Tool Lists
+
+| Approach | Static Tools | Dynamic Tools |
+|----------|-------------|---------------|
+| **Definition** | Fixed set declared at init | Tools change based on context |
+| **Caching** | Client can cache `tools/list` | Must re-fetch frequently |
+| **Predictability** | High — always available | Low — may disappear |
+| **Use case** | Most servers | Multi-tenant, permission-based |
+| **Risk** | Stale if server updates | Client confusion if tool vanishes mid-session |
+
+### Design Heuristics for Staff Engineers
+
+1. **One tool = one verb** — `search`, `create`, `delete`, not `manage`
+2. **Required params should be minimal** — prefer smart defaults
+3. **Return structured data** — don't force the AI to parse prose
+4. **Idempotent where possible** — retries shouldn't cause side effects
+5. **Include examples in descriptions** — "Search for Python files: pattern='*.py'"
+6. **Error messages should guide correction** — "Invalid date format. Use YYYY-MM-DD"

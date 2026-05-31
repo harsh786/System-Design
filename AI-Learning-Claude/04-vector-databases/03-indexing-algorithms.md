@@ -218,4 +218,94 @@ It's just linear scan — compare query to every vector. Perfect recall, O(n) sp
 
 ---
 
+## Staff-Level: Anti-Patterns
+
+### 1. Using Flat/Brute-Force in Production at Scale
+
+**Mistake**: "Our recall needs to be 100%, so we'll use flat index." Ships to production with 5M vectors, queries take 500ms.
+
+**Why it's wrong**: Users don't notice the difference between 99% and 100% recall, but they absolutely notice 500ms vs 5ms latency. ANN at 99% recall is indistinguishable from perfect for nearly all applications.
+
+**When flat IS appropriate**: <10K vectors, ground-truth benchmarking, offline batch processing where latency doesn't matter.
+
+### 2. Wrong HNSW Parameters
+
+| Parameter Mistake | Symptom | Fix |
+|-------------------|---------|-----|
+| M too low (4-8) | Recall drops below 90%, especially on large datasets | Use M=16 minimum, M=32 for high-recall needs |
+| M too high (64+) | Write throughput collapses, memory explodes | M=16-32 covers 99% of cases |
+| ef_construction too low (50) | Permanent graph quality damage — can't fix at query time | Use ef_construction ≥ 200 (invest at build time) |
+| ef_search not tuned | Either overpaying on latency or getting bad recall | Benchmark: plot recall vs latency curve, pick knee |
+
+### 3. Not Benchmarking on YOUR Data
+
+**Mistake**: Reading a blog post that says "HNSW with M=16 gives 99% recall" and assuming it applies to your 3072-dimensional multilingual embeddings.
+
+**Reality**: Recall is heavily dependent on data distribution, dimensionality, and query patterns. High-dimensional data with clustered distributions behaves differently than uniform random vectors used in benchmarks.
+
+**Fix**: Always run `ann-benchmarks` or equivalent on a representative sample of YOUR data with YOUR query distribution.
+
+---
+
+## Staff-Level: Algorithm Trade-off Matrix
+
+| Factor | HNSW | IVF | IVF-PQ | DiskANN | Flat |
+|--------|------|-----|--------|---------|------|
+| **Recall@10** | 95-99.5% | 90-97% | 85-95% | 95-99% | 100% |
+| **Query latency** | 1-5ms | 5-20ms | 10-30ms | 5-10ms | O(n) |
+| **Memory per 1M vectors (1536d)** | ~9 GB | ~6.5 GB | ~0.5-2 GB | ~1-2 GB | ~6 GB |
+| **Build time (1M vectors)** | 10-30 min | 2-5 min | 5-10 min | 30-60 min | 0 |
+| **Supports updates** | Yes (slow) | Yes (reassign) | Yes (re-encode) | Limited | N/A |
+| **Scales to** | ~50M/node | ~100M/node | ~1B/node | ~1B/node | ~50K |
+
+---
+
+## Staff-Level: Decision Framework — Which Index When
+
+```
+Data size < 10K vectors?
+  → Flat index. Done.
+
+Data size 10K - 1M vectors?
+  → HNSW (M=16, ef_construction=200). Fits in RAM easily.
+
+Data size 1M - 50M vectors?
+  → HNSW + Scalar Quantization (float32 → int8 = 4x savings)
+  → If RAM still tight: HNSW + PQ for storage, re-rank with full vectors
+
+Data size 50M - 500M vectors?
+  → DiskANN if 5-10ms latency acceptable (10x cheaper)
+  → HNSW + PQ + sharding across nodes if <5ms required
+  → IVF-PQ for batch/offline workloads where 20ms is fine
+
+Data size > 500M vectors?
+  → Sharded HNSW with quantization across cluster
+  → OR DiskANN on large NVMe instances
+  → IVF-PQ if memory budget is extremely tight
+
+Write-heavy workload (>10K upserts/sec)?
+  → IVF (rebuilds are fast) or HNSW with async graph updates
+  → Avoid: DiskANN (expensive rebuilds)
+
+Need guaranteed recall > 99%?
+  → HNSW with high ef_search (200+) + overretrieval + re-ranking
+  → Never: PQ alone (lossy by design)
+```
+
+**Staff insight**: The best production systems use a two-stage approach: fast ANN retrieval (top-100 with quantized vectors) followed by exact re-ranking on full-precision vectors. This gives you PQ-level memory costs with HNSW-level recall.
+
+---
+
+## Quick Decision Summary: When to Use Which Algorithm
+
+| Situation | Algorithm | Why |
+|-----------|-----------|-----|
+| <1M vectors, need high recall | HNSW | Best recall/speed, fits in RAM |
+| >100M vectors, cost-sensitive | IVF-PQ | 10-50x memory reduction |
+| Streaming inserts + search | HNSW (or DiskANN) | No rebuild needed |
+| Exact results required | Flat (brute force) | Only option for 100% recall |
+| Billion-scale, SSD-backed | DiskANN / Vamana | Designed for disk-resident vectors |
+
+---
+
 *Next: [04 - Vector DB Operations](./04-vector-db-operations.md)*

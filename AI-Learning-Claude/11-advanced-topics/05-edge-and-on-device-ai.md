@@ -278,3 +278,104 @@ AI inference drains battery. Design for:
 
 - Build the [Edge Inference Program](./programs/edge-inference/) to benchmark quantization effects
 - Consider hybrid architectures that combine edge with [Streaming Pipelines](./01-streaming-and-real-time-ai.md)
+
+---
+
+## Anti-Patterns
+
+### 1. Trying to Run Full-Size Models on Edge
+
+**What goes wrong:** Team deploys unquantized 7B+ model to mobile device. App crashes on low-memory devices, inference takes 30+ seconds, device overheats, battery drains in minutes.
+
+**Rule:** Always quantize for edge. There is no scenario where full-precision models belong on consumer devices.
+
+**Decision ladder:**
+- Phone (4-8GB RAM): INT4 quantized models ≤ 3B params
+- Laptop (16-32GB RAM): INT4 quantized models ≤ 13B params
+- Edge server (64GB+ RAM): INT8 quantized models ≤ 70B params
+
+### 2. No Model Update Strategy for Deployed Devices
+
+**What goes wrong:** Model ships with app v1.0. Bugs are found, quality degrades, world changes. But model is baked into the binary. Users stuck on bad model until next app store update (which they may never install).
+
+**Fix:**
+- Separate model from application binary (download on first launch)
+- Background model updates (like app updates but for weights only)
+- Version negotiation: device reports model version, server recommends update
+- Rollback capability: keep previous model version on device
+- A/B testing: serve different model versions to different device cohorts
+
+### 3. Ignoring Battery/Thermal Constraints
+
+**What goes wrong:** Continuous AI inference heats device to thermal throttling. OS kills your app or reduces CPU/GPU frequency. User experience degrades progressively. Battery life drops from 8 hours to 2 hours.
+
+**Fix:**
+- Monitor thermal state and reduce inference frequency when hot
+- Batch inference requests (one larger call vs many small calls)
+- Use NPU when available (10-100x more power efficient than CPU)
+- Defer non-urgent inference to when device is charging
+- Set inference budgets: max N inferences per minute
+
+### 4. Edge-Only Without Cloud Fallback
+
+**What goes wrong:** Edge model can't handle complex queries. User gets bad answers with no recourse. No way to improve — edge model is static and limited.
+
+**Fix:**
+- Confidence-based routing: if edge model confidence < threshold, route to cloud
+- Graceful messaging: "For this complex question, let me check with a more capable model..."
+- Offline queue: if cloud is unavailable, queue complex queries for later
+- Hybrid UX: instant edge response + cloud "enhancement" that arrives seconds later
+
+---
+
+## Key Trade-offs
+
+### Edge (Private, Fast, Limited) vs Cloud (Powerful, Latency, Privacy Risk)
+
+| Factor | Edge | Cloud |
+|--------|------|-------|
+| Latency | 10-100ms | 200-2000ms |
+| Privacy | Data stays on device | Data leaves device |
+| Model capability | Small models only (≤13B) | Full-size models (GPT-4 class) |
+| Cost at scale | Zero marginal cost per inference | $0.01-0.10 per request |
+| Offline support | Full functionality | None |
+| Model updates | Slow (app update cycle) | Instant (server-side) |
+| Consistency | Device-dependent behavior | Same for all users |
+
+**Decision framework:**
+- Latency-critical (< 100ms) → Edge
+- Privacy-sensitive (health, finance, personal) → Edge
+- Complex reasoning needed → Cloud
+- Offline requirement → Edge with cloud enhancement
+- Consistency requirement → Cloud (same model for all users)
+
+### Model Size vs Capability (The Edge Frontier)
+
+```
+Model size → Capability mapping (2024):
+  1-3B params:  Simple classification, extraction, short generation
+  7B params:    Decent general assistant, good at specific tasks when fine-tuned
+  13B params:   Strong general capability, approaching GPT-3.5 level
+  70B params:   Near GPT-4 level on many tasks (but needs edge server)
+  
+What fits where (INT4 quantized):
+  Smartphone:     ≤ 3B  (fast, good for narrow tasks)
+  Laptop:         ≤ 13B (good general assistant)  
+  Edge server:    ≤ 70B (near cloud quality)
+```
+
+**Key insight:** A fine-tuned 3B model on a specific task often beats a general 13B model. For edge, specialization > size.
+
+### When Edge AI is Worth the Complexity
+
+**Worth it:**
+- 1B+ users (cloud costs would be $millions/month)
+- Regulated industries (data cannot leave device/premises)
+- Real-time requirements (autonomous vehicles, AR)
+- Offline-first products (field workers, rural areas)
+
+**Not worth it:**
+- Internal tools with < 1000 users (cloud is simpler and cheap enough)
+- Tasks requiring frontier model intelligence
+- Rapid iteration phase (cloud lets you update instantly)
+- When model quality directly impacts revenue (use the best model available)
