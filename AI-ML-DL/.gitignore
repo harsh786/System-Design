@@ -1,0 +1,16 @@
+__pycache__/
+*.pyc
+.ipynb_checkpoints/
+venv/
+ai-ml-env/
+*.egg-info/
+dist/
+build/
+.env
+mlruns/
+wandb/
+data/
+models/
+*.h5
+*.pt
+*.pkl

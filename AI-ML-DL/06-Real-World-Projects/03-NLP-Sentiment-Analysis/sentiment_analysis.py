@@ -2,7 +2,7 @@
 NLP Sentiment Analysis Pipeline
 ================================
 Approach 1: TF-IDF + Classical ML (Logistic Regression, SVM, Naive Bayes)
-Approach 2: LSTM with PyTorch
+Approach 2: LSTM with PyTorch (optional, requires torch)
 Uses sklearn's 20newsgroups as a proxy text classification dataset.
 """
 
@@ -12,22 +12,27 @@ import time
 from typing import Dict, List, Tuple
 
 import numpy as np
-import torch
-import torch.nn as nn
-import torch.optim as optim
 from sklearn.datasets import fetch_20newsgroups
 from sklearn.feature_extraction.text import TfidfVectorizer
 from sklearn.linear_model import LogisticRegression
-from sklearn.metrics import accuracy_score, classification_report, f1_score
+from sklearn.metrics import accuracy_score, f1_score
 from sklearn.model_selection import train_test_split
 from sklearn.naive_bayes import MultinomialNB
 from sklearn.svm import LinearSVC
-from torch.utils.data import DataLoader, Dataset
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
 logger = logging.getLogger(__name__)
 
-DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+try:
+    import torch
+    import torch.nn as nn
+    import torch.optim as optim
+    from torch.utils.data import DataLoader, Dataset
+    TORCH_AVAILABLE = True
+    DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+except ImportError:
+    TORCH_AVAILABLE = False
+    logger.info("PyTorch not available. LSTM approach will be skipped.")
 
 
 # =============================================================================
@@ -100,50 +105,48 @@ def classical_ml_pipeline(texts: List[str], labels: np.ndarray) -> Dict[str, flo
 
 
 # =============================================================================
-# Approach 2: LSTM with PyTorch
+# Approach 2: LSTM with PyTorch (Optional)
 # =============================================================================
 
-class TextDataset(Dataset):
-    """Simple text dataset with integer encoding."""
+if TORCH_AVAILABLE:
+    class TextDataset(Dataset):
+        """Simple text dataset with integer encoding."""
 
-    def __init__(self, texts: List[str], labels: np.ndarray, vocab: Dict[str, int], max_len: int = 200):
-        self.labels = labels
-        self.max_len = max_len
-        self.encoded = []
-        for text in texts:
-            tokens = clean_text(text).split()[:max_len]
-            ids = [vocab.get(t, 1) for t in tokens]  # 1 = UNK
-            # Pad
-            ids = ids + [0] * (max_len - len(ids))
-            self.encoded.append(ids)
+        def __init__(self, texts: List[str], labels: np.ndarray, vocab: Dict[str, int], max_len: int = 200):
+            self.labels = labels
+            self.max_len = max_len
+            self.encoded = []
+            for text in texts:
+                tokens = clean_text(text).split()[:max_len]
+                ids = [vocab.get(t, 1) for t in tokens]  # 1 = UNK
+                ids = ids + [0] * (max_len - len(ids))
+                self.encoded.append(ids)
 
-    def __len__(self) -> int:
-        return len(self.labels)
+        def __len__(self) -> int:
+            return len(self.labels)
 
-    def __getitem__(self, idx: int) -> Tuple[torch.Tensor, torch.Tensor]:
-        return torch.tensor(self.encoded[idx], dtype=torch.long), torch.tensor(self.labels[idx], dtype=torch.long)
+        def __getitem__(self, idx: int) -> Tuple[torch.Tensor, torch.Tensor]:
+            return torch.tensor(self.encoded[idx], dtype=torch.long), torch.tensor(self.labels[idx], dtype=torch.long)
 
+    class LSTMClassifier(nn.Module):
+        """Bidirectional LSTM for text classification."""
 
-class LSTMClassifier(nn.Module):
-    """Bidirectional LSTM for text classification."""
+        def __init__(self, vocab_size: int, embed_dim: int = 128, hidden_dim: int = 128, num_classes: int = 2):
+            super().__init__()
+            self.embedding = nn.Embedding(vocab_size, embed_dim, padding_idx=0)
+            self.lstm = nn.LSTM(embed_dim, hidden_dim, num_layers=2, batch_first=True, bidirectional=True, dropout=0.3)
+            self.fc = nn.Sequential(
+                nn.Dropout(0.5),
+                nn.Linear(hidden_dim * 2, 64),
+                nn.ReLU(),
+                nn.Linear(64, num_classes),
+            )
 
-    def __init__(self, vocab_size: int, embed_dim: int = 128, hidden_dim: int = 128, num_classes: int = 2):
-        super().__init__()
-        self.embedding = nn.Embedding(vocab_size, embed_dim, padding_idx=0)
-        self.lstm = nn.LSTM(embed_dim, hidden_dim, num_layers=2, batch_first=True, bidirectional=True, dropout=0.3)
-        self.fc = nn.Sequential(
-            nn.Dropout(0.5),
-            nn.Linear(hidden_dim * 2, 64),
-            nn.ReLU(),
-            nn.Linear(64, num_classes),
-        )
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        emb = self.embedding(x)
-        _, (hidden, _) = self.lstm(emb)
-        # Concatenate last hidden states from both directions
-        hidden = torch.cat((hidden[-2], hidden[-1]), dim=1)
-        return self.fc(hidden)
+        def forward(self, x: torch.Tensor) -> torch.Tensor:
+            emb = self.embedding(x)
+            _, (hidden, _) = self.lstm(emb)
+            hidden = torch.cat((hidden[-2], hidden[-1]), dim=1)
+            return self.fc(hidden)
 
 
 def build_vocab(texts: List[str], max_vocab: int = 15000) -> Dict[str, int]:
@@ -162,6 +165,10 @@ def build_vocab(texts: List[str], max_vocab: int = 15000) -> Dict[str, int]:
 
 def lstm_pipeline(texts: List[str], labels: np.ndarray) -> float:
     """Train LSTM classifier."""
+    if not TORCH_AVAILABLE:
+        print("\n[SKIPPED] LSTM approach requires PyTorch")
+        return 0.0
+
     print("\n" + "=" * 60)
     print("APPROACH 2: LSTM (PyTorch)")
     print("=" * 60)
@@ -189,7 +196,7 @@ def lstm_pipeline(texts: List[str], labels: np.ndarray) -> float:
     print(f"Device: {DEVICE}")
 
     # Train
-    epochs = 5
+    epochs = 3
     print(f"\n{'Epoch':>5} {'Train Loss':>11} {'Train Acc':>10} {'Test Acc':>9}")
     print("-" * 40)
 
@@ -251,7 +258,7 @@ def main() -> None:
     # Approach 1: Classical ML
     classical_results = classical_ml_pipeline(texts, labels)
 
-    # Approach 2: LSTM
+    # Approach 2: LSTM (optional)
     lstm_acc = lstm_pipeline(texts, labels)
 
     # Comparison
@@ -262,7 +269,8 @@ def main() -> None:
     print("-" * 37)
     for name, acc in classical_results.items():
         print(f"{name:<25} {acc:>10.4f}")
-    print(f"{'LSTM (PyTorch)':<25} {lstm_acc/100:>10.4f}")
+    if TORCH_AVAILABLE:
+        print(f"{'LSTM (PyTorch)':<25} {lstm_acc/100:>10.4f}")
 
     print("\n✅ Pipeline complete!")
 

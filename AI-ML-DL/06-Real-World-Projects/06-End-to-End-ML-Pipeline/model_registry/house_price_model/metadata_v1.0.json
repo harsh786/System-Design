@@ -1,0 +1,19 @@
+{
+  "model_id": "house_price_model",
+  "version": "1.0",
+  "created_at": "2026-06-01T23:59:18.524373",
+  "metrics": {
+    "mae": 0.34485719480088023,
+    "rmse": 0.5094076656173084,
+    "r2": 0.8019731441873783,
+    "cv_r2_mean": 0.8070365876364066,
+    "cv_r2_std": 0.0033689310166761764
+  },
+  "parameters": {
+    "n_estimators": 100,
+    "max_depth": 4,
+    "learning_rate": 0.1,
+    "random_state": 42
+  },
+  "data_hash": "299cc5ba8e02"
+}

@@ -543,3 +543,736 @@ Loss = Reconstruction + KL(q(z|x) || p(z))
 3. **Distributions model uncertainty** — the real world is noisy
 4. **Statistical testing** prevents shipping models that only appear better
 5. **Bayesian methods** give you uncertainty for free — critical for high-stakes decisions
+
+---
+
+## Exercises
+
+### Exercise 1 (Beginner)
+**Problem:** A bag contains 5 red, 3 blue, and 2 green balls. What is the probability of drawing (a) a red ball, (b) not a green ball, (c) a red or blue ball?
+
+**Hint:** P(A) = favorable outcomes / total outcomes.
+
+<details><summary>Solution</summary>
+
+```
+Total balls = 10
+(a) P(red) = 5/10 = 0.5
+(b) P(not green) = 1 - P(green) = 1 - 2/10 = 0.8
+(c) P(red or blue) = P(red) + P(blue) = 5/10 + 3/10 = 0.8
+    (mutually exclusive, so no overlap to subtract)
+```
+</details>
+
+### Exercise 2 (Beginner)
+**Problem:** Two fair dice are rolled. What is P(sum = 7)? What is P(sum = 7 | first die = 3)?
+
+**Hint:** List favorable outcomes. For conditional, restrict sample space.
+
+<details><summary>Solution</summary>
+
+```
+P(sum=7): favorable = {(1,6),(2,5),(3,4),(4,3),(5,2),(6,1)} = 6 outcomes
+Total outcomes = 36
+P(sum=7) = 6/36 = 1/6
+
+P(sum=7|first=3): given first=3, need second=4
+Only 1 outcome out of 6 possible for second die
+P(sum=7|first=3) = 1/6
+```
+</details>
+
+### Exercise 3 (Beginner)
+**Problem:** A medical test has 95% sensitivity (true positive rate) and 90% specificity (true negative rate). If 1% of the population has the disease, what is P(disease | positive test)?
+
+**Hint:** Use Bayes' theorem: P(D|+) = P(+|D)P(D) / P(+).
+
+<details><summary>Solution</summary>
+
+```
+P(D) = 0.01, P(+|D) = 0.95, P(+|¬D) = 0.10
+P(+) = P(+|D)P(D) + P(+|¬D)P(¬D)
+     = 0.95×0.01 + 0.10×0.99 = 0.0095 + 0.099 = 0.1085
+
+P(D|+) = 0.0095/0.1085 ≈ 0.0876 ≈ 8.8%
+
+Despite 95% sensitivity, only ~9% of positive tests are true positives!
+(Base rate fallacy — the low prevalence dominates)
+```
+</details>
+
+### Exercise 4 (Beginner)
+**Problem:** Compute the mean, variance, and standard deviation of X = {2, 4, 6, 8, 10}.
+
+**Hint:** μ = Σxᵢ/n, σ² = Σ(xᵢ-μ)²/n.
+
+<details><summary>Solution</summary>
+
+```
+μ = (2+4+6+8+10)/5 = 30/5 = 6
+σ² = [(2-6)²+(4-6)²+(6-6)²+(8-6)²+(10-6)²]/5
+   = [16+4+0+4+16]/5 = 40/5 = 8
+σ = √8 ≈ 2.83
+```
+</details>
+
+### Exercise 5 (Intermediate)
+**Problem:** X ~ N(μ=100, σ=15). Find P(X > 130), P(85 < X < 115), and the value x such that P(X < x) = 0.95.
+
+**Hint:** Standardize: Z = (X-μ)/σ. Use Z-table or scipy.
+
+<details><summary>Solution</summary>
+
+```
+P(X > 130) = P(Z > (130-100)/15) = P(Z > 2) ≈ 0.0228 (2.28%)
+P(85 < X < 115) = P(-1 < Z < 1) ≈ 0.6827 (68.27%)
+P(X < x) = 0.95 → Z = 1.645 → x = 100 + 1.645×15 = 124.67
+```
+</details>
+
+### Exercise 6 (Intermediate)
+**Problem:** You flip a biased coin (P(H)=0.7) 10 times. (a) What's the expected number of heads? (b) P(exactly 7 heads)? (c) P(at least 8 heads)?
+
+**Hint:** Binomial distribution: P(X=k) = C(n,k) × p^k × (1-p)^(n-k).
+
+<details><summary>Solution</summary>
+
+```
+n=10, p=0.7
+(a) E[X] = np = 10×0.7 = 7
+
+(b) P(X=7) = C(10,7)×0.7⁷×0.3³ = 120×0.0824×0.027 = 0.2668
+
+(c) P(X≥8) = P(X=8) + P(X=9) + P(X=10)
+    P(X=8) = C(10,8)×0.7⁸×0.3² = 45×0.0576×0.09 = 0.2335
+    P(X=9) = C(10,9)×0.7⁹×0.3¹ = 10×0.0404×0.3 = 0.1211
+    P(X=10) = 0.7¹⁰ = 0.0282
+    P(X≥8) ≈ 0.3828
+```
+</details>
+
+### Exercise 7 (Intermediate)
+**Problem:** Prove that for independent random variables X and Y: Var(X+Y) = Var(X) + Var(Y).
+
+**Hint:** Expand Var(X+Y) = E[(X+Y-E[X+Y])²] and use E[XY] = E[X]E[Y] for independent variables.
+
+<details><summary>Solution</summary>
+
+```
+Var(X+Y) = E[(X+Y)²] - (E[X+Y])²
+= E[X²+2XY+Y²] - (E[X]+E[Y])²
+= E[X²]+2E[XY]+E[Y²] - E[X]²-2E[X]E[Y]-E[Y]²
+
+Since X,Y independent: E[XY] = E[X]E[Y]
+
+= E[X²]+2E[X]E[Y]+E[Y²] - E[X]²-2E[X]E[Y]-E[Y]²
+= (E[X²]-E[X]²) + (E[Y²]-E[Y]²)
+= Var(X) + Var(Y) ✓
+```
+</details>
+
+### Exercise 8 (Intermediate)
+**Problem:** You're A/B testing a new recommendation model. Control: 1000 users, 50 conversions. Treatment: 1000 users, 65 conversions. Is the difference statistically significant (α=0.05)?
+
+**Hint:** Two-proportion Z-test: Z = (p₁-p₂)/√(p̂(1-p̂)(1/n₁+1/n₂)) where p̂ is pooled proportion.
+
+<details><summary>Solution</summary>
+
+```
+p₁ = 50/1000 = 0.05, p₂ = 65/1000 = 0.065
+p̂ = (50+65)/(1000+1000) = 115/2000 = 0.0575
+
+SE = √(0.0575×0.9425×(1/1000+1/1000)) = √(0.0575×0.9425×0.002)
+   = √(0.0001084) = 0.01041
+
+Z = (0.065-0.05)/0.01041 = 0.015/0.01041 = 1.44
+
+Critical value for α=0.05 (two-tailed): Z=1.96
+1.44 < 1.96 → NOT statistically significant (p≈0.15)
+Need more data or larger effect size.
+```
+</details>
+
+### Exercise 9 (Advanced)
+**Problem:** Derive the maximum likelihood estimate for the parameters (μ, σ²) of a Gaussian distribution given n i.i.d. samples x₁,...,xₙ.
+
+**Hint:** Write the log-likelihood, take derivatives, set to zero.
+
+<details><summary>Solution</summary>
+
+```
+Likelihood: L(μ,σ²) = Πᵢ (1/√(2πσ²)) exp(-(xᵢ-μ)²/(2σ²))
+
+Log-likelihood: ℓ = -n/2 log(2π) - n/2 log(σ²) - (1/2σ²)Σ(xᵢ-μ)²
+
+∂ℓ/∂μ = (1/σ²)Σ(xᵢ-μ) = 0
+→ μ_MLE = (1/n)Σxᵢ = x̄ (sample mean)
+
+∂ℓ/∂σ² = -n/(2σ²) + (1/2σ⁴)Σ(xᵢ-μ)² = 0
+→ σ²_MLE = (1/n)Σ(xᵢ-x̄)² (sample variance, biased)
+
+Note: Unbiased estimate uses 1/(n-1) instead of 1/n.
+```
+</details>
+
+### Exercise 10 (Advanced)
+**Problem:** Explain the bias-variance tradeoff mathematically. Decompose E[(y-f̂(x))²] into bias², variance, and irreducible noise.
+
+**Hint:** Add and subtract E[f̂(x)] inside the squared term.
+
+<details><summary>Solution</summary>
+
+```
+Let y = f(x) + ε where E[ε]=0, Var(ε)=σ²
+
+E[(y-f̂)²] = E[(f+ε-f̂)²]
+= E[(f-E[f̂]+E[f̂]-f̂+ε)²]
+= E[(f-E[f̂])² + (E[f̂]-f̂)² + ε² + cross terms]
+
+Cross terms vanish (independence of ε and f̂, and E[f̂-E[f̂]]=0):
+
+= (f-E[f̂])² + E[(f̂-E[f̂])²] + σ²
+= Bias²      + Variance        + Irreducible noise
+
+- High bias: model too simple (underfitting)
+- High variance: model too complex (overfitting)
+- σ²: noise in data, can't reduce
+```
+</details>
+
+### Exercise 11 (Advanced)
+**Problem:** Derive the posterior distribution for Bayesian linear regression with a Gaussian prior on weights: p(w|X,y) ∝ p(y|X,w)p(w).
+
+**Hint:** Prior: w ~ N(0, τ²I). Likelihood: y|X,w ~ N(Xw, σ²I). Product of Gaussians is Gaussian.
+
+<details><summary>Solution</summary>
+
+```
+Prior: p(w) = N(0, τ²I) → log p(w) ∝ -w^Tw/(2τ²)
+Likelihood: p(y|X,w) = N(Xw, σ²I) → log p(y|X,w) ∝ -(y-Xw)^T(y-Xw)/(2σ²)
+
+Log posterior ∝ -(y-Xw)^T(y-Xw)/(2σ²) - w^Tw/(2τ²)
+= -(1/2)[w^T(X^TX/σ² + I/τ²)w - 2w^TX^Ty/σ²] + const
+
+This is quadratic in w → posterior is Gaussian!
+
+p(w|X,y) = N(μ_post, Σ_post) where:
+Σ_post = (X^TX/σ² + I/τ²)⁻¹
+μ_post = Σ_post × X^Ty/σ²
+
+Note: μ_post = (X^TX + (σ²/τ²)I)⁻¹X^Ty = Ridge regression solution!
+MAP estimate of Bayesian LR = Ridge regression.
+```
+</details>
+
+### Exercise 12 (Advanced)
+**Problem:** Prove that the KL divergence D_KL(P||Q) ≥ 0 with equality iff P = Q (Gibbs' inequality).
+
+**Hint:** Use Jensen's inequality with the concave function log.
+
+<details><summary>Solution</summary>
+
+```
+D_KL(P||Q) = Σ p(x) log(p(x)/q(x)) = -Σ p(x) log(q(x)/p(x))
+
+By Jensen's inequality (log is concave):
+-Σ p(x) log(q(x)/p(x)) ≥ -log(Σ p(x)×q(x)/p(x))
+                        = -log(Σ q(x))
+                        = -log(1) = 0
+
+Equality holds iff q(x)/p(x) is constant → q(x) = p(x) for all x.
+
+Therefore D_KL(P||Q) ≥ 0 with equality iff P = Q. ∎
+```
+</details>
+
+---
+
+## Self-Assessment Quiz
+
+**1. If P(A) = 0.3 and P(B) = 0.4 and A,B are independent, then P(A∩B) =?**
+- (a) 0.7
+- (b) 0.12
+- (c) 0.1
+- (d) 0.58
+
+<details><summary>Answer</summary>(b) 0.12. For independent events: P(A∩B) = P(A)×P(B) = 0.3×0.4 = 0.12.</details>
+
+**2. The Central Limit Theorem states that:**
+- (a) All data is normally distributed
+- (b) Sample means converge to a normal distribution as n→∞
+- (c) Variance decreases with more data
+- (d) Outliers disappear with large samples
+
+<details><summary>Answer</summary>(b) Regardless of the underlying distribution, the distribution of sample means approaches normal with mean μ and variance σ²/n as sample size increases.</details>
+
+**3. Maximum Likelihood Estimation finds parameters that:**
+- (a) Minimize the prior probability
+- (b) Maximize the probability of observed data given the parameters
+- (c) Minimize variance
+- (d) Maximize the posterior
+
+<details><summary>Answer</summary>(b) MLE finds θ that maximizes P(data|θ), the likelihood function.</details>
+
+**4. A p-value of 0.03 means:**
+- (a) There's a 3% chance the null hypothesis is true
+- (b) The probability of seeing data this extreme (or more) if H₀ is true is 3%
+- (c) The effect size is 3%
+- (d) 97% of the data supports the alternative
+
+<details><summary>Answer</summary>(b) p-value = P(data this extreme or more | H₀ true). It's NOT the probability that H₀ is true.</details>
+
+**5. The expected value of a discrete random variable is:**
+- (a) The most common value
+- (b) The median
+- (c) Σ xᵢ × P(xᵢ)
+- (d) The maximum value
+
+<details><summary>Answer</summary>(c) E[X] = Σ xᵢ × P(xᵢ), the probability-weighted average of all possible values.</details>
+
+**6. Bayes' theorem relates:**
+- (a) Prior, likelihood, and posterior
+- (b) Mean and variance
+- (c) Bias and variance
+- (d) Precision and recall
+
+<details><summary>Answer</summary>(a) P(θ|data) ∝ P(data|θ) × P(θ). Posterior ∝ Likelihood × Prior.</details>
+
+**7. Two variables with correlation = 0 are:**
+- (a) Always independent
+- (b) Linearly uncorrelated (but may have nonlinear dependence)
+- (c) Identically distributed
+- (d) Mutually exclusive
+
+<details><summary>Answer</summary>(b) Zero correlation means no LINEAR relationship. Variables can still be dependent (e.g., Y=X² has correlation 0 with X if X is symmetric around 0).</details>
+
+**8. The law of large numbers guarantees that:**
+- (a) You'll eventually win in gambling
+- (b) Sample mean converges to population mean as n→∞
+- (c) Variance goes to zero
+- (d) All distributions become normal
+
+<details><summary>Answer</summary>(b) As sample size increases, x̄ → μ (with probability 1 in the strong law).</details>
+
+**9. In a Gaussian Mixture Model, the number of parameters for K components in d dimensions is:**
+- (a) K×d
+- (b) K×(d + d(d+1)/2 + 1) - 1
+- (c) K×d²
+- (d) K+d
+
+<details><summary>Answer</summary>(b) Each component needs: d means + d(d+1)/2 covariance entries + 1 mixing weight. Subtract 1 because weights sum to 1. Total ≈ K(d + d²/2 + 1) - 1.</details>
+
+**10. The difference between MAP and MLE estimation is:**
+- (a) MAP includes a prior distribution on parameters
+- (b) MAP always gives better results
+- (c) MLE is Bayesian
+- (d) There is no difference
+
+<details><summary>Answer</summary>(a) MAP = argmax P(θ|data) ∝ P(data|θ)P(θ). MLE = argmax P(data|θ). MAP adds a prior which acts as regularization (e.g., Gaussian prior → L2 regularization).</details>
+
+---
+
+## Coding Challenges
+
+### Challenge 1: Implement Naive Bayes Classifier from Scratch
+```python
+"""
+Build a Gaussian Naive Bayes classifier:
+1. Fit: compute mean and variance per feature per class
+2. Predict: apply Bayes' theorem assuming feature independence
+3. Test on a simple 2D dataset
+"""
+```
+
+<details><summary>Solution</summary>
+
+```python
+import numpy as np
+from sklearn.datasets import make_classification
+
+class NaiveBayes:
+    def fit(self, X, y):
+        self.classes = np.unique(y)
+        self.params = {}
+        for c in self.classes:
+            X_c = X[y == c]
+            self.params[c] = {
+                'mean': X_c.mean(axis=0),
+                'var': X_c.var(axis=0) + 1e-9,
+                'prior': len(X_c) / len(X)
+            }
+    
+    def _gaussian_pdf(self, x, mean, var):
+        return np.exp(-0.5*(x-mean)**2/var) / np.sqrt(2*np.pi*var)
+    
+    def predict(self, X):
+        predictions = []
+        for x in X:
+            posteriors = []
+            for c in self.classes:
+                p = self.params[c]
+                likelihood = np.prod(self._gaussian_pdf(x, p['mean'], p['var']))
+                posterior = likelihood * p['prior']
+                posteriors.append(posterior)
+            predictions.append(self.classes[np.argmax(posteriors)])
+        return np.array(predictions)
+
+# Test
+X, y = make_classification(n_samples=200, n_features=2, n_redundant=0, random_state=42)
+nb = NaiveBayes()
+nb.fit(X[:150], y[:150])
+preds = nb.predict(X[150:])
+accuracy = np.mean(preds == y[150:])
+print(f"Accuracy: {accuracy:.2%}")
+```
+</details>
+
+### Challenge 2: Monte Carlo Estimation of Pi
+```python
+"""
+Estimate π using Monte Carlo simulation:
+1. Generate random points in a unit square
+2. Count points falling inside the unit circle
+3. π ≈ 4 × (points inside) / (total points)
+4. Plot convergence as sample size increases
+"""
+```
+
+<details><summary>Solution</summary>
+
+```python
+import numpy as np
+import matplotlib.pyplot as plt
+
+def estimate_pi(n_samples):
+    x = np.random.uniform(-1, 1, n_samples)
+    y = np.random.uniform(-1, 1, n_samples)
+    inside = (x**2 + y**2) <= 1
+    return 4 * np.sum(inside) / n_samples
+
+# Convergence plot
+np.random.seed(42)
+sample_sizes = np.logspace(1, 6, 50).astype(int)
+estimates = [estimate_pi(n) for n in sample_sizes]
+
+plt.figure(figsize=(10, 5))
+plt.semilogx(sample_sizes, estimates, 'b-')
+plt.axhline(y=np.pi, color='r', linestyle='--', label=f'π = {np.pi:.6f}')
+plt.xlabel('Number of samples')
+plt.ylabel('Estimate of π')
+plt.title('Monte Carlo Estimation of π')
+plt.legend()
+plt.grid(True)
+plt.show()
+print(f"Final estimate with 1M samples: {estimate_pi(1000000):.6f}")
+```
+</details>
+
+### Challenge 3: Bootstrap Confidence Intervals
+```python
+"""
+Implement bootstrap to estimate confidence intervals:
+1. Given a sample, resample with replacement B=10000 times
+2. Compute statistic (mean, median) for each resample
+3. Report 95% confidence interval using percentile method
+4. Compare with analytical CI for the mean
+"""
+```
+
+<details><summary>Solution</summary>
+
+```python
+import numpy as np
+
+def bootstrap_ci(data, statistic_fn, n_bootstrap=10000, ci=0.95):
+    n = len(data)
+    bootstrap_stats = []
+    for _ in range(n_bootstrap):
+        resample = data[np.random.randint(0, n, size=n)]
+        bootstrap_stats.append(statistic_fn(resample))
+    
+    alpha = (1 - ci) / 2
+    lower = np.percentile(bootstrap_stats, 100*alpha)
+    upper = np.percentile(bootstrap_stats, 100*(1-alpha))
+    return lower, upper, np.array(bootstrap_stats)
+
+# Test with skewed data
+np.random.seed(42)
+data = np.random.exponential(scale=2.0, size=50)
+
+# Bootstrap CI for mean
+lower, upper, boot_means = bootstrap_ci(data, np.mean)
+print(f"Bootstrap 95% CI for mean: [{lower:.3f}, {upper:.3f}]")
+
+# Analytical CI for mean (t-distribution)
+from scipy import stats
+se = stats.sem(data)
+analytical_ci = stats.t.interval(0.95, df=len(data)-1, loc=np.mean(data), scale=se)
+print(f"Analytical 95% CI for mean: [{analytical_ci[0]:.3f}, {analytical_ci[1]:.3f}]")
+
+# Bootstrap CI for median (no simple analytical formula!)
+lower_med, upper_med, _ = bootstrap_ci(data, np.median)
+print(f"Bootstrap 95% CI for median: [{lower_med:.3f}, {upper_med:.3f}]")
+```
+</details>
+
+### Challenge 4: Implement A/B Test Analysis
+```python
+"""
+Build a complete A/B test analysis pipeline:
+1. Simulate experiment data (conversions for control vs treatment)
+2. Compute Z-test for proportions
+3. Calculate p-value and confidence interval for the difference
+4. Determine required sample size for 80% power to detect 2% lift
+"""
+```
+
+<details><summary>Solution</summary>
+
+```python
+import numpy as np
+from scipy import stats
+
+def ab_test(control_conversions, control_total, treatment_conversions, treatment_total, alpha=0.05):
+    p1 = control_conversions / control_total
+    p2 = treatment_conversions / treatment_total
+    p_pool = (control_conversions + treatment_conversions) / (control_total + treatment_total)
+    
+    se = np.sqrt(p_pool*(1-p_pool)*(1/control_total + 1/treatment_total))
+    z = (p2 - p1) / se
+    p_value = 2 * (1 - stats.norm.cdf(abs(z)))
+    
+    # CI for difference
+    se_diff = np.sqrt(p1*(1-p1)/control_total + p2*(1-p2)/treatment_total)
+    ci_lower = (p2-p1) - 1.96*se_diff
+    ci_upper = (p2-p1) + 1.96*se_diff
+    
+    return {
+        'control_rate': p1, 'treatment_rate': p2,
+        'lift': (p2-p1)/p1*100,
+        'z_statistic': z, 'p_value': p_value,
+        'ci_95': (ci_lower, ci_upper),
+        'significant': p_value < alpha
+    }
+
+def required_sample_size(baseline_rate, min_detectable_effect, alpha=0.05, power=0.80):
+    z_alpha = stats.norm.ppf(1 - alpha/2)
+    z_beta = stats.norm.ppf(power)
+    p1, p2 = baseline_rate, baseline_rate + min_detectable_effect
+    n = (z_alpha*np.sqrt(2*p1*(1-p1)) + z_beta*np.sqrt(p1*(1-p1)+p2*(1-p2)))**2 / (p2-p1)**2
+    return int(np.ceil(n))
+
+# Simulate
+np.random.seed(42)
+result = ab_test(control_conversions=500, control_total=10000,
+                 treatment_conversions=550, treatment_total=10000)
+print(f"Control: {result['control_rate']:.1%}, Treatment: {result['treatment_rate']:.1%}")
+print(f"Lift: {result['lift']:.1f}%, p-value: {result['p_value']:.4f}")
+print(f"95% CI: [{result['ci_95'][0]:.4f}, {result['ci_95'][1]:.4f}]")
+print(f"Significant: {result['significant']}")
+
+n = required_sample_size(0.05, 0.02)
+print(f"\nRequired sample size per group for 2% lift detection: {n:,}")
+```
+</details>
+
+### Challenge 5: Gaussian Mixture Model with EM Algorithm
+```python
+"""
+Implement the Expectation-Maximization algorithm for GMM:
+1. Initialize K cluster means, variances, and mixing coefficients
+2. E-step: compute responsibilities (soft assignments)
+3. M-step: update parameters using responsibilities
+4. Iterate until convergence
+5. Visualize clusters on 2D data
+"""
+```
+
+<details><summary>Solution</summary>
+
+```python
+import numpy as np
+import matplotlib.pyplot as plt
+
+class GMM:
+    def __init__(self, k=3, max_iters=100, tol=1e-6):
+        self.k = k
+        self.max_iters = max_iters
+        self.tol = tol
+    
+    def fit(self, X):
+        n, d = X.shape
+        # Initialize
+        idx = np.random.choice(n, self.k, replace=False)
+        self.means = X[idx].copy()
+        self.covs = [np.eye(d) for _ in range(self.k)]
+        self.weights = np.ones(self.k) / self.k
+        
+        for iteration in range(self.max_iters):
+            # E-step
+            resp = self._e_step(X)
+            # M-step
+            old_means = self.means.copy()
+            self._m_step(X, resp)
+            # Check convergence
+            if np.linalg.norm(self.means - old_means) < self.tol:
+                break
+        self.responsibilities = resp
+        return self
+    
+    def _gaussian(self, X, mean, cov):
+        d = X.shape[1]
+        diff = X - mean
+        inv_cov = np.linalg.inv(cov + 1e-6*np.eye(d))
+        exponent = -0.5 * np.sum(diff @ inv_cov * diff, axis=1)
+        norm = np.sqrt((2*np.pi)**d * np.linalg.det(cov + 1e-6*np.eye(d)))
+        return np.exp(exponent) / norm
+    
+    def _e_step(self, X):
+        resp = np.zeros((X.shape[0], self.k))
+        for j in range(self.k):
+            resp[:, j] = self.weights[j] * self._gaussian(X, self.means[j], self.covs[j])
+        resp /= resp.sum(axis=1, keepdims=True) + 1e-10
+        return resp
+    
+    def _m_step(self, X, resp):
+        n = X.shape[0]
+        for j in range(self.k):
+            r_j = resp[:, j]
+            N_j = r_j.sum()
+            self.means[j] = (r_j[:, None] * X).sum(axis=0) / N_j
+            diff = X - self.means[j]
+            self.covs[j] = (r_j[:, None] * diff).T @ diff / N_j
+            self.weights[j] = N_j / n
+
+# Generate test data
+np.random.seed(42)
+X = np.vstack([
+    np.random.randn(100, 2) + [2, 2],
+    np.random.randn(100, 2) + [-2, -2],
+    np.random.randn(100, 2) + [2, -2]
+])
+
+gmm = GMM(k=3).fit(X)
+labels = gmm.responsibilities.argmax(axis=1)
+
+plt.scatter(X[:, 0], X[:, 1], c=labels, cmap='viridis', alpha=0.6)
+plt.scatter(gmm.means[:, 0], gmm.means[:, 1], c='red', marker='x', s=200)
+plt.title('GMM Clustering with EM')
+plt.show()
+```
+</details>
+
+---
+
+## Interview Questions
+
+### 1. Explain the difference between generative and discriminative models.
+<details><summary>Answer</summary>
+
+- **Generative models** learn the joint distribution P(X,Y) or P(X). Can generate new samples and compute P(Y|X) via Bayes' theorem. Examples: Naive Bayes, GMMs, VAEs, GANs, GPT.
+- **Discriminative models** learn P(Y|X) directly (the decision boundary). Can't generate data but often more accurate for classification. Examples: logistic regression, SVMs, neural network classifiers.
+
+Key tradeoff: Generative models need more data to estimate P(X,Y) accurately but are more flexible. Discriminative models focus on what matters for prediction.
+</details>
+
+### 2. What is the curse of dimensionality and how does it relate to probability?
+<details><summary>Answer</summary>
+
+In high dimensions:
+- Data becomes sparse: volume of a d-dimensional unit cube = 1ᵈ = 1, but most volume is near the surface
+- Distance metrics become meaningless: all points are roughly equidistant
+- You need exponentially more data to maintain density
+- Gaussian distributions concentrate in a thin shell (not at the mean!)
+
+ML implications: KNN fails, density estimation requires too many samples, feature selection becomes critical. Solutions: dimensionality reduction (PCA), regularization, manifold learning.
+</details>
+
+### 3. Explain cross-validation and why it gives better estimates than a single train/test split.
+<details><summary>Answer</summary>
+
+K-fold CV:
+1. Split data into K folds
+2. Train on K-1 folds, evaluate on the held-out fold
+3. Repeat K times, average the scores
+
+Benefits over single split:
+- Uses ALL data for both training and evaluation
+- Reduces variance of the performance estimate
+- Detects overfitting more reliably
+- Provides confidence intervals on performance
+
+Standard: K=5 or K=10. Leave-one-out (K=n) has high variance despite low bias.
+</details>
+
+### 4. What is the difference between Type I and Type II errors? How do they relate to precision/recall?
+<details><summary>Answer</summary>
+
+- **Type I (False Positive)**: Rejecting H₀ when it's true (false alarm). Rate = α (significance level).
+- **Type II (False Negative)**: Failing to reject H₀ when it's false (missed detection). Rate = β. Power = 1-β.
+
+In classification:
+- Precision = 1 - FP rate among positives = TP/(TP+FP) ← relates to Type I
+- Recall = 1 - FN rate among actual positives = TP/(TP+FN) ← relates to Type II
+
+Trade-off: lowering threshold increases recall (fewer Type II) but decreases precision (more Type I).
+</details>
+
+### 5. When would you use Bayesian methods over frequentist methods?
+<details><summary>Answer</summary>
+
+Use Bayesian when:
+- You have strong prior knowledge (domain expertise)
+- Small sample size (prior regularizes)
+- You need uncertainty estimates on predictions (posterior predictive distribution)
+- You want to update beliefs incrementally (online learning)
+- Model comparison is needed (Bayes factors)
+
+Use frequentist when:
+- Large data (prior becomes irrelevant)
+- Computational efficiency matters (posteriors can be expensive)
+- Regulatory requirements demand p-values
+- Simple interpretability needed
+</details>
+
+### 6. Explain the relationship between cross-entropy loss and MLE.
+<details><summary>Answer</summary>
+
+Minimizing cross-entropy loss IS maximum likelihood estimation for classification:
+
+For binary classification with Bernoulli likelihood:
+- P(y|x,θ) = p^y × (1-p)^(1-y) where p = σ(θᵀx)
+- Log-likelihood: y·log(p) + (1-y)·log(1-p)
+- Negative log-likelihood = binary cross-entropy loss
+
+For multi-class with categorical distribution:
+- NLL = -Σ yₖ log(pₖ) = categorical cross-entropy
+
+So when you minimize cross-entropy, you're finding the MLE of the model parameters. This is why cross-entropy is the "natural" loss for classification.
+</details>
+
+### 7. What assumptions does linear regression make and what happens when they're violated?
+<details><summary>Answer</summary>
+
+Assumptions (LINE):
+1. **Linearity**: y = Xβ + ε → violation: biased estimates, use polynomial/nonlinear models
+2. **Independence**: errors are independent → violation (autocorrelation): underestimated SEs, use time-series models
+3. **Normality**: ε ~ N(0, σ²) → violation: CIs/p-values unreliable (but estimates still unbiased by CLT for large n)
+4. **Equal variance** (homoscedasticity): Var(ε) = σ² constant → violation: inefficient estimates, use weighted LS or robust SEs
+5. **No multicollinearity**: features not perfectly correlated → violation: unstable estimates, use regularization/VIF
+
+</details>
+
+### 8. Explain the reparameterization trick in VAEs.
+<details><summary>Answer</summary>
+
+In VAEs, we need to backpropagate through z ~ N(μ, σ²), but sampling is not differentiable.
+
+Reparameterization trick: Instead of z ~ N(μ, σ²), write z = μ + σ × ε where ε ~ N(0,1).
+
+Now μ and σ are deterministic functions of input (computed by encoder), ε is external randomness. Gradients flow through μ and σ:
+- ∂z/∂μ = 1
+- ∂z/∂σ = ε
+
+This enables training the encoder end-to-end with gradient descent while maintaining stochasticity.
+</details>

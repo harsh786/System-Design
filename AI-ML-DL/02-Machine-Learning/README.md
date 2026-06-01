@@ -213,3 +213,12 @@ There is no single algorithm that works best for every problem. The NFL theorem 
 - Ordinal: Label encoding
 - Nominal (few categories): One-hot encoding
 - Nominal (many categories): Target encoding, frequency encoding, embeddings
+
+
+---
+
+## Recommended Resources
+
+For curated video courses, books, blogs, and practice platforms related to this section, see the comprehensive resources guide:
+
+> **[RESOURCES.md](../RESOURCES.md)** — Organized by learning phase with free and paid options.

@@ -800,3 +800,221 @@ Shared: ML Platform team provides tooling
 | Feature computation freshness | < 1 hour (batch), < 1s (stream) |
 | Experiment tracking coverage | 100% of runs |
 | Model monitoring coverage | 100% of prod models |
+
+---
+
+## Production War Stories
+
+Real-world incidents from production ML systems. These stories illustrate why MLOps practices exist — every best practice was born from a painful failure.
+
+---
+
+### War Story 1: The Silent Model Degradation
+
+**Company:** Large e-commerce platform (~50M daily active users)
+
+**What Happened:**
+Over 3 months, the recommendation model's accuracy degraded by 30%. No alerts fired. No one noticed until a quarterly business review revealed a revenue dip in the "recommended for you" section. A data scientist manually investigated and found the model was essentially returning near-random recommendations.
+
+**Root Cause Analysis:**
+A data pipeline migration introduced a bug where a key user behavior feature (`last_category_viewed`) was silently being filled with `NULL` values for 40% of users. The model didn't crash — it gracefully degraded, falling back to popularity-based recommendations without any explicit error.
+
+The pipeline had tests, but they only checked schema and row counts, not value distributions.
+
+**How It Was Detected:**
+- Revenue from recommendation-driven purchases dropped 15% over 3 months
+- A product manager flagged it during quarterly review
+- Manual investigation by a data scientist confirmed the issue
+
+**How It Was Fixed:**
+1. Immediate: Fixed the pipeline bug, backfilled the feature
+2. Short-term: Added Great Expectations data quality checks on all features
+3. Long-term: 
+   - Feature distribution monitoring (KL divergence, PSI)
+   - Automated alerts when any feature's null rate exceeds historical baseline by 2x
+   - Model performance dashboard with daily accuracy tracking
+   - Business metric correlation monitoring
+
+**Key Takeaway:**
+Models fail silently. You MUST monitor input features, not just output metrics. A model returning predictions with high confidence doesn't mean it's correct.
+
+**Prevention Checklist:**
+- [ ] Data quality checks on all input features (null rates, distribution shifts)
+- [ ] Feature-level monitoring with automated alerts
+- [ ] Business metric correlation with model metrics
+- [ ] Regular model accuracy audits (weekly minimum)
+- [ ] Alerting on prediction distribution changes (e.g., diversity of recommendations)
+
+---
+
+### War Story 2: The Training-Serving Skew
+
+**Company:** Fintech company (credit scoring)
+
+**What Happened:**
+A new credit scoring model achieved AUC 0.95 in offline evaluation — significantly better than the existing model (AUC 0.82). After deploying to production, the model's actual AUC was measured at 0.65, worse than the model it replaced.
+
+**Root Cause Analysis:**
+Feature computation differed between training and serving:
+- **Training:** Batch SQL pipeline computed features nightly. Dates were parsed using SQL's `DATE_PARSE` (which defaults to UTC).
+- **Serving:** Real-time Python code computed features on-the-fly. Dates used `datetime.strptime()` which used local timezone (PST).
+- **Null handling:** SQL `COALESCE(value, 0)` vs Python `value or -1`
+- **String processing:** SQL `UPPER(TRIM(field))` vs Python `field.strip().upper()` (different whitespace handling)
+
+These subtle differences meant 4 out of 15 features had different values at serving time compared to training time.
+
+**How It Was Detected:**
+- Online/offline metric mismatch flagged by an engineer during the first week
+- Feature value comparison between training data and live serving logs confirmed the skew
+
+**How It Was Fixed:**
+1. Implemented Feast as a feature store
+2. Single feature computation codebase used for both training and serving
+3. Added automated skew detection: compute features both ways, alert if divergence > 1%
+4. Training pipeline now validates features against serving infrastructure before model promotion
+
+**Key Takeaway:**
+Always use a feature store or shared feature computation layer. Never let training and serving compute features independently.
+
+**Prevention Checklist:**
+- [ ] Feature store (Feast, Tecton, etc.) for unified feature computation
+- [ ] Automated training-serving skew detection
+- [ ] Integration tests that compare training features vs serving features
+- [ ] Feature computation code review as part of model review
+- [ ] Log serving-time feature values for post-hoc comparison
+
+---
+
+### War Story 3: The Feedback Loop Disaster
+
+**Company:** Content moderation platform
+
+**What Happened:**
+A toxicity detection model was retrained weekly on new data. Within 2 weeks of deployment, it started flagging nearly 80% of all content as toxic (up from 5%), causing massive user complaints and content removal.
+
+**Root Cause Analysis:**
+A positive feedback loop emerged:
+1. Model flags content as toxic → content is removed
+2. Removed content disappears from the "safe" training pool
+3. Retraining data becomes skewed (fewer negative/safe examples)
+4. New model has a lower threshold for "toxic" → flags more content
+5. Cycle repeats, each iteration more aggressive
+
+The model was literally training on a biased sample created by its own predictions.
+
+**How It Was Detected:**
+- User complaints spiked 400% in week 2
+- Daily flagging rate metric showed exponential growth
+- Manual review showed clearly safe content being flagged
+
+**How It Was Fixed:**
+1. Immediate: Rolled back to the pre-deployment model
+2. Short-term:
+   - Added counterfactual logging (log predictions but don't always act on them)
+   - Human review sampling: 5% of "safe" predictions are manually verified
+   - Temporal holdout evaluation: always test on data from BEFORE model deployment
+3. Long-term:
+   - Randomized holdback: 1% of content is never acted upon (for unbiased evaluation)
+   - Prediction rate monitoring with alerts on significant shifts
+   - Retraining data auditing: check label distribution before retraining
+
+**Key Takeaway:**
+Be extremely careful with models that influence their own training data. This includes recommendation systems, content moderation, fraud detection, and search ranking.
+
+**Prevention Checklist:**
+- [ ] Identify feedback loops BEFORE deployment (draw the data flow diagram)
+- [ ] Counterfactual logging (record what would have happened without the model)
+- [ ] Holdback groups for unbiased evaluation
+- [ ] Monitor prediction distribution over time (flag rate, positive rate)
+- [ ] Human-in-the-loop sampling for ground truth
+- [ ] Temporal holdout validation (test on pre-deployment data)
+
+---
+
+### War Story 4: The Cascading Failure
+
+**Company:** Ride-sharing platform
+
+**What Happened:**
+During a Sunday night traffic spike, the ML pricing service (surge pricing) became overwhelmed. Within 3 minutes, 6 dependent services (ETA estimation, driver matching, ride pricing, route optimization, demand forecasting, fare estimation) all went down. The entire platform was unavailable for 23 minutes.
+
+**Root Cause Analysis:**
+- The ML service had no circuit breaker — when it slowed down, callers kept retrying
+- No timeout configuration — callers waited indefinitely for responses
+- No fallback logic — services couldn't function without ML predictions
+- Thread pool exhaustion in calling services → cascading failure
+- The ML service was a single point of failure for the entire platform
+
+**How It Was Detected:**
+- PagerDuty alerts fired for all 6 services simultaneously
+- Customer reports flooded in
+- Monitoring dashboards showed cascade pattern
+
+**How It Was Fixed:**
+1. Immediate: Restarted all services, scaled ML service
+2. Short-term:
+   - Circuit breakers (Hystrix pattern) on all ML service calls
+   - Timeouts: 100ms for ML predictions, fall back after that
+   - Graceful degradation: rule-based pricing as fallback (1.5x base fare)
+3. Long-term:
+   - Bulkheading: separate thread pools per downstream service
+   - Cached predictions: serve last-known-good predictions for up to 5 minutes
+   - Load shedding: ML service drops low-priority requests under pressure
+   - Chaos engineering: monthly failure injection tests
+
+**Key Takeaway:**
+ML services must have fallbacks. Always design for failure. An ML service going down should degrade the experience, not crash the platform.
+
+**Prevention Checklist:**
+- [ ] Circuit breakers on all ML service calls
+- [ ] Timeouts (aggressive — 100ms for real-time predictions)
+- [ ] Fallback logic (rule-based, cached predictions, or default values)
+- [ ] Bulkheading (isolate failure domains)
+- [ ] Load shedding under pressure
+- [ ] Regular chaos engineering / failure injection tests
+- [ ] Dependency mapping (know your blast radius)
+
+---
+
+### War Story 5: The Expensive GPU Incident
+
+**Company:** AI startup (20 employees)
+
+**What Happened:**
+A machine learning engineer launched a hyperparameter sweep on a Friday afternoon — 200 GPU instances (V100s at $3.06/hr each) across multiple configurations. They planned to check results Monday. They got sick and didn't log in until the following Monday. By then, the sweep had finished on Saturday but the instances kept running. Total bill: $47,000.
+
+**Root Cause Analysis:**
+- No auto-shutdown policy for GPU instances
+- No budget alerts configured
+- No instance TTL (time-to-live) enforcement
+- No team visibility into running resources
+- The sweep framework didn't terminate instances after completion
+
+**How It Was Detected:**
+- Monday morning: engineer logged in and saw instances still running
+- AWS bill alert came 3 days later (configured at $50K threshold, too high)
+
+**How It Was Fixed:**
+1. Immediate: Terminated all instances, negotiated partial credit with cloud provider
+2. Short-term:
+   - Budget alerts at $500/day, $2000/week, $5000/month
+   - Auto-shutdown: all GPU instances auto-terminate after 4 hours unless explicitly extended
+   - Spot instances for all training workloads (70% cost savings)
+3. Long-term:
+   - Scheduled scaling: training only during business hours
+   - Resource tagging: every instance tagged with owner, purpose, TTL
+   - Weekly cost review meeting
+   - Terraform/IaC for all infrastructure (no manual instance launches)
+   - Slack bot that posts daily cloud spend
+
+**Key Takeaway:**
+Always set budget alerts and instance TTLs for ML workloads. GPU instances are expensive and easy to forget.
+
+**Prevention Checklist:**
+- [ ] Budget alerts at multiple thresholds (daily, weekly, monthly)
+- [ ] Auto-shutdown/TTL policies for all compute instances
+- [ ] Spot/preemptible instances for training workloads
+- [ ] Resource tagging (owner, purpose, expiry)
+- [ ] No manual instance creation (use IaC only)
+- [ ] Daily cost visibility (dashboard or Slack alerts)
+- [ ] Instance audit: weekly review of running resources

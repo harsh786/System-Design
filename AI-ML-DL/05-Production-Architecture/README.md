@@ -126,3 +126,12 @@ For Staff/Principal level interviews, expect questions on:
 - Compliance and governance for ML systems
 - Incident response for model failures
 - Building vs buying ML infrastructure decisions
+
+
+---
+
+## Recommended Resources
+
+For curated video courses, books, blogs, and practice platforms related to this section, see the comprehensive resources guide:
+
+> **[RESOURCES.md](../RESOURCES.md)** — Organized by learning phase with free and paid options.

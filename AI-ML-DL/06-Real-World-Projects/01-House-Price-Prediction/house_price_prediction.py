@@ -101,8 +101,8 @@ def train_and_evaluate_models(
         "Ridge (α=1.0)": Ridge(alpha=1.0),
         "Lasso (α=0.01)": Lasso(alpha=0.01),
         "ElasticNet": ElasticNet(alpha=0.01, l1_ratio=0.5),
-        "Random Forest": RandomForestRegressor(n_estimators=100, max_depth=15, random_state=42, n_jobs=-1),
-        "Gradient Boosting": GradientBoostingRegressor(n_estimators=200, max_depth=5, learning_rate=0.1, random_state=42),
+        "Random Forest": RandomForestRegressor(n_estimators=50, max_depth=12, random_state=42, n_jobs=1),
+        "Gradient Boosting": GradientBoostingRegressor(n_estimators=100, max_depth=4, learning_rate=0.1, random_state=42),
     }
 
     results: List[ModelResult] = []
@@ -122,11 +122,11 @@ def train_and_evaluate_models(
         if "Forest" in name or "Boosting" in name:
             model.fit(X_train, y_train)
             preds = model.predict(X_test)
-            cv = cross_val_score(model, X_train, y_train, cv=5, scoring="r2", n_jobs=-1)
+            cv = cross_val_score(model, X_train, y_train, cv=3, scoring="r2", n_jobs=1)
         else:
             model.fit(X_train_scaled, y_train)
             preds = model.predict(X_test_scaled)
-            cv = cross_val_score(model, X_train_scaled, y_train, cv=5, scoring="r2", n_jobs=-1)
+            cv = cross_val_score(model, X_train_scaled, y_train, cv=3, scoring="r2", n_jobs=1)
 
         result = ModelResult(
             name=name,
@@ -195,7 +195,7 @@ def main() -> None:
     print_results(results)
 
     # Step 7: Feature importances from best tree model
-    gb = GradientBoostingRegressor(n_estimators=200, max_depth=5, learning_rate=0.1, random_state=42)
+    gb = GradientBoostingRegressor(n_estimators=100, max_depth=4, learning_rate=0.1, random_state=42)
     gb.fit(X_train, y_train)
     print_feature_importances(gb, list(X_train.columns))
 

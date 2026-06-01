@@ -450,3 +450,689 @@ print(x.grad)  # dy/dx = 3x² + 4x + 1 = 12 + 8 + 1 = 21
 3. **Chain rule = backpropagation.** The single most important calculus concept for deep learning.
 4. **Every optimizer** (SGD, Adam, RMSProp) is a variation on: θ ← θ - α·∇L
 5. **Automatic differentiation** (PyTorch/TensorFlow) applies the chain rule computationally — you don't compute derivatives by hand.
+
+---
+
+## Exercises
+
+### Exercise 1 (Beginner)
+**Problem:** Find the derivative of f(x) = 3x⁴ - 2x³ + x - 7.
+
+**Hint:** Apply the power rule: d/dx[xⁿ] = nxⁿ⁻¹.
+
+<details><summary>Solution</summary>
+
+```
+f'(x) = 12x³ - 6x² + 1
+```
+</details>
+
+### Exercise 2 (Beginner)
+**Problem:** Find the partial derivatives ∂f/∂x and ∂f/∂y for f(x,y) = x²y + 3xy² - 2y.
+
+**Hint:** When taking ∂f/∂x, treat y as a constant (and vice versa).
+
+<details><summary>Solution</summary>
+
+```
+∂f/∂x = 2xy + 3y²
+∂f/∂y = x² + 6xy - 2
+```
+</details>
+
+### Exercise 3 (Beginner)
+**Problem:** Compute the gradient of f(x,y,z) = x²+ y² + z² at the point (1, 2, 3). What direction does it point?
+
+**Hint:** ∇f = [∂f/∂x, ∂f/∂y, ∂f/∂z]
+
+<details><summary>Solution</summary>
+
+```
+∇f = [2x, 2y, 2z]
+At (1,2,3): ∇f = [2, 4, 6]
+Direction: points away from origin (direction of steepest increase)
+||∇f|| = sqrt(4+16+36) = sqrt(56) ≈ 7.48
+```
+</details>
+
+### Exercise 4 (Beginner)
+**Problem:** Apply the chain rule: if y = (3x² + 1)⁵, find dy/dx.
+
+**Hint:** Let u = 3x² + 1, then y = u⁵. dy/dx = dy/du × du/dx.
+
+<details><summary>Solution</summary>
+
+```
+Let u = 3x² + 1
+dy/du = 5u⁴ = 5(3x²+1)⁴
+du/dx = 6x
+dy/dx = 5(3x²+1)⁴ × 6x = 30x(3x²+1)⁴
+```
+</details>
+
+### Exercise 5 (Intermediate)
+**Problem:** For a simple neural network: output = σ(w₂ · σ(w₁ · x + b₁) + b₂) where σ is sigmoid. Derive ∂output/∂w₁ using the chain rule.
+
+**Hint:** Work layer by layer. σ'(z) = σ(z)(1 - σ(z)).
+
+<details><summary>Solution</summary>
+
+```
+Let z₁ = w₁·x + b₁, a₁ = σ(z₁), z₂ = w₂·a₁ + b₂, output = σ(z₂)
+
+∂output/∂w₁ = ∂output/∂z₂ × ∂z₂/∂a₁ × ∂a₁/∂z₁ × ∂z₁/∂w₁
+             = σ(z₂)(1-σ(z₂)) × w₂ × σ(z₁)(1-σ(z₁)) × x
+
+This IS backpropagation — chain rule applied through layers.
+```
+</details>
+
+### Exercise 6 (Intermediate)
+**Problem:** Compute the Jacobian matrix of f: R² → R² where f(x,y) = [x²+y, xy²].
+
+**Hint:** J[i,j] = ∂fᵢ/∂xⱼ
+
+<details><summary>Solution</summary>
+
+```
+J = [[∂f₁/∂x, ∂f₁/∂y],
+     [∂f₂/∂x, ∂f₂/∂y]]
+  = [[2x, 1],
+     [y², 2xy]]
+```
+</details>
+
+### Exercise 7 (Intermediate)
+**Problem:** Find the Hessian matrix of f(x,y) = x³ + 3x²y - y³. Is the function convex at (1,1)?
+
+**Hint:** H[i,j] = ∂²f/∂xᵢ∂xⱼ. Convex if H is positive semi-definite.
+
+<details><summary>Solution</summary>
+
+```
+∂f/∂x = 3x² + 6xy,  ∂f/∂y = 3x² - 3y²
+∂²f/∂x² = 6x + 6y,  ∂²f/∂y² = -6y,  ∂²f/∂x∂y = 6x
+
+H = [[6x+6y, 6x],
+     [6x, -6y]]
+
+At (1,1): H = [[12, 6],[6, -6]]
+Eigenvalues: det(H-λI) = (12-λ)(-6-λ)-36 = λ²-6λ-108 = 0
+λ = (6±√(36+432))/2 → one positive, one negative
+H is indefinite → NOT convex at (1,1) (saddle point)
+```
+</details>
+
+### Exercise 8 (Intermediate)
+**Problem:** Derive the gradient of MSE loss L = (1/n)Σ(yᵢ - wᵀxᵢ)² with respect to w.
+
+**Hint:** Expand using matrix notation: L = (1/n)||y - Xw||².
+
+<details><summary>Solution</summary>
+
+```
+L = (1/n)(y - Xw)ᵀ(y - Xw)
+∂L/∂w = (1/n) × 2Xᵀ(Xw - y) = (2/n)Xᵀ(Xw - y)
+
+Setting to zero (closed-form solution):
+Xᵀ(Xw - y) = 0
+XᵀXw = Xᵀy
+w* = (XᵀX)⁻¹Xᵀy  (Normal Equation)
+```
+</details>
+
+### Exercise 9 (Advanced)
+**Problem:** Derive the gradient of softmax cross-entropy loss. Given logits z, softmax p = softmax(z), and one-hot target y, show that ∂L/∂z = p - y.
+
+**Hint:** L = -Σ yⱼ log(pⱼ), where pⱼ = exp(zⱼ)/Σexp(zₖ).
+
+<details><summary>Solution</summary>
+
+```
+∂L/∂zᵢ = -Σⱼ yⱼ × (1/pⱼ) × ∂pⱼ/∂zᵢ
+
+For softmax: ∂pⱼ/∂zᵢ = pⱼ(δᵢⱼ - pᵢ) where δᵢⱼ is Kronecker delta
+
+∂L/∂zᵢ = -Σⱼ yⱼ × (1/pⱼ) × pⱼ(δᵢⱼ - pᵢ)
+        = -Σⱼ yⱼ(δᵢⱼ - pᵢ)
+        = -(yᵢ - pᵢ × Σⱼyⱼ)
+        = -(yᵢ - pᵢ × 1)    [since Σyⱼ = 1 for one-hot]
+        = pᵢ - yᵢ
+
+Therefore: ∂L/∂z = p - y  (beautifully simple!)
+```
+</details>
+
+### Exercise 10 (Advanced)
+**Problem:** Use Taylor expansion to show why gradient descent with learning rate η converges when η < 2/L (where L is the Lipschitz constant of the gradient).
+
+**Hint:** Expand f(x - η∇f(x)) around x using second-order Taylor approximation.
+
+<details><summary>Solution</summary>
+
+```
+f(x - η∇f) ≈ f(x) - η||∇f||² + (η²/2)∇fᵀH∇f
+
+For L-smooth function: ∇fᵀH∇f ≤ L||∇f||²
+
+f(x - η∇f) ≤ f(x) - η||∇f||² + (η²L/2)||∇f||²
+           = f(x) - η(1 - ηL/2)||∇f||²
+
+For guaranteed decrease: 1 - ηL/2 > 0 → η < 2/L
+Optimal step size: η = 1/L (maximizes decrease per step)
+```
+</details>
+
+### Exercise 11 (Advanced)
+**Problem:** Explain vanishing/exploding gradients using the chain rule. If a network has n layers each with weight W, what happens to ∂L/∂W₁ as n grows?
+
+**Hint:** ∂L/∂W₁ involves products of n Jacobians.
+
+<details><summary>Solution</summary>
+
+```
+By chain rule: ∂L/∂W₁ = ∂L/∂aₙ × ∂aₙ/∂aₙ₋₁ × ... × ∂a₂/∂a₁ × ∂a₁/∂W₁
+
+Each ∂aᵢ/∂aᵢ₋₁ ≈ Wᵢ × diag(σ'(zᵢ))
+
+If ||W × σ'|| < 1: product → 0 exponentially (vanishing gradients)
+If ||W × σ'|| > 1: product → ∞ exponentially (exploding gradients)
+
+Solutions:
+- Careful initialization (Xavier/He)
+- Residual connections: gradient flows through skip connections
+- LSTM/GRU: gating mechanisms control gradient flow
+- Gradient clipping (for exploding)
+- Batch normalization
+```
+</details>
+
+### Exercise 12 (Advanced)
+**Problem:** Derive the update rule for batch normalization during backpropagation. Given x̂ = (x - μ)/σ, y = γx̂ + β, find ∂L/∂γ, ∂L/∂β, and ∂L/∂x.
+
+**Hint:** μ and σ depend on x (they're batch statistics), making the derivative of ∂L/∂x non-trivial.
+
+<details><summary>Solution</summary>
+
+```
+∂L/∂γ = Σᵢ (∂L/∂yᵢ) × x̂ᵢ
+∂L/∂β = Σᵢ (∂L/∂yᵢ)
+
+For ∂L/∂x (complex because μ, σ depend on all xᵢ):
+∂L/∂x̂ᵢ = ∂L/∂yᵢ × γ
+∂L/∂σ² = Σᵢ ∂L/∂x̂ᵢ × (xᵢ-μ) × (-1/2)(σ²+ε)⁻³/²
+∂L/∂μ = Σᵢ ∂L/∂x̂ᵢ × (-1/σ) + ∂L/∂σ² × (-2/m)Σᵢ(xᵢ-μ)
+∂L/∂xᵢ = ∂L/∂x̂ᵢ × (1/σ) + ∂L/∂σ² × 2(xᵢ-μ)/m + ∂L/∂μ × (1/m)
+```
+</details>
+
+---
+
+## Self-Assessment Quiz
+
+**1. The chain rule states that d/dx[f(g(x))] equals:**
+- (a) f'(x) × g'(x)
+- (b) f'(g(x)) × g'(x)
+- (c) f(g'(x))
+- (d) f'(g(x)) + g'(x)
+
+<details><summary>Answer</summary>(b) f'(g(x)) × g'(x). Evaluate outer derivative at inner function, multiply by inner derivative.</details>
+
+**2. The gradient ∇f points in the direction of:**
+- (a) Steepest descent
+- (b) Steepest ascent
+- (c) Zero change
+- (d) Random direction
+
+<details><summary>Answer</summary>(b) Steepest ascent. That's why gradient DESCENT moves in the -∇f direction.</details>
+
+**3. If f(x) has a local minimum at x₀, then:**
+- (a) f'(x₀) > 0
+- (b) f'(x₀) = 0 and f''(x₀) > 0
+- (c) f'(x₀) = 0 and f''(x₀) < 0
+- (d) f''(x₀) = 0
+
+<details><summary>Answer</summary>(b) f'(x₀) = 0 (critical point) and f''(x₀) > 0 (concave up, confirming minimum).</details>
+
+**4. The Jacobian matrix generalizes derivatives for:**
+- (a) Scalar → Scalar functions
+- (b) Vector → Vector functions
+- (c) Only 2D functions
+- (d) Non-differentiable functions
+
+<details><summary>Answer</summary>(b) Vector → Vector functions. It contains all partial derivatives ∂fᵢ/∂xⱼ.</details>
+
+**5. In backpropagation, gradients are computed using:**
+- (a) Forward mode differentiation
+- (b) Numerical differentiation
+- (c) Reverse mode automatic differentiation
+- (d) Symbolic differentiation
+
+<details><summary>Answer</summary>(c) Reverse mode AD. It's efficient when there are many inputs but one output (scalar loss).</details>
+
+**6. The derivative of ReLU(x) = max(0,x) is:**
+- (a) Always 1
+- (b) 0 for x<0, 1 for x>0, undefined at x=0
+- (c) x for x>0, 0 otherwise
+- (d) sigmoid(x)
+
+<details><summary>Answer</summary>(b) The derivative is the step function. At x=0, it's typically set to 0 or 0.5 by convention.</details>
+
+**7. A saddle point has:**
+- (a) f' = 0, f'' > 0
+- (b) f' = 0, f'' < 0
+- (c) f' = 0, Hessian has both positive and negative eigenvalues
+- (d) f' ≠ 0
+
+<details><summary>Answer</summary>(c) At a saddle point, it's a minimum in some directions and maximum in others.</details>
+
+**8. The integral ∫₀^∞ e^(-x²) dx is important in ML because:**
+- (a) It's the normalization constant for Gaussian distribution
+- (b) It equals exactly 1
+- (c) It defines ReLU
+- (d) It's used in backpropagation
+
+<details><summary>Answer</summary>(a) It equals √π/2, and the full integral from -∞ to ∞ equals √π, giving the normalization for Gaussians.</details>
+
+**9. The derivative of sigmoid σ(x) = 1/(1+e⁻ˣ) is:**
+- (a) σ(x)²
+- (b) σ(x)(1-σ(x))
+- (c) 1-σ(x)
+- (d) e⁻ˣ/(1+e⁻ˣ)
+
+<details><summary>Answer</summary>(b) σ(x)(1-σ(x)). Maximum value is 0.25 at x=0, which contributes to vanishing gradients.</details>
+
+**10. Automatic differentiation differs from numerical differentiation because:**
+- (a) It's less accurate
+- (b) It computes exact derivatives using chain rule decomposition
+- (c) It only works for linear functions
+- (d) It requires symbolic simplification
+
+<details><summary>Answer</summary>(b) AD computes exact (to machine precision) derivatives by decomposing computations into elementary operations and applying the chain rule. No approximation error like finite differences.</details>
+
+---
+
+## Coding Challenges
+
+### Challenge 1: Implement Gradient Descent from Scratch
+```python
+"""
+Minimize f(x,y) = (x-3)² + (y+1)² using gradient descent.
+1. Compute the gradient analytically
+2. Implement the update loop
+3. Track and plot the path to the minimum
+4. Experiment with different learning rates (0.01, 0.1, 0.5, 1.5)
+"""
+```
+
+<details><summary>Solution</summary>
+
+```python
+import numpy as np
+import matplotlib.pyplot as plt
+
+def f(x, y):
+    return (x-3)**2 + (y+1)**2
+
+def grad_f(x, y):
+    return np.array([2*(x-3), 2*(y+1)])
+
+def gradient_descent(lr=0.1, n_iters=50):
+    point = np.array([0.0, 0.0])
+    path = [point.copy()]
+    for _ in range(n_iters):
+        point -= lr * grad_f(point[0], point[1])
+        path.append(point.copy())
+    return np.array(path)
+
+fig, axes = plt.subplots(1, 4, figsize=(16, 4))
+for ax, lr in zip(axes, [0.01, 0.1, 0.5, 1.5]):
+    path = gradient_descent(lr=lr)
+    x = np.linspace(-2, 6, 50)
+    y = np.linspace(-4, 3, 50)
+    X, Y = np.meshgrid(x, y)
+    Z = f(X, Y)
+    ax.contour(X, Y, Z, levels=20)
+    ax.plot(path[:,0], path[:,1], 'r.-')
+    ax.set_title(f'lr={lr}, final=({path[-1,0]:.2f},{path[-1,1]:.2f})')
+plt.tight_layout()
+plt.show()
+```
+</details>
+
+### Challenge 2: Numerical vs Analytical Gradient Verification
+```python
+"""
+Implement gradient checking:
+1. Define a function f(W) where W is a matrix (e.g., f = ||W @ x - y||²)
+2. Compute analytical gradient
+3. Compute numerical gradient using (f(W+ε) - f(W-ε))/(2ε)
+4. Compare — relative error should be < 1e-5
+"""
+```
+
+<details><summary>Solution</summary>
+
+```python
+import numpy as np
+
+def f(W, x, y):
+    return np.sum((W @ x - y)**2)
+
+def analytical_grad(W, x, y):
+    return 2 * np.outer(W @ x - y, x)
+
+def numerical_grad(W, x, y, epsilon=1e-5):
+    grad = np.zeros_like(W)
+    for i in range(W.shape[0]):
+        for j in range(W.shape[1]):
+            W_plus = W.copy(); W_plus[i,j] += epsilon
+            W_minus = W.copy(); W_minus[i,j] -= epsilon
+            grad[i,j] = (f(W_plus, x, y) - f(W_minus, x, y)) / (2*epsilon)
+    return grad
+
+np.random.seed(42)
+W = np.random.randn(3, 4)
+x = np.random.randn(4)
+y = np.random.randn(3)
+
+ag = analytical_grad(W, x, y)
+ng = numerical_grad(W, x, y)
+relative_error = np.linalg.norm(ag - ng) / (np.linalg.norm(ag) + np.linalg.norm(ng))
+print(f"Relative error: {relative_error:.2e}")  # Should be < 1e-5
+```
+</details>
+
+### Challenge 3: Implement Backpropagation for a 2-Layer Network
+```python
+"""
+Build a 2-layer neural network (input→hidden→output) and implement:
+1. Forward pass
+2. Loss computation (MSE)
+3. Backward pass (manual gradient computation)
+4. Parameter update
+Train on XOR problem: inputs=[[0,0],[0,1],[1,0],[1,1]], targets=[0,1,1,0]
+"""
+```
+
+<details><summary>Solution</summary>
+
+```python
+import numpy as np
+
+def sigmoid(x): return 1 / (1 + np.exp(-x))
+def sigmoid_deriv(x): return sigmoid(x) * (1 - sigmoid(x))
+
+np.random.seed(42)
+X = np.array([[0,0],[0,1],[1,0],[1,1]], dtype=float)
+y = np.array([[0],[1],[1],[0]], dtype=float)
+
+# Initialize weights
+W1 = np.random.randn(2, 4) * 0.5
+b1 = np.zeros((1, 4))
+W2 = np.random.randn(4, 1) * 0.5
+b2 = np.zeros((1, 1))
+lr = 1.0
+
+losses = []
+for epoch in range(10000):
+    # Forward
+    z1 = X @ W1 + b1
+    a1 = sigmoid(z1)
+    z2 = a1 @ W2 + b2
+    a2 = sigmoid(z2)
+    
+    # Loss
+    loss = np.mean((a2 - y)**2)
+    losses.append(loss)
+    
+    # Backward
+    dL_da2 = 2*(a2 - y)/4
+    da2_dz2 = sigmoid_deriv(z2)
+    dz2 = dL_da2 * da2_dz2
+    
+    dW2 = a1.T @ dz2
+    db2 = np.sum(dz2, axis=0, keepdims=True)
+    
+    da1 = dz2 @ W2.T
+    dz1 = da1 * sigmoid_deriv(z1)
+    dW1 = X.T @ dz1
+    db1 = np.sum(dz1, axis=0, keepdims=True)
+    
+    # Update
+    W2 -= lr * dW2; b2 -= lr * db2
+    W1 -= lr * dW1; b1 -= lr * db1
+
+print(f"Final loss: {losses[-1]:.6f}")
+print(f"Predictions: {a2.flatten().round(2)}")  # Should be close to [0,1,1,0]
+```
+</details>
+
+### Challenge 4: Visualize Gradient Flow in Deep Networks
+```python
+"""
+Create a deep network (10 layers) and visualize:
+1. Gradient magnitudes at each layer during backprop
+2. Compare: sigmoid activations vs ReLU activations
+3. Show vanishing gradient problem visually
+"""
+```
+
+<details><summary>Solution</summary>
+
+```python
+import numpy as np
+import matplotlib.pyplot as plt
+
+def forward_and_backward(activation='sigmoid', n_layers=10, hidden_size=50):
+    np.random.seed(42)
+    x = np.random.randn(32, hidden_size)
+    y = np.random.randn(32, hidden_size)
+    
+    if activation == 'sigmoid':
+        act = lambda x: 1/(1+np.exp(-np.clip(x,-500,500)))
+        act_deriv = lambda x: act(x)*(1-act(x))
+    else:  # relu
+        act = lambda x: np.maximum(0, x)
+        act_deriv = lambda x: (x > 0).astype(float)
+    
+    # Initialize weights
+    weights = [np.random.randn(hidden_size, hidden_size)*0.5 for _ in range(n_layers)]
+    
+    # Forward pass - store activations
+    activations = [x]
+    pre_activations = []
+    for W in weights:
+        z = activations[-1] @ W
+        pre_activations.append(z)
+        activations.append(act(z))
+    
+    # Loss and backward
+    loss_grad = 2*(activations[-1] - y)
+    grad_norms = []
+    
+    grad = loss_grad
+    for i in range(n_layers-1, -1, -1):
+        grad = grad * act_deriv(pre_activations[i])
+        grad_norms.append(np.linalg.norm(grad))
+        grad = grad @ weights[i].T
+    
+    return list(reversed(grad_norms))
+
+fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(12, 5))
+sigmoid_grads = forward_and_backward('sigmoid')
+relu_grads = forward_and_backward('relu')
+
+ax1.plot(sigmoid_grads, 'b-o'); ax1.set_title('Sigmoid: Vanishing Gradients')
+ax1.set_xlabel('Layer'); ax1.set_ylabel('Gradient Norm'); ax1.set_yscale('log')
+ax2.plot(relu_grads, 'r-o'); ax2.set_title('ReLU: Better Gradient Flow')
+ax2.set_xlabel('Layer'); ax2.set_ylabel('Gradient Norm'); ax2.set_yscale('log')
+plt.tight_layout(); plt.show()
+```
+</details>
+
+### Challenge 5: Implement Automatic Differentiation (Simple)
+```python
+"""
+Build a minimal autodiff system:
+1. Create a Value class that tracks computation graph
+2. Implement forward operations (+, *, power, relu)
+3. Implement backward() that computes gradients via reverse-mode AD
+4. Verify against PyTorch autograd
+"""
+```
+
+<details><summary>Solution</summary>
+
+```python
+class Value:
+    def __init__(self, data, children=(), op=''):
+        self.data = data
+        self.grad = 0.0
+        self._backward = lambda: None
+        self._children = set(children)
+        self._op = op
+    
+    def __add__(self, other):
+        other = other if isinstance(other, Value) else Value(other)
+        out = Value(self.data + other.data, (self, other), '+')
+        def _backward():
+            self.grad += out.grad
+            other.grad += out.grad
+        out._backward = _backward
+        return out
+    
+    def __mul__(self, other):
+        other = other if isinstance(other, Value) else Value(other)
+        out = Value(self.data * other.data, (self, other), '*')
+        def _backward():
+            self.grad += other.data * out.grad
+            other.grad += self.data * out.grad
+        out._backward = _backward
+        return out
+    
+    def __pow__(self, n):
+        out = Value(self.data**n, (self,), f'**{n}')
+        def _backward():
+            self.grad += n * self.data**(n-1) * out.grad
+        out._backward = _backward
+        return out
+    
+    def relu(self):
+        out = Value(max(0, self.data), (self,), 'relu')
+        def _backward():
+            self.grad += (self.data > 0) * out.grad
+        out._backward = _backward
+        return out
+    
+    def backward(self):
+        topo = []
+        visited = set()
+        def build_topo(v):
+            if v not in visited:
+                visited.add(v)
+                for child in v._children:
+                    build_topo(child)
+                topo.append(v)
+        build_topo(self)
+        self.grad = 1.0
+        for v in reversed(topo):
+            v._backward()
+
+# Test
+x = Value(2.0)
+y = Value(3.0)
+z = x**2 + x*y + y**2  # 4 + 6 + 9 = 19
+z.backward()
+print(f"z={z.data}, dz/dx={x.grad}, dz/dy={y.grad}")  # dz/dx=2x+y=7, dz/dy=x+2y=8
+```
+</details>
+
+---
+
+## Interview Questions
+
+### 1. What is backpropagation and why does it work?
+<details><summary>Answer</summary>
+
+Backpropagation is reverse-mode automatic differentiation applied to compute gradients of a scalar loss with respect to all parameters. It works by:
+1. Forward pass: compute loss
+2. Backward pass: apply chain rule from output to input, reusing intermediate results
+
+Key insight: For a computation graph with n parameters and 1 scalar output, reverse mode computes ALL gradients in O(1) backward passes (vs O(n) for forward mode). This makes it practical for networks with millions of parameters.
+</details>
+
+### 2. Explain vanishing and exploding gradients. How are they solved?
+<details><summary>Answer</summary>
+
+When gradients flow through many layers via chain rule, they're multiplied at each step:
+- **Vanishing**: Repeated multiplication by values < 1 (e.g., sigmoid derivative max = 0.25) → gradients → 0 → early layers don't learn
+- **Exploding**: Repeated multiplication by values > 1 → gradients → ∞ → unstable training
+
+Solutions:
+- ReLU activation (gradient = 1 for positive inputs)
+- Residual connections (gradient highway)
+- Proper initialization (Xavier/He)
+- Gradient clipping (for exploding)
+- LSTM gates (for RNNs)
+- Batch normalization
+</details>
+
+### 3. Why is the learning rate the most important hyperparameter?
+<details><summary>Answer</summary>
+
+Learning rate η controls step size in gradient descent: θ ← θ - η∇L.
+- Too large: overshoots minima, diverges
+- Too small: extremely slow convergence, gets stuck
+- Must be < 2/L (L = smoothness constant) for convergence
+
+Optimal η varies during training → use schedules (warmup, cosine decay) or adaptive methods (Adam adapts per-parameter). Unlike other hyperparameters, wrong η causes complete training failure.
+</details>
+
+### 4. What's the difference between convex and non-convex optimization in deep learning?
+<details><summary>Answer</summary>
+
+- **Convex** (linear/logistic regression): one global minimum, guaranteed convergence
+- **Non-convex** (neural networks): many local minima, saddle points, plateaus
+
+Surprisingly, deep learning works because:
+1. In high dimensions, most critical points are saddle points, not local minima
+2. Local minima tend to have similar loss values (loss landscape is "benign")
+3. SGD noise helps escape bad regions
+4. Overparameterization creates many good solutions
+</details>
+
+### 5. Explain the intuition behind Adam optimizer.
+<details><summary>Answer</summary>
+
+Adam combines momentum (first moment) and RMSProp (second moment):
+- **First moment** m = β₁m + (1-β₁)g: smoothed gradient direction (reduces noise)
+- **Second moment** v = β₂v + (1-β₂)g²: per-parameter learning rate (adapts to gradient magnitude)
+- Update: θ -= η × m/(√v + ε)
+
+Intuition: For parameters with consistently large gradients → large v → smaller effective lr (prevents overshooting). For sparse/noisy gradients → momentum smooths the path. Bias correction handles initialization.
+</details>
+
+### 6. How does batch normalization help training from a calculus perspective?
+<details><summary>Answer</summary>
+
+Batch normalization smooths the loss landscape:
+1. Reduces internal covariate shift (input distributions to each layer change less)
+2. Makes the loss landscape more Lipschitz smooth (bounded gradients)
+3. Allows higher learning rates (smoother landscape → larger safe step sizes)
+4. Provides implicit regularization via batch noise
+
+From a gradient flow perspective: normalizing activations prevents them from growing unboundedly, keeping gradients in a reasonable range throughout the network.
+</details>
+
+### 7. What is the relationship between the Hessian and learning rate selection?
+<details><summary>Answer</summary>
+
+The Hessian H captures curvature of the loss landscape:
+- Eigenvalues of H = curvature in each direction
+- Max eigenvalue λ_max determines the maximum safe learning rate: η < 2/λ_max
+- Condition number κ = λ_max/λ_min determines convergence speed
+- High κ → elongated valleys → slow convergence with fixed lr
+
+Second-order methods (Newton's method: θ -= H⁻¹∇L) account for curvature but are O(n²) memory for n parameters. Approximations: L-BFGS, natural gradient, K-FAC.
+</details>

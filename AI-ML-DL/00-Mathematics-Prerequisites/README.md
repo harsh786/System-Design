@@ -98,3 +98,12 @@ KL Divergence             →    VAE loss, GAN training
 - **Mathematics for Machine Learning** (Deisenroth, Faisal, Ong) - Free textbook
 - **Deep Learning** (Goodfellow, Bengio, Courville) - Chapter 2-4
 - **Pattern Recognition and Machine Learning** (Bishop) - Probability focus
+
+
+---
+
+## Recommended Resources
+
+For curated video courses, books, blogs, and practice platforms related to this section, see the comprehensive resources guide:
+
+> **[RESOURCES.md](../RESOURCES.md)** — Organized by learning phase with free and paid options.
