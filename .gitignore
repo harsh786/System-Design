@@ -1,3 +1,4 @@
+*.class
 Platform/*
 Platform/Architecture.jpg
 Platform/CLAUDE.md
@@ -86,3 +87,4 @@ Platform/Subscriptions/11-mandate-and-token-management.md
 Platform/Subscriptions/12-settlement-and-reconciliation.md
 Platform/Subscriptions/README.md
 Platform/UPI/UPI-Gateway-Architecture.md
+LLD/design-patterns/creational/abstract-factory/AbstractFactoryPattern.class
