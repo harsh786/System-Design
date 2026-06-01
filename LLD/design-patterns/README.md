@@ -2,6 +2,14 @@
 
 A comprehensive implementation of all 23 Gang of Four (GoF) design patterns in Java with runnable programs, real-world examples, and detailed explanations.
 
+## Foundations (Start Here)
+
+| Section | Path | What You'll Learn |
+|---------|------|-------------------|
+| **OOP Principles** | `principles/oops-principles/` | Encapsulation, Abstraction, Inheritance, Polymorphism |
+| **SOLID Principles** | `principles/solid-principles/` | SRP, OCP, LSP, ISP, DIP with before/after examples |
+| **Relationships** | `principles/relationships/` | Association, Aggregation, Composition, Dependency, Realization |
+
 ---
 
 ## Overview Diagram
@@ -118,6 +126,16 @@ A comprehensive implementation of all 23 Gang of Four (GoF) design patterns in J
 ```
 design-patterns/
 ├── README.md (this file)
+├── principles/
+│   ├── oops-principles/
+│   │   ├── OOPSPrinciples.java
+│   │   └── README.md
+│   ├── solid-principles/
+│   │   ├── SOLIDPrinciples.java
+│   │   └── README.md
+│   └── relationships/
+│       ├── Relationships.java
+│       └── README.md
 ├── creational/
 │   ├── singleton/
 │   │   ├── SingletonPattern.java
