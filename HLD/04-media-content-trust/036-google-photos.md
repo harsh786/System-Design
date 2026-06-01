@@ -990,7 +990,7 @@ sequenceDiagram
         end
     end
 
-    Note over ML,Search: All async; user sees photo immediately, features appear within seconds
+    Note over ML,Search: All async, user sees photo immediately, features appear within seconds
 ```
 
 ### 2. Shared Album Collaboration

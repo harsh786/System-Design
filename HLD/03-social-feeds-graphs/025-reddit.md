@@ -1178,7 +1178,7 @@ sequenceDiagram
         DB-->>CS: flat_comments[]
         CS->>CS: buildTree(flat_comments, parent_id linkage)
         CS->>RS: rankComments(tree, sort_algorithm)
-        Note over RS: best = Wilson score interval; hot = score/age; controversial = balanced up/down
+        Note over RS: best = Wilson score interval, hot = score/age, controversial = balanced up/down
         RS-->>CS: ranked_tree (truncated at depth=5)
         CS->>RC: SET comment_tree:{post_id}:{sort} TTL=60
     end

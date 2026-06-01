@@ -874,7 +874,7 @@ sequenceDiagram
     participant AS as Awareness Service
     participant Cache as Redis (Presence)
 
-    Note over A,B,C: All editors have document open
+    Note over A,C: All editors have document open
 
     A->>A: Cursor moves to position 42, selects range [42, 58]
     A->>GW: awareness_update {cursor: {pos:42, sel:[42,58]}, color: "#FF5733"}

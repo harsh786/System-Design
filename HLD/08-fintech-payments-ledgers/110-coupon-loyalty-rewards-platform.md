@@ -1254,7 +1254,7 @@ sequenceDiagram
     Fraud-->>Coupon: OK (not in abuse blocklist, first use by this user)
     
     Coupon->>Redis: DECR coupon:SUMMER20:remaining (atomic decrement)
-    Note over Redis: Lua script: if remaining > 0 then DECR, return new_value; else return -1
+    Note over Redis: Lua script: if remaining > 0 then DECR, return new_value, otherwise return -1
     Redis-->>Coupon: remaining=456 (was 457, decremented to 456)
     
     alt Decrement successful (remaining ≥ 0)

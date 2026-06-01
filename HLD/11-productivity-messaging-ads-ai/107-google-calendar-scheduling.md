@@ -1458,7 +1458,7 @@ sequenceDiagram
     participant Cache as Redis Cache
     participant NQ as Notification Queue (Kafka)
 
-    U->>API: POST /events {title, rrule: "FREQ=WEEKLY;COUNT=52", attendees}
+    U->>API: POST /events {title, rrule: "FREQ=WEEKLY,COUNT=52", attendees}
     API->>ES: createEvent(userId, eventPayload)
     ES->>ES: Validate RRULE (RFC 5545 compliance)
     ES->>DB: INSERT master event (rrule stored as-is)

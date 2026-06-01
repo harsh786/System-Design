@@ -71,12 +71,12 @@ erDiagram
         boolean is_paused
     }
     DAG_VERSIONS {
-        varchar dag_id PK_FK
+        varchar dag_id PK,FK
         int version PK
         jsonb dag_definition
     }
     DAG_TASKS {
-        varchar dag_id PK_FK
+        varchar dag_id PK,FK
         varchar task_id PK
         varchar task_type
         varchar trigger_rule

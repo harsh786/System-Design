@@ -66,13 +66,13 @@ erDiagram
         varchar medallion_layer
     }
     DELTA_LOG {
-        uuid table_id PK_FK
+        uuid table_id PK,FK
         bigint version PK
         varchar operation
         timestamp timestamp
     }
     DELTA_ADD_FILE {
-        uuid table_id PK_FK
+        uuid table_id PK,FK
         bigint version PK
         varchar path PK
         bigint size_bytes

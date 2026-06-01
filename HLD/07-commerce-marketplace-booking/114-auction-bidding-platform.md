@@ -1264,7 +1264,7 @@ sequenceDiagram
     Note over BidService: Validate:<br/>- new_bid(550) > current(500) + min_increment(10) ✓<br/>- auction still active ✓<br/>- bidder not banned ✓
 
     BidService->>Redis: EVAL lua_atomic_bid_update(A-100, 550, bidder_id)
-    Note over Redis: Lua: if current < 550 then SET; return OK<br/>else return OUTBID (race condition safe)
+    Note over Redis: Lua: if current < 550 then SET, return OK<br/>otherwise return OUTBID (race condition safe)
     Redis-->>BidService: OK (bid accepted)
 
     BidService->>PostgreSQL: INSERT bid(A-100, bidder_id, 550, timestamp)

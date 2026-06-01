@@ -1304,7 +1304,7 @@ sequenceDiagram
     HC->>HC: Confirm failure (3 consecutive failures)<br/>Automated decision (< 60s total detection)
 
     HC->>DNS: Update DNS: remove US from active set
-    DNS->>DNS: TTL 60s; propagation begins
+    DNS->>DNS: TTL 60s, propagation begins
 
     Client->>DNS: Resolve api.example.com
     DNS-->>Client: EU-West IP only (US removed)

@@ -1416,7 +1416,7 @@ sequenceDiagram
     Portal->>DB: Store app metadata
 
     Dev->>Portal: Subscribe to API Product {product: "Products API", plan: "Gold"}
-    Portal->>Portal: Check plan eligibility (auto-approve for free/gold; manual for enterprise)
+    Portal->>Portal: Check plan eligibility (auto-approve for free/gold, manual for enterprise)
 
     alt Auto-approved plan
         Portal->>KMS: Generate API key pair

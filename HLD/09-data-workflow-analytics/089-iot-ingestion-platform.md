@@ -71,13 +71,13 @@ erDiagram
         varchar protocol
     }
     DEVICE_TWINS {
-        varchar device_id PK_FK
+        varchar device_id PK,FK
         jsonb desired_properties
         jsonb reported_properties
         varchar sync_status
     }
     DEVICE_TELEMETRY {
-        varchar device_id PK_FK
+        varchar device_id PK,FK
         timestamptz timestamp PK
         varchar metric_name PK
         double value_numeric
@@ -98,8 +98,8 @@ erDiagram
         varchar status
     }
     FIRMWARE_DEVICE_STATUS {
-        uuid update_id PK_FK
-        varchar device_id PK_FK
+        uuid update_id PK,FK
+        varchar device_id PK,FK
         varchar status
         int progress_pct
     }

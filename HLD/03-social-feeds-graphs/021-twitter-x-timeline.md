@@ -799,7 +799,7 @@ sequenceDiagram
             FO->>RC: LTRIM timeline:{follower_id} 0 799
         end
     else Author has >= 10K followers (Celebrity)
-        Note over FO: Skip fanout; merge at read time
+        Note over FO: Skip fanout, merge at read time
         FO->>RC: ADD celebrity_tweets:{author_id} tweet_id
     end
 

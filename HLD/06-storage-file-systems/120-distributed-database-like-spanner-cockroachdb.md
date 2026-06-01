@@ -1317,7 +1317,7 @@ sequenceDiagram
     participant R1F as Range-1 Followers
     participant R2F as Range-2 Followers
 
-    C->>GW: BEGIN; UPDATE accounts SET balance-=100 WHERE id=1; INSERT INTO orders(...); COMMIT;
+    C->>GW: BEGIN, UPDATE accounts SET balance-=100 WHERE id=1, INSERT INTO orders(...), COMMIT
     GW->>TM: StartTransaction(txn_id=T1, timestamp=HLC_now)
     
     GW->>R1: Write Intent(key=account:1, value=balance-100, txn=T1)

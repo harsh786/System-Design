@@ -76,13 +76,13 @@ erDiagram
         varchar label_value
     }
     LABEL_INVERTED_INDEX {
-        bigint metric_id PK_FK
+        bigint metric_id PK,FK
         varchar label_key PK
         varchar label_value PK
         array series_ids
     }
     TS_CHUNKS {
-        bigint series_id PK_FK
+        bigint series_id PK,FK
         varchar resolution PK
         timestamp chunk_start_time PK
         bytea data_compressed
@@ -102,7 +102,7 @@ erDiagram
         interval source_retention
     }
     CARDINALITY_TRACKING {
-        bigint metric_id PK_FK
+        bigint metric_id PK,FK
         varchar label_key PK
         int unique_values
         boolean is_high_cardinality

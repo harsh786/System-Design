@@ -1003,7 +1003,7 @@ sequenceDiagram
     V->>API: POST /stories/{story_id}/seen
     API->>DB: Record view (viewer_id, story_id, timestamp)
     API->>Cache: Mark story as seen for this viewer
-    Note over API: Owner can see viewer list; analytics updated async
+    Note over API: Owner can see viewer list, analytics updated async
 ```
 
 ### 3. Story Expiry Cleanup at 24 Hours

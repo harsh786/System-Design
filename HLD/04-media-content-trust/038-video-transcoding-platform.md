@@ -1235,7 +1235,7 @@ sequenceDiagram
     end
 
     Ladder-->>Job: Optimized ladder [{res: 1080p, bitrate: 4800kbps}, {res: 720p, bitrate: 2100kbps}, ...]
-    Note over Ladder,Job: Action movie gets higher bitrates; talking-head gets lower
+    Note over Ladder,Job: Action movie gets higher bitrates, talking-head gets lower
 
     Job->>Encode: Encode full video using optimized ladder
     Encode->>S3: Store all renditions

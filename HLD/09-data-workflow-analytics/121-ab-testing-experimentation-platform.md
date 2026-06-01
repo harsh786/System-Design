@@ -576,8 +576,8 @@ erDiagram
         varchar aggregation
     }
     EXPERIMENT_METRICS {
-        uuid experiment_id PK_FK
-        uuid metric_id PK_FK
+        uuid experiment_id PK,FK
+        uuid metric_id PK,FK
         varchar metric_role
     }
     EXPERIMENT_TARGETING {
@@ -592,8 +592,8 @@ erDiagram
         uuid layer_id FK
     }
     MUTUAL_EXCLUSION_MEMBERS {
-        uuid group_id PK_FK
-        uuid experiment_id PK_FK
+        uuid group_id PK,FK
+        uuid experiment_id PK,FK
     }
     ASSIGNMENT_LOG {
         varchar user_id
