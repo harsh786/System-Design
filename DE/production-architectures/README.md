@@ -156,6 +156,76 @@ Each architecture includes:
 
 ---
 
+## Deep Dive: Apache Flink Production at Scale (10-flink-production-at-scale/)
+
+> World-class guide to solving **billion-scale** data engineering problems with Apache Flink. 10 real-world production problems with full architecture, code, deployment, monitoring, and scaling.
+
+| # | Problem / Topic | Key Technologies | Scale |
+|---|---|---|---|
+| 00 | [Flink Architecture Internals](10-flink-production-at-scale/00-flink-architecture-internals.md) | State, Checkpoints, Watermarks, Memory Model | Reference |
+| 01 | [Real-Time Fraud Detection](10-flink-production-at-scale/01-fraud-detection-pipeline.md) | Flink CEP, RocksDB, Broadcast State | 500K TPS |
+| 02 | [Audit & History Trails](10-flink-production-at-scale/02-audit-history-pipeline.md) | CDC, Iceberg, Temporal Joins, Exactly-Once | 1B events/day |
+| 03 | [Real-Time Aggregation](10-flink-production-at-scale/03-real-time-aggregation-pipeline.md) | Windows, Watermarks, Late Data, Pinot | 10M events/sec |
+| 04 | [Recommendation System](10-flink-production-at-scale/04-recommendation-system-pipeline.md) | Async I/O, Broadcast State, Feature Store | 100M users |
+| 05 | [ML Feature Engineering](10-flink-production-at-scale/05-ml-feature-engineering-pipeline.md) | Table API, Batch-Stream Unification, Iceberg | 50TB/day |
+| 06 | [IoT Anomaly Detection](10-flink-production-at-scale/06-iot-anomaly-detection-pipeline.md) | Session Windows, CEP, Process Functions | 5M sensors |
+| 07 | [Clickstream Analytics](10-flink-production-at-scale/07-clickstream-analytics-pipeline.md) | Session Windows, Bot Detection, ClickHouse | 2B clicks/day |
+| 08 | [Payment Reconciliation](10-flink-production-at-scale/08-payment-reconciliation-pipeline.md) | Interval Joins, State Machines, 2PC | $1T/year |
+| 09 | [Log Analytics & Observability](10-flink-production-at-scale/09-log-analytics-observability-pipeline.md) | Percentiles, Multi-Sink, Anomaly Detection | 10TB logs/day |
+| 10 | [Dynamic Pricing Engine](10-flink-production-at-scale/10-dynamic-pricing-pipeline.md) | Process Functions, Timers, Low Latency | 1M prices/sec |
+| 11 | [Production Deployment](10-flink-production-at-scale/11-deployment-production-operations.md) | Kubernetes, HA, CI/CD, Zero-Downtime | Enterprise |
+| 12 | [Monitoring & Debugging](10-flink-production-at-scale/12-monitoring-alerting-debugging.md) | Prometheus, Grafana, Backpressure, SLAs | Operations |
+| 13 | [Scaling for Billions](10-flink-production-at-scale/13-scaling-billions-transactions.md) | Auto-scaling, Hot Keys, State Optimization | 10M+ TPS |
+| 14 | [Technology Integration](10-flink-production-at-scale/14-technology-integration-patterns.md) | Kafka, Iceberg, Pinot, Redis, ES, ML | Ecosystem |
+
+---
+
+## Deep Dive: AWS Glue Production at Scale (10-aws-glue-production-at-scale/)
+
+> Complete guide to AWS Glue covering **every concept** through **10 real-world production problems** at billion-scale. Includes deployment, monitoring, and performance tuning.
+
+| # | Problem / Topic | Key Technologies | Scale |
+|---|---|---|---|
+| 00 | [AWS Glue Concepts Deep Dive](10-aws-glue-production-at-scale/00-overview.md) | All Glue components, DynamicFrame, Crawlers, Catalog | Reference |
+| 01 | [E-Commerce Transaction Aggregation](10-aws-glue-production-at-scale/01-ecommerce-transaction-aggregation.md) | Glue, Spark, Iceberg, Athena, Redshift Spectrum | 5B orders/day |
+| 02 | [Fraud Detection Feature Engineering](10-aws-glue-production-at-scale/02-fraud-detection-feature-engineering.md) | Glue, DynamoDB, SageMaker, GraphFrames | 100M txns/day, 500+ features |
+| 03 | [Recommendation System Data Pipeline](10-aws-glue-production-at-scale/03-recommendation-system-data-pipeline.md) | Glue, Iceberg, SageMaker, Feature Store | 300M users × 50M items |
+| 04 | [Slowly Changing Dimensions & History](10-aws-glue-production-at-scale/04-slowly-changing-dimensions-history.md) | Glue, Iceberg MERGE, SCD Type 2 | 500M dimension records |
+| 05 | [Financial Regulatory Audit Trail](10-aws-glue-production-at-scale/05-financial-regulatory-audit.md) | Glue, S3 Object Lock, Iceberg, KMS | 10B events/day, 10-year retention |
+| 06 | [ML Training Data Pipeline](10-aws-glue-production-at-scale/06-ml-training-data-pipeline.md) | Glue, Ray, SageMaker, Iceberg versioning | 50TB/day, 200+ models |
+| 07 | [Clickstream Sessionization](10-aws-glue-production-at-scale/07-clickstream-sessionization.md) | Glue Streaming, Kinesis, Attribution models | 20B page views/day |
+| 08 | [GDPR/PII Compliance Pipeline](10-aws-glue-production-at-scale/08-gdpr-pii-compliance.md) | Glue PII Detection, Iceberg deletes, FPE | 500M users, 72-hour SLA |
+| 09 | [IoT Telemetry & Predictive Maintenance](10-aws-glue-production-at-scale/09-iot-telemetry-aggregation.md) | Glue Streaming, Time-series, FFT | 10M sensors, 864B points/day |
+| 10 | [Healthcare EHR Interoperability](10-aws-glue-production-at-scale/10-healthcare-ehr-interoperability.md) | Glue Custom Classifiers, FHIR, OMOP CDM | 500 hospitals, 10B events/day |
+| 11 | [Production Deployment & CI/CD](10-aws-glue-production-at-scale/11-production-deployment-cicd.md) | CDK, GitHub Actions, pytest, Docker Glue | 500+ jobs, 20 deploys/day |
+| 12 | [Monitoring, Alerting & Observability](10-aws-glue-production-at-scale/12-monitoring-alerting-observability.md) | CloudWatch, Grafana, PagerDuty, Lambda | 99.9% SLA tracking |
+| 13 | [Scaling Billions & Performance Tuning](10-aws-glue-production-at-scale/13-scaling-billions-performance.md) | Auto-scaling, AQE, Flex execution | 10B records/day, $50K budget |
+
+---
+
+## Deep Dive: Apache Spark Production at Scale (10-spark-production-at-scale/)
+
+> World-class guide to **Apache Spark** covering every concept through **10 real-world production problems** at billion-scale. Includes deployment (K8s, EMR, Databricks), monitoring, and performance tuning.
+
+| # | Problem / Topic | Key Technologies | Scale |
+|---|---|---|---|
+| 01 | [Fraud Detection Pipeline](10-spark-production-at-scale/01-fraud-detection-pipeline.md) | Spark Streaming, ML, Iceberg | 500K TPS |
+| 02 | [Slowly Changing Dimensions & History](10-spark-production-at-scale/02-slowly-changing-dimensions-history.md) | MERGE INTO, SCD Type 2, Iceberg | 500M dimension records |
+| 03 | [Recommendation Engine Pipeline](10-spark-production-at-scale/03-recommendation-engine-pipeline.md) | ALS, Deep Learning, Feature Store | 100M users × 10M items |
+| 04 | [Real-Time Aggregation at Billions](10-spark-production-at-scale/04-real-time-aggregation-billions.md) | Structured Streaming, Watermarks, Stateful | 10B events/day |
+| 05 | [ML Feature Engineering & Training](10-spark-production-at-scale/05-ml-feature-engineering-training.md) | Spark ML, Feature Store, Iceberg | 50TB/day |
+| 06 | [Data Deduplication & Reconciliation](10-spark-production-at-scale/06-data-deduplication-reconciliation.md) | Bloom Filters, LSH, Graph Components | 10B records/day |
+| 07 | [Audit, Compliance & Lineage](10-spark-production-at-scale/07-audit-compliance-lineage.md) | OpenLineage, Immutable Storage, WORM | SOX/HIPAA/PCI |
+| 08 | [Customer 360 & Graph Processing](10-spark-production-at-scale/08-customer-360-graph-processing.md) | GraphFrames, Entity Resolution | 500M profiles |
+| 09 | [Data Quality & Observability](10-spark-production-at-scale/09-data-quality-observability.md) | Great Expectations, Statistical Profiling | 1000+ pipelines |
+| 10 | [Multi-Petabyte Optimization](10-spark-production-at-scale/10-multi-petabyte-optimization.md) | AQE, DPP, Z-order, Bucketing | 50PB lakehouse |
+| -- | [Kubernetes Spark Operator Deployment](10-spark-production-at-scale/deployment/kubernetes-spark-operator.md) | K8s, Spark Operator, Volcano | Enterprise |
+| -- | [EMR & Databricks Configuration](10-spark-production-at-scale/deployment/emr-databricks-config.md) | EMR, Databricks, Spot Instances | Multi-cloud |
+| -- | [Monitoring & Observability Stack](10-spark-production-at-scale/monitoring/spark-observability-stack.md) | Prometheus, Grafana, SparkListener, SLAs | 500+ jobs |
+| -- | [Billion-Scale Tuning Guide](10-spark-production-at-scale/scaling/billion-scale-tuning-guide.md) | Memory, Shuffle, AQE, Partitioning | 10B+ records |
+
+---
+
 ## Technology Index
 
 | Technology | Architectures |
