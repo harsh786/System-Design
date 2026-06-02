@@ -180,11 +180,40 @@ AI-ML-DL/
 ├── 02-Machine-Learning/                         ← PHASE 3
 │   ├── README.md
 │   ├── 01-Supervised-Learning/
-│   │   ├── README.md                           (Linear/Logistic Reg, SVM, Trees, KNN)
+│   │   ├── README.md                           (Overview + algorithm selection)
+│   │   ├── 01-linear-regression.md             (OLS, GD, Ridge, Lasso, ElasticNet)
+│   │   ├── 02-logistic-regression.md           (Sigmoid, MLE, softmax, regularization)
+│   │   ├── 03-decision-trees.md                (Entropy, Gini, CART, pruning)
+│   │   ├── 04-support-vector-machines.md       (Kernels, margin, C parameter)
+│   │   ├── 05-k-nearest-neighbors.md           (Distance, K selection, KD-trees)
+│   │   ├── 06-naive-bayes.md                   (Gaussian, Multinomial, Bernoulli)
+│   │   ├── 07-training-data-preparation.md     (Splitting, scaling, encoding, Pipeline)
 │   │   └── supervised_learning_lab.ipynb
-│   ├── 02-Unsupervised-Learning/               (K-Means, PCA, t-SNE, DBSCAN)
-│   ├── 03-Ensemble-Methods/                    (Random Forest, XGBoost, Stacking)
-│   ├── 04-Model-Evaluation-and-Selection/      (CV, metrics, bias-variance)
+│   ├── 02-Unsupervised-Learning/
+│   │   ├── README.md                           (Overview + taxonomy)
+│   │   ├── 01-k-means-clustering.md            (Lloyd's, K-means++, elbow/silhouette)
+│   │   ├── 02-hierarchical-clustering.md       (Linkage, dendrograms)
+│   │   ├── 03-dbscan.md                        (Density-based, HDBSCAN)
+│   │   ├── 04-pca-dimensionality-reduction.md  (Eigendecomposition, kernel PCA)
+│   │   ├── 05-t-sne-and-umap.md               (Visualization, comparison)
+│   │   ├── 06-gaussian-mixture-models.md       (EM algorithm, BIC/AIC)
+│   │   ├── 07-anomaly-detection.md             (Isolation Forest, LOF, autoencoders)
+│   │   └── 08-data-preparation-for-clustering.md (Scaling, evaluation, profiling)
+│   ├── 03-Ensemble-Methods/
+│   │   ├── README.md                           (Why ensembles work, taxonomy)
+│   │   ├── 01-bagging-and-random-forest.md     (Bootstrap, RF, feature importance)
+│   │   ├── 02-boosting-gradient-boosting.md    (AdaBoost, GBM from scratch)
+│   │   ├── 03-xgboost-lightgbm-catboost.md    (All 3 frameworks + tuning)
+│   │   ├── 04-stacking-and-blending.md         (Meta-learners, competition recipes)
+│   │   └── 05-ensemble-training-guide.md       (When to ensemble, production tips)
+│   ├── 04-Model-Evaluation-and-Selection/
+│   │   ├── README.md                           (Overview, bias-variance)
+│   │   ├── 01-classification-metrics.md        (Precision, Recall, F1, ROC, PR)
+│   │   ├── 02-regression-metrics.md            (MSE, MAE, R², residuals)
+│   │   ├── 03-cross-validation.md              (K-fold, stratified, nested CV)
+│   │   ├── 04-hyperparameter-tuning.md         (Grid, Random, Optuna/Bayesian)
+│   │   ├── 05-model-selection-strategy.md      (Statistical tests, complexity)
+│   │   └── 06-evaluation-for-production.md     (A/B testing, fairness, calibration)
 │   └── 05-Advanced-ML-Techniques/              (Feature selection, imbalance, AutoML)
 │
 ├── 03-Deep-Learning/                            ← PHASE 4
@@ -279,6 +308,65 @@ AI-ML-DL/
 │   ├── 03-Autonomous-Systems/                (Self-driving, robotics, sensor fusion)
 │   └── 04-Recommendation-Systems-at-Scale/   (Two-tower, Netflix arch, cold start)
 │
+├── 15-Practical-Model-Building/                   ← BRIDGES THEORY → PRACTICE
+│   ├── README.md                              (When to use which guide)
+│   ├── 01-Model-Training-Recipes/             (Step-by-step cookbooks per task)
+│   ├── 02-Data-Collection-and-Labeling/       (Get/clean/label real-world data)
+│   ├── 03-Training-Debugging-Playbook/        (Fix "model not learning" problems)
+│   ├── 04-Build-From-Scratch-Templates/       (Modify-and-run code templates)
+│   ├── 05-Transfer-Learning-Cookbook/          (Fine-tune BERT, ResNet, GPT)
+│   ├── 06-Dataset-Handling-Patterns/          (Load any data type correctly)
+│   └── 07-Experiment-Management/              (Track, compare, reproduce)
+│
+├── 16-Architecture-Decision-Diagrams/             ← STAFF ARCHITECT REASONING
+│   ├── README.md                              (48 diagrams, quick decision lookup)
+│   ├── 01-Algorithm-Selection-Workflows.md    (Which algo/loss/optimizer and WHY)
+│   ├── 02-Training-Pipeline-Internals.md      (Forward/backward, distributed, mixed precision)
+│   ├── 03-System-Architecture-Decisions.md    (Serving, scaling, caching, fallbacks)
+│   ├── 04-Data-Pipeline-Decisions.md          (ETL/ELT, feature engineering, quality)
+│   ├── 05-Model-Lifecycle-MLOps.md            (Dev→prod, monitoring, retraining)
+│   └── 06-LLM-GenAI-Architecture-Decisions.md (RAG vs fine-tune, agents, cost)
+│
+├── 17-AWS-ML-Deployment/                          ← DEPLOY AT SCALE
+│   ├── README.md                              (AWS ML stack, decision flowchart)
+│   ├── 01-SageMaker-Training-and-Endpoints/   (Training jobs, endpoints, pipelines, registry)
+│   ├── 02-Container-Deployment-EKS-ECS/       (Docker, EKS, ECS, GPU nodes, Triton)
+│   ├── 03-Serverless-ML-Lambda/               (Lambda patterns, Step Functions)
+│   ├── 04-CI-CD-Pipeline-AWS/                 (GitHub Actions → SageMaker, CDK)
+│   ├── 05-Observability-CloudWatch/           (Metrics, alarms, Model Monitor, dashboards)
+│   ├── 06-Cost-Optimization/                  (Spot, right-sizing, cost formulas)
+│   └── 07-Full-Production-Workflow/           (End-to-end: laptop → prod → maintain)
+│
+├── 18-Distributed-Training/                       ← TRAINING AT SCALE
+│   └── README.md                              (DDP, FSDP, DeepSpeed, pipeline parallel)
+│
+├── 19-Cost-and-Resource-Estimation/               ← ARCHITECT PLANNING
+│   └── README.md                              (GPU memory calc, time, cloud costs)
+│
+├── 20-Failure-Modes-Playbook/                     ← WHAT KILLS ML PROJECTS
+│   └── README.md                              (Label leakage, drift, feedback loops)
+│
+├── 21-Real-World-Case-Studies/                    ← HOW THE BEST COMPANIES DO IT
+│   └── README.md                              (Spotify, Uber, Netflix, Google, Stripe, Tesla)
+│
+├── 22-ML-Testing/                                 ← PRODUCTION QUALITY
+│   └── README.md                              (pytest code: data, model, integration tests)
+│
+├── 23-Multimodal-AI/                              ← MODERN AI
+│   └── README.md                              (CLIP, Stable Diffusion, Whisper, GPT-4V)
+│
+├── 24-Progressive-Mini-Projects/                  ← BUILD AFTER LEARNING
+│   └── README.md                              (24 mini-projects, 30-60 min each)
+│
+├── 25-ML-Interview-Bank/                          ← CAREER PREP
+│   └── README.md                              (Theory, coding, system design, behavioral)
+│
+├── 26-OpenCV-and-Image-Processing/                ← COMPUTER VISION FUNDAMENTALS
+│   └── README.md                              (Filters, contours, features, video, real-time)
+│
+├── 27-Computer-Vision-Deep-Dive/                  ← DETECTION, SEGMENTATION, TRACKING
+│   └── README.md                              (YOLO, Mask R-CNN, DeepSORT, deployment)
+│
 └── 06-Real-World-Projects/                      ← ALL PHASES (Hands-on)
     ├── README.md
     ├── 01-House-Price-Prediction/             (Classical ML pipeline)
@@ -289,7 +377,8 @@ AI-ML-DL/
     ├── 06-End-to-End-ML-Pipeline/             (Pipeline + API + monitoring + Docker)
     ├── 07-RAG-Chatbot/                        (Vector search + context assembly)
     ├── 08-LLM-Agent-with-Tools/               (ReAct pattern + tool use)
-    └── 09-Real-Time-Streaming-ML/             (Online learning + drift detection)
+    ├── 09-Real-Time-Streaming-ML/             (Online learning + drift detection)
+    └── 10-BERT-Text-Classifier/               (RoBERTa: dirty CSV → trained → deployed)
 ```
 
 ---
@@ -299,17 +388,30 @@ AI-ML-DL/
 | Dimension | Coverage |
 |-----------|----------|
 | **Mathematics** | Linear Algebra through Information Theory with proofs & intuition |
-| **Algorithms** | 30+ ML/DL algorithms with derivations |
+| **Algorithms** | 30+ ML/DL algorithms with derivations + from-scratch code |
 | **Modern AI** | LLMs, RAG, Agents, Fine-tuning, Prompt Engineering |
+| **Multimodal** | CLIP, Stable Diffusion, Whisper, Vision-Language Models |
 | **NLP** | From regex to Transformers to semantic search |
 | **Production** | MLOps, serving, scaling, monitoring, system design |
+| **AWS Deployment** | SageMaker, EKS, Lambda, CI/CD, observability, cost optimization |
+| **Distributed** | DDP, FSDP, DeepSpeed, pipeline/tensor parallelism |
 | **Data Engineering** | SQL, Spark, Kafka, ETL, feature stores |
 | **Theory** | Bayesian ML, Causal Inference, GNNs, PAC Learning |
 | **Tools** | HuggingFace, LangChain, W&B, DVC, ONNX, PyTorch, TF |
+| **Testing** | pytest for ML: data, model, integration, drift tests |
+| **Case Studies** | Spotify, Netflix, Uber, Google, Stripe, Tesla deep-dives |
+| **Failure Modes** | Label leakage, feedback loops, model decay, silent failures |
+| **Cost Planning** | GPU memory calc, training time, cloud cost estimation |
 | **Ethics** | Bias, fairness, privacy, regulations |
 | **Domain** | Finance, Healthcare, Autonomous, RecSys at scale |
 | **Research** | Paper reading, 50+ landmark papers, reproducibility |
-| **Hands-on** | 9 runnable projects from classical ML to streaming |
+| **Practical** | Training recipes, debugging playbooks, modifiable templates |
+| **Hands-on** | 10 runnable projects from classical ML to BERT to streaming |
+| **Computer Vision** | OpenCV, YOLO, segmentation, tracking, pose estimation, deployment |
+| **Diagrams** | 68+ Mermaid decision diagrams with WHY reasoning |
+| **Research** | Paper reading, 50+ landmark papers, reproducibility |
+| **Practical** | Training recipes, debugging playbooks, modifiable templates |
+| **Hands-on** | 10 runnable projects from classical ML to streaming |
 | **Exercises** | Quizzes, coding challenges, interview questions per section |
 | **Notebooks** | 5 interactive Jupyter notebooks |
 
@@ -371,7 +473,13 @@ WEEKLY GOALS:
 - [ ] Phase 9: Production Architecture (all 5 sections)
 - [ ] Phase 10: Advanced Theory (all 6 sections)
 - [ ] Phase 11: Research + Ethics + Domain (12 sections)
-- [ ] All 9 projects completed and running
+- [ ] Phase 12: Practical Model Building (7 guides + templates)
+- [ ] Phase 13: AWS Deployment (full production workflow)
+- [ ] Phase 14: Distributed Training + Cost Estimation
+- [ ] Phase 15: Case Studies + Failure Modes + Testing
+- [ ] Phase 16: Multimodal AI
+- [ ] Phase 17: OpenCV & Computer Vision (sections 26-27)
+- [ ] All 10 projects completed and running
 - [ ] All exercises and quizzes completed
 - [ ] 10+ papers read and annotated
 

@@ -65,6 +65,11 @@ graph TD
 | 03 | [Probability & Statistics](./03-Probability-and-Statistics/README.md) | Distributions, Bayes, MLE | Naive Bayes, GMMs, VAEs |
 | 04 | [Optimization](./04-Optimization/README.md) | Gradient Descent, Adam, Convergence | Training Neural Networks |
 | 05 | [Information Theory](./05-Information-Theory/README.md) | Entropy, Cross-Entropy, KL Divergence | Loss Functions, GANs |
+| 06 | [Numerical Methods & Stability](./06-Numerical-Methods-and-Stability/README.md) | Floating Point, NaN debugging, Mixed Precision | Production ML debugging |
+| 07 | [Discrete Math & Graph Theory](./07-Discrete-Math-and-Graph-Theory/README.md) | Graphs, Algorithms, Spectral Theory | GNNs, Attention, Computation Graphs |
+| 08 | [Matrix Calculus Deep Dive](./08-Matrix-Calculus-Deep-Dive/README.md) | Vector/Matrix Derivatives, Jacobians | Deriving backprop for custom layers |
+| 09 | [Fourier Analysis & Signal Processing](./09-Fourier-Analysis-and-Signal-Processing/README.md) | DFT, FFT, Convolution Theorem | CNNs, Positional Encoding, Audio ML |
+| 10 | [Game Theory](./10-Game-Theory/README.md) | Nash Equilibrium, Minimax, Mechanism Design | GANs, Adversarial ML, Multi-agent RL |
 
 ## How Math Maps to ML Concepts
 
@@ -85,11 +90,19 @@ KL Divergence             →    VAE loss, GAN training
 
 ## Recommended Learning Order
 
+**Core (required before ML):**
 1. **Linear Algebra** (1-2 weeks) - Foundation for everything
 2. **Calculus** (1-2 weeks) - Needed for optimization
 3. **Probability & Statistics** (2 weeks) - Core of ML reasoning
 4. **Optimization** (1 week) - How models learn
 5. **Information Theory** (3-5 days) - Loss functions and beyond
+
+**Advanced (required for staff architect level):**
+6. **Numerical Methods** (1 week) - Debug NaN, production stability
+7. **Discrete Math & Graph Theory** (1 week) - GNNs, computation graphs
+8. **Matrix Calculus** (1 week) - Derive gradients for custom layers
+9. **Fourier Analysis** (1 week) - CNNs, audio, positional encoding
+10. **Game Theory** (3-5 days) - GANs, adversarial ML, multi-agent
 
 ## Resources
 
